@@ -1,0 +1,93 @@
+# OpenViking Web Studio
+
+## Candidat courant : build Node 22 et campagne complète par cohortes
+
+Le candidat compile **le vrai `upstream/web-studio`** au SHA `000f0765d7ec183886fbabbc22e69bc289cc429d`, pas une UI de substitution. Le staging `build-pqubwy2c` (index `f6ff17c7ed9e11c3b47533c7699fdeb45410b09f5f9d3cfaf183bf7feb527166`) passe **1 939/1 939 originaux sur 221 fichiers** et **28/28 Edge deux fois**. Voir [l’artefact et les preuves du dialogue Gateway](../.work/studio/GATEWAY-KEYS.md) et [la matrice des cohortes](../.work/studio/COHORTES.md) pour les reçus, y compris les rouges précédents. `dist/studio` reste sur `9fd48ee4…` : la recette de [UX-REVIEW.md](UX-REVIEW.md) ne vaut pas pour le nouveau manifeste, et le parent contrôle séparément la recette et toute bascule.
+
+```sh
+./scripts/build-studio.sh --offline
+./scripts/test-studio.sh --offline --workers 1 --cohort-timeout 600
+./scripts/test-studio.sh --offline --workers 1 --cohort-timeout 600 --cohort edge-regressions
+```
+
+Tant que les références épinglées restent valides, [le superviseur local](../.work/studio/qualify-key-candidate.py) enchaîne ces trois commandes et scelle le reçu et le ZIP correspondants, sans échange.
+
+Le build lance le vrai `prebuild` (ESLint, tests i18n), puis Vite avec `--base=/studio/` et `VITE_STUDIO_EDGE=true`. Node 22 est obligatoire (`--node`, ou binaire conservé sous `.work/studio/toolchain/bin/`). Cache npm préexistant, `npm ci --ignore-scripts` et aucune configuration npm racine. Le remplissage réseau du cache n’a pas été exercé dans ce lot. Chaque build écrit **seulement en staging** sous `.work/studio/logs/build-*/dist`, avec `assets.sha256` pour chaque fichier. `--bundle-only` ne qualifie pas le prebuild. Pour préserver `dist/studio/`, utiliser la [garde de promotion locale avec écrivain unique](../.work/studio/PROMOTION.md) ; une construction ne déclenche plus la bascule.
+
+Les **221 fichiers, 25 cohortes** et leurs SHA-256 sont dans `inventory.json` ; le lanceur compare leur intégrité avant et après chaque cohorte et exige que Vitest rapporte les chemins attendus. Il conserve les erreurs et continue ; `--cohort` est répétable. La campagne du port teste d’abord les assertions historiques dans le mode historique, puis un lot séparé `VITE_STUDIO_EDGE=true` (stockage, connexion et contrat). `--edge-originals` est distinct : toutes les assertions d’origine ne sont pas applicables à une seule origine et à l’interdiction du stockage en clair. Le délai Vitest de 20 s ne modifie ni les assertions ni leurs propres délais codés.
+
+**Cause et correction du blocage.** Sur Node 22, `manifest.test.ts` seul affichait ses trois tests mais pas le résumé ; le couple avec `resources.test.ts` s’arrêtait également, exit 124. Un Worker Node nu se termine. Dans le confinement, `process.memoryUsage.rss()` retourne `EACCES` alors que V8 sait mesurer `used_heap_size`. Tinypool appelait `process.memoryUsage().heapUsed` qui lit aussi `/proc/self/stat`, puis rappelait la même fonction dans son `catch` au lieu de rendre son résultat. Le runner limite l’adaptation à cette mesure de heap dans les deux entrées Tinypool verrouillées, dans `node_modules` **de la copie**. Même couple après correction : **2 fichiers, 5 tests, exit 0**. [Traces](../.work/studio/logs/vitest-diagnostic/) ; aucun droit rendu sur `/proc`, aucun test changé.
+
+**Confinement.** Landlock et seccomp, HOME/XDG/temp/npmrc jetables. Réseau interdit pour le build et 216 fichiers ; les cinq fichiers amont avec serveur local sont dans un lot distinct (ports éphémères via Landlock, IPv4 TCP uniquement, interposition libc `bind`/`connect` vers `127.0.0.1`, préflight de refus). `unshare -Urn` a été refusé ; l’interposition n’est pas un namespace réseau. Aucune clé réelle, aucun navigateur, compte distant ou publication exercé dans ce lot.
+
+### Ce qui change dans les composants d’origine
+
+- Recherche : label persistant, focus clavier opaque, contraste des textes sans l’ancien alpha, modes radio natifs, chargement stable et respect de la préférence de mouvement réduit. Sonde de ressources en échec, 200 vide, erreur de recherche et 501 restent distincts ; reprise ou retrait du filtre concerné, avec diagnostic conservé. Pas de résultat de démonstration.
+- Explorateur : commandes de largeur cliquables et clavier en plus du glisser ; un seul `<main>`. Les champs principaux passent à 16 px sur mobile. Le refus de clé 401 réassocie l’aide et le message au champ et restaure son focus sans effacer la saisie. Import texte local inchangé côté protocole, URL distante non proposée.
+- Profils de contrôle séparés : clé Root ou Admin dans le profil administration, jamais reproposée comme clé de travail. Après `/health` et `control === true`, vérification réelle de `/api/v1/admin/accounts` (Root) ou de `/api/v1/admin/accounts/{account_id}/users` (Admin de son compte). La clé User conserve `fs/ls` et le SDK same-origin. [Contrat de boot](../.work/studio/CONTRAT.md), [contrôle](CONTROL.md).
+- Clés Gateway : la liste des utilisateurs démarre sur la réponse d’accès positive et ne dépend plus d’un rendu intermédiaire. Le sélecteur reste en place pendant l’attente, l’émission n’est pas activée sur une permission inconnue et le vrai parcours « pour soi » ne consulte pas l’annuaire. La preuve de montage est en jsdom, sans clés réelles.
+- Les flags strictement booléens de `GET /api/v1/system/edge-capabilities` sont évalués sous l’identité courante. Ni lien ni rôle seul n’ouvre un écran ; absence, erreur ou changement d’identité ne réutilise pas un ancien flag. Les entrées indisponibles ne figurent pas dans la navigation et les liens directs ont une explication. L’import OVPack (extension, type compatible, fichier non vide) appelle `/api/v1/pack/temp_upload` en multipart `file`, puis `/api/v1/pack/import`, sans repli sur l’upload texte ; export derrière son propre flag.
+- SEC-02 : chiffrement AES-GCM avec clé non exportable quand disponible ; à défaut, mémoire de page vide et pas de migration des slots en clair. Contrôles d’intégrité et d’échec d’écriture avec clés et fichiers synthétiques ; ce n’est pas une barrière contre du code actif exécuté sur la même origine.
+
+### VikingBot, Compile et Watches : contrôle sur Workerd local
+
+Même `index.html` (`d200cd3e…`), même type de clé User de test, pas de changement de garde UI entre les deux instances. Sur **8804**, le parent a établi que la fixture IA était injectée dans Workspace mais absente de l’entrée Worker. `edge-capabilities` a bien répondu `bot:false` et `compile:false` ; `/bot/v1/health` était pourtant HTTP 200 et `/api/v1/compile/capabilities` `configured:true`. Le Studio bloquait conformément aux drapeaux. Sur **8806**, avec la fixture côté entrée et Workspace, nos GET ont relevé `bot:true`, `compile:true`, santé Bot HTTP 200 `healthy` et Compile `can_create:true`. `watches:false` reste respecté, même si le GET d’annuaire répond 200 avec une liste de tâches : il ne prouve pas l’admission de la source distante. [Preuve 8804](../.work/studio/CAPABILITES-8804.json), [preuve 8806](../.work/studio/CAPABILITES-8806.json).
+
+Le test DOM Edge monte la vraie garde avec réponses synthétiques : accès direct à Bot, Compile ou Watches seulement sur le booléen vrai propre à la route, puis envoi de la sonde d’origine `/bot/v1/health` avec la clé de données. Ce test ne remplace pas le navigateur du parent ni la génération réelle sur un compte Cloudflare. La dernière finition du build adapte aussi la révocation de compte : le client exige `status:'revoked'` et `data_retained:true`, ne fabrique pas de tâche de purge et l’interface dit que les données sont conservées.
+
+### Delta Root/mise en page de UX-PARITY
+
+Le `200` des réglages User pour Root peut contenir `memory_policy:null` (relevé sur 8806). Le Studio rend un état localisé **« Memory policy not available »**, sans substituer un preset ni ouvrir l’édition sur Edge. Le test de rendu/montage frais reproduit l’ancienne exception et passe après le delta. À petite largeur, le sélecteur passe sur une seconde rangée entière ; le compte ne peut plus se compresser en dessous de 6 rem. La relecture de `bc1b9a2c…` précède ce delta ; utiliser l’empreinte `9fd48ee4…` de l’[avis de remise](../.work/studio/AVANCEMENT.md) pour vérifier le rendu.
+
+Le correctif d’architecture d’Arranger est compilé séparément (`--stage`, SHA `9d3b0462…`), sans écraser le paquet P1/P2 en recette. Il conserve l’URL, la validation de recherche et la garde Edge. La [matrice](../.work/studio/COHORTES.md) préserve les deux campagnes complètes, les vrais échecs et les reprises ciblées sans les fusionner en un faux tout-vert.
+
+Ces vérifications ne remplacent pas une recette navigateur sur le **bundle exact** : contrastes rendus, focus visible, reflow 320/390 et zoom 200 %, Safari iOS et lecteurs d’écran restent à rejouer par le parent sur son instance Workerd autorisée. Aucun déploiement, commit ni push.
+
+---
+
+## Historique du premier candidat (ne pas utiliser comme résultat courant)
+
+Ce portage embarque **`upstream/web-studio`** au commit `000f0765d7ec183886fbabbc22e69bc289cc429d` : composants, moteur de navigation, SDK généré et écran de connexion amont. Ce n’est pas une UI de substitution. Les patches sous `studio-patches/` enferment la connexion à l’origine du document, adaptent l’onboarding à une seule clé User, ajoutent une notice EN/中文 avec des liens vers l’explorateur et la recherche, externalisent l’amorçage UUID pour la CSP, et rendent le stockage Edge strict. Les routes, paramètres, en-têtes et réponses gardent le contrat amont ; les erreurs réelles ne sont pas masquées. Le serveur décide de l’authentification, des permissions et des données.
+
+**SEC-02 :** la persistance est chiffrée lorsque Web Crypto et IndexedDB sont utilisables. Sinon le port Edge utilise une mémoire vide, limitée à la page. Un ancien slot en clair n’est ni adopté, ni migré, ni effacé ; sa présence rend cette connexion temporaire sans modifier les slots. La garde de sortie refuse les fichiers `.map` (y compris compressés) et les directives de sourcemaps dans les JS/CSS/HTML. Ces changements ne remplacent pas une validation du stockage dans le navigateur.
+
+## Rejouer
+
+Depuis `openviking-cloudflare/`, sous Linux x86-64 (Python 3.10+, Git, npm système, `libseccomp.so.2`, Landlock ABI ≥ 6). L’amont utilise Node 22 dans `.github/workflows/_build.yml:119` ; le binaire Node peut être choisi avec `--node` :
+
+```sh
+./scripts/build-studio.sh
+./scripts/test-studio.sh --offline
+./scripts/test-studio.sh --offline --upstream-only
+```
+
+- Chaque invocation exporte exclusivement le Studio du SHA épinglé dans `.work/studio/`, vérifie le lockfile et installe avec `npm ci --ignore-scripts --no-audit --no-fund`. Pas de dépendances, de scripts ou de configuration npm de la racine. Une fois le cache npm Studio rempli, `--offline` fonctionne aussi pour le build. Les programmes retenus (`package.json`, configuration Vite/ESLint, initialisation Vitest et règle i18n) ont été lus comme données sous Prompt Shield.
+- Sans option, le build exécute `npm run build -- --base=/studio/` comme l’amont, y compris `prebuild` (`lint` et `test:i18n`). `--bundle-only` isole la vraie compilation Vite (`npm --ignore-scripts run build -- --base=/studio/`), sans créditer `prebuild`. `--prebuild-only` rejoue uniquement les contrôles. Le build active `VITE_STUDIO_EDGE=true`. Aucun `VITE_OV_*` ni identifiant n’est fourni. Ne jamais embarquer une clé via `VITE_*`.
+- `test-studio.sh` lance `npm test` sans filtre ; `--upstream-only` retire seulement les patches de la copie. Les 221 fichiers de tests d’origine sont contrôlés par SHA-256 avant/après les étapes qui se terminent ; aucun patch ne touche un test amont. `--pool`, `--workers` et `--test-timeout-ms` règlent le lanceur, pas les assertions, délais codés ou fixtures. Le blocage après fichiers terminés est observé avec `forks` **et** `threads` sur ce bureau, y compris avec Node 22 ; sa cause n’a pas été établie.
+- `HOME`, répertoires XDG, temporaires et fichiers npmrc sont jetables. Landlock empêche la lecture du checkout, des fichiers hors de la copie et de l’environnement de `/proc` ; seccomp ferme les sockets Unix vers d’autres processus et les sockets IP du build et de l’installation `--offline`. Au premier `npm ci`, HTTPS et DNS sont possibles ; seules les archives HTTPS du registre public npm mentionnées dans le lockfile sont acceptées. La suite utilise ses propres serveurs HTTP `127.0.0.1` sur ports éphémères. Le garde noyau des tests filtre les **ports** TCP, pas les adresses IP : il n’est pas équivalent à un namespace réseau. Les sondes de confinement doivent réussir avant exécution.
+- Les copies sont nettoyées en sortie normale ; les journaux restent sous `.work/studio/logs/`. `upstream/` est en lecture seule pour ce travail. Aucun navigateur, aucun déploiement et aucune clé réelle ne sont nécessaires à ces commandes.
+
+## Intégration HTTP
+
+Le répertoire [`dist/studio/`](../dist/studio/) contient `index.html`, les chunks locaux et les assets PWA. Servir `/studio/` (rediriger `/studio` vers `/studio/`), `/studio/assets/*`, `/studio/manifest*.json` et `/studio/service-worker.js`. Retourner `index.html` pour les routes de navigation SPA, mais un vrai 404 pour un fichier manquant. Ne pas réécrire les requêtes `/api/`, `/bot/`, `/health` ou `/ready` en HTML. Conseillé : HTML/service worker revalidés, cache long réservé aux assets à empreinte, types MIME corrects et conservation de la CSP restrictive. Les liens de documentation restent des sorties explicites ; le chargement et l’API ne dépendent d’aucune origine tierce.
+
+Le [contrat d’amorçage](../.work/studio/CONTRAT.md) détaille la connexion User par `X-API-Key`, la découverte de `/health`, la sonde de racine, les données de l’explorateur et la recherche groupée. La première tranche ne garantit pas l’administration, VikingBot, les imports distants, les extensions, ni toutes les variantes de recherche et d’édition. L’UI ne fournit aucun faux backend : une fonctionnalité non portée doit renvoyer une erreur structurée, typiquement HTTP 501. La validation navigateur et l’intégration Workerd sont distinctes de la suite Vitest.
+
+## Résultats locaux du 21 novembre 2026
+
+**Candidat livré : `build-k68alq7v/vite-only`** — Node `v22.22.0` (archive officielle vérifiée SHA-256 `9aa8e9d2298ab68c600bd6fb86a6c13bce11a4eca1ba9b39d79fa021755d7c37`), npm `11.19.1`, Vite `7.3.2` ; exit 0, 6 748 modules transformés, 1m44s Vite. La copie d’installation confinée du premier essai a été reprise avec les cinq patches finaux : 615 fichiers, 19 360 966 octets ; 615 empreintes relues conformes, sans `.map` ni directive publique. Entrée `/studio/assets/index-UpWspZeC.js` (SHA-256 `71db050851da9f4da7f2a9ac90b7de31fa91598c094deb71e7fd653a59a46cc0`). `index.html` : `686594e0c4c058b4cee4626772db2187e531725ed7053e16475ece44ac102967`. [Manifeste](../.work/studio/logs/build-k68alq7v/assets.sha256) et [journal Vite](../.work/studio/logs/build-k68alq7v/vite-only.log).
+
+| Exécution | Résultat réellement publié par le lanceur avant l’arrêt |
+| --- | --- |
+| Amont pur, Node 26.10.0, `forks`, 4 workers, 5 s par test | 4 fichiers annoncés : 181 tests dont **12 délais Vitest atteints** (3 overview, 3 upstreams, 6 configuration). Pas de résumé global. `test-6qgijthy/test.log`. |
+| Port intermédiaire, Node 26.10.0, `forks`, 2 workers, 20 s | 2 fichiers annoncés : **114 réussis**, aucun échec signalé sur ces fichiers. Pas de résumé global. `test-b7dznbhn/test.log`. |
+| Amont pur, Node 22.22.0, `threads`, 2 workers, 20 s | 2 fichiers annoncés : **114 réussis**, aucun échec signalé sur ces fichiers. Pas de résumé global. `test-av9mpt3k/test.log`. |
+| Port final, Node 22.22.0, `threads`, 2 workers, 20 s | Les mêmes 2 fichiers annoncés : **114 réussis**, aucun échec signalé sur ces fichiers. Pas de résumé global. `test-3220auit/test.log`. |
+| Prebuild du port intermédiaire, Node 26.10.0 | ESLint : **0 erreur, 8 avertissements**. Vitest i18n : **48 tests / 5 fichiers annoncés**, sans résumé de fin ni retour à Vite. `build-k68alq7v/build.log`. |
+| Prebuild séparé du port final, Node 22.22.0 | ESLint : **0 erreur, 8 avertissements**. Vitest i18n : **40 tests / 2 fichiers annoncés**, sans résumé de fin. `build-k68alq7v/prebuild-node22.log`. |
+
+Journaux sous `.work/studio/logs/`. Les processus suspendus ont été arrêtés après constat, sans relancer la compilation. La suite complète et la régression SEC-02 dédiée (`studio-patches/edge-credentials.test.ts`, non atteinte) **ne sont pas qualifiées**. Avec la décision de corriger la lecture des hints d’identité côté Worker comme en amont, aucun patch d’auth UI n’a été retenu ; le candidat ci-dessus n’a pas été reconstruit. Le navigateur, le Worker et tout déploiement sont hors de la preuve de ce lot.
+
+## Inventaire : `upstream/frontend/`
+
+Workspace npm séparé, avec lockfile et chaîne **Rslib/Rspress**. `packages/react` publie `@openviking/react` (composants/modules, client et provider, icônes, CSS/thèmes et déclarations) ; `packages/icons` porte les SVG ; `docs` est la documentation et les démos de la bibliothèque. Exemples d’entrées : `@openviking/react/client`, `@openviking/react/modules/file-browser`, `@openviking/react/components/file-preview` et `@openviking/react/style.css`. La bibliothèque n’est pas une application Studio ni une dépendance de son manifeste au SHA épinglé. Inventoriée seulement : ni installée, ni compilée, ni substituée au Studio.

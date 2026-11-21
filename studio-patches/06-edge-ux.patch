@@ -1,0 +1,1678 @@
+diff --git a/src/app/layouts/studio-feature-boundary.tsx b/src/app/layouts/studio-feature-boundary.tsx
+--- a/src/app/layouts/studio-feature-boundary.tsx
++++ b/src/app/layouts/studio-feature-boundary.tsx
+@@ -1,6 +1,10 @@
+ import { useAppConnection } from '#/features/connection/hooks/use-app-connection'
+ import { useStudioCapabilities } from '#/features/connection/hooks/use-studio-capabilities'
+ import { useStudioService } from '#/features/connection/hooks/use-studio-service'
++import { useEdgeFeatures } from '#/features/connection/hooks/use-edge-features'
++import { useStudioMode } from '#/features/connection/hooks/use-studio-mode'
++import { edgeAllowsPage } from '#/shared/lib/edge-capabilities'
++import { EDGE_STUDIO } from '#/shared/lib/edge-studio'
+ import {
+   connectionSettingsPath,
+   isConnectionSettingsPath,
+@@ -34,7 +38,24 @@
+   const cloudProbe =
+     service.ready && service.provider === 'volcengine' && Boolean(probe)
+   const capabilities = useStudioCapabilities()
++  const { flags, pending } = useEdgeFeatures()
++  const { canManage } = useStudioMode()
+   const capability = feature ? capabilities[feature.id] : undefined
++  if (EDGE_STUDIO && pathname !== '/' && !isConnectionSettingsPath(pathname)) {
++    const management = isManagementPath(pathname)
++    const hasWorkspace = Boolean(connection.apiKey)
++    const allowed = (management || hasWorkspace) && edgeAllowsPage(pathname, flags, canManage)
++    if (!allowed) return (
++      <section className="mx-auto grid w-full max-w-xl gap-4 rounded-xl border bg-card p-5" aria-live="polite">
++        <h1 className="text-lg font-medium">{t(pending ? 'states.checking.title' : 'edge.unsupportedTitle')}</h1>
++        <p className="text-sm text-foreground">{t(pending ? 'states.checking.description' : !management && !hasWorkspace ? 'edge.workspaceRequired' : 'edge.unsupportedDescription')}</p>
++        <div className="flex flex-wrap gap-2">
++          {hasWorkspace ? <Button nativeButton={false} render={<Link to="/filesystem" />}>{t('edge.explorer')}</Button> : null}
++          <Button nativeButton={false} variant="outline" render={<Link to={management ? '/admin/connections/new' : '/connections/new'} />}>{t('edge.useAnotherProfile')}</Button>
++        </div>
++      </section>
++    )
++  }
+   if (
+     isConnectionSettingsPath(pathname) ||
+     pathname === '/' ||
+diff --git a/src/app/layouts/studio-header.tsx b/src/app/layouts/studio-header.tsx
+--- a/src/app/layouts/studio-header.tsx
++++ b/src/app/layouts/studio-header.tsx
+@@ -8,6 +8,8 @@
+ import brandLockupLight from '#/assets/brand-lockup-light.svg'
+ import { OpenVikingMark } from '#/shared/components/openviking-mark'
+ import { resolveConfiguredServiceProvider } from '#/shared/lib/studio-service'
++import { EDGE_STUDIO } from '#/shared/lib/edge-studio'
++import { cn } from '#/shared/lib/utils'
+ import { SidebarTrigger } from '#/shared/ui/sidebar'
+ import { Link, useRouterState } from '@tanstack/react-router'
+ import { useTranslation } from 'react-i18next'
+@@ -32,13 +34,17 @@
+   const showManagementEntry =
+     !isGatewayHost &&
+     (canManage ||
+-      resolveConfiguredServiceProvider(
++      (!EDGE_STUDIO && resolveConfiguredServiceProvider(
+         connection.baseUrl,
+         connection.serviceSelection,
+-      ) === 'opensource')
++      ) === 'opensource'))
+   return (
+-    <header className="z-20 flex h-14 shrink-0 items-center justify-between gap-2 border-b border-border/70 bg-background px-3 sm:gap-4 sm:px-4">
+-      <div className="flex min-w-0 items-center gap-2 sm:gap-4">
++    <header className={cn(
++      'z-20 flex h-14 shrink-0 items-center justify-between gap-2 border-b border-border/70 bg-background px-3 sm:gap-4 sm:px-4',
++      EDGE_STUDIO && 'max-sm:grid max-sm:h-auto max-sm:grid-cols-[minmax(0,1fr)_auto] max-sm:gap-y-1 max-sm:py-2',
++    )}>
++      <div className={cn('flex min-w-0 items-center gap-2 sm:gap-4', EDGE_STUDIO && 'max-sm:contents')}>
++        <div className="flex min-w-0 shrink-0 items-center gap-2 sm:gap-4">
+         <SidebarTrigger className="shrink-0 md:hidden" />
+         <Link
+           to={managementMode ? '/admin' : '/'}
+@@ -60,14 +66,17 @@
+           />
+         </Link>
+         <div className="hidden h-5 w-px bg-border/70 sm:block" />
++        </div>
++        <div className={cn('min-w-0', EDGE_STUDIO && 'max-sm:col-span-2 max-sm:row-start-2')}>
+         <StudioScopeSwitcher
+           key={`${identityScopeKey}:${managementMode}:${showAccountScope}`}
+           settingsPath={settingsPath}
+           managementMode={managementMode}
+           showAccountScope={showAccountScope}
+         />
++        </div>
+       </div>
+-      <div className="flex shrink-0 items-center gap-1.5 sm:gap-3">
++      <div className={cn('flex shrink-0 items-center gap-1.5 sm:gap-3', EDGE_STUDIO && 'max-sm:col-start-2 max-sm:row-start-1 max-sm:justify-self-end')}>
+         {managementMode ? (
+           <span className="hidden rounded-md bg-muted/60 px-2 py-1 text-xs text-muted-foreground xl:inline">
+             {t('modes.management')}
+diff --git a/src/app/layouts/studio-layout.tsx b/src/app/layouts/studio-layout.tsx
+--- a/src/app/layouts/studio-layout.tsx
++++ b/src/app/layouts/studio-layout.tsx
+@@ -25,6 +25,8 @@
+   isStudioFeatureVisible,
+ } from '#/shared/lib/studio-service'
+ import { EDGE_STUDIO } from '#/shared/lib/edge-studio'
++import { edgeAllowsPage } from '#/shared/lib/edge-capabilities'
++import { useEdgeFeatures } from '#/features/connection/hooks/use-edge-features'
+ import { ScrollArea } from '#/shared/ui/scroll-area'
+ import {
+   Sidebar,
+@@ -112,7 +114,9 @@
+     pathname.startsWith('/oauth/verify/') ||
+     pathname === '/admin/oauth/verify'
+   const capabilities = useStudioCapabilities()
++  const { flags } = useEdgeFeatures()
+   const visibleNavItems = NAV_ITEMS.filter((item) => {
++    if (EDGE_STUDIO && !edgeAllowsPage(item.to, flags, canManage)) return false
+     const feature = featureForPath(item.to)
+     return (
+       !feature ||
+@@ -231,11 +235,11 @@
+ 
+             <SidebarGroup
+               className="pb-1"
+-              hidden={provider !== 'opensource' || isGatewayHost}
++              hidden={provider !== 'opensource' || isGatewayHost || (EDGE_STUDIO && (flags.oauth !== true || managementMode))}
+             >
+               <SidebarGroupContent>
+                 <SidebarMenu>
+-                  {provider === 'opensource' && !isGatewayHost ? (
++                  {provider === 'opensource' && !isGatewayHost && (!EDGE_STUDIO || (flags.oauth === true && !managementMode)) ? (
+                     <SidebarMenuItem>
+                       <SidebarMenuButton
+                         onClick={openCrossDeviceVerify}
+@@ -333,7 +337,8 @@
+             <div className="flex w-full flex-col gap-6 px-4 py-6 md:px-6">
+               {EDGE_STUDIO ? (
+                 <div role="note" className="rounded-md border border-border bg-muted/40 px-3 py-2 text-sm text-foreground">
+-                  <p>{t('studio:edge.notice')}</p>
++                  <p>{t('studio:edge.limitedNotice')}</p>
++                  {!managementMode && connection.apiKey ? (
+                   <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1">
+                     <Link to="/filesystem" className="underline underline-offset-4 focus-visible:outline-2 focus-visible:outline-offset-2">
+                       {t('studio:edge.explorer')}
+@@ -342,6 +347,7 @@
+                       {t('studio:edge.retrieval')}
+                     </Link>
+                   </div>
++                  ) : null}
+                 </div>
+               ) : null}
+               {children}
+diff --git a/src/app/navigation/studio-management-navigation.tsx b/src/app/navigation/studio-management-navigation.tsx
+--- a/src/app/navigation/studio-management-navigation.tsx
++++ b/src/app/navigation/studio-management-navigation.tsx
+@@ -18,6 +18,7 @@
+   WaypointsIcon,
+ } from 'lucide-react'
+ import { useTranslation } from 'react-i18next'
++import { EDGE_STUDIO } from '#/shared/lib/edge-studio'
+ 
+ const managementItems = [
+   {
+@@ -61,7 +62,7 @@
+   developmentMode?: boolean
+ }) {
+   const { t } = useTranslation(['appShell', 'settings'])
+-  const serviceItems = [
++  const serviceItems = EDGE_STUDIO ? [] : [
+     ...(isRoot && !gatewayOnly && !developmentMode
+       ? ([
+           {
+@@ -92,7 +93,7 @@
+   ]
+   const groups = [
+     ...(!gatewayOnly && !developmentMode
+-      ? [{ label: 'appShell:modes.management', items: managementItems }]
++      ? [{ label: 'appShell:modes.management', items: EDGE_STUDIO ? managementItems.slice(0, 2) : managementItems }]
+       : []),
+     ...(serviceItems.length
+       ? [{ label: 'appShell:sidebar.groups.services', items: serviceItems }]
+diff --git a/src/app/router/admin-boundary.tsx b/src/app/router/admin-boundary.tsx
+--- a/src/app/router/admin-boundary.tsx
++++ b/src/app/router/admin-boundary.tsx
+@@ -1,5 +1,7 @@
+ import { useAppConnection } from '#/features/connection/hooks/use-app-connection'
+ import { useStudioMode } from '#/features/connection/hooks/use-studio-mode'
++import { useEdgeFeatures } from '#/features/connection/hooks/use-edge-features'
++import { EDGE_STUDIO } from '#/shared/lib/edge-studio'
+ import { isConnectionSettingsPath } from '#/features/connection/lib/studio-mode'
+ import { Button } from '#/shared/ui/button'
+ import { Link, Outlet, useRouterState } from '@tanstack/react-router'
+@@ -8,6 +10,7 @@
+ export function AdminRoute() {
+   const { t } = useTranslation('appShell')
+   const { canManage } = useStudioMode()
++  const { pending } = useEdgeFeatures()
+   const { isConnectionRoleLoading, isGatewayHost, serverMode } =
+     useAppConnection()
+   const pathname = useRouterState({ select: (s) => s.location.pathname })
+@@ -16,7 +19,7 @@
+     isGatewayHost &&
+     (pathname === '/admin/gateway' || pathname.startsWith('/admin/gateway/'))
+   if (isConnectionSettingsPath(pathname) || standaloneGateway) return <Outlet />
+-  if (isConnectionRoleLoading) return <p role="status">{t('modes.checking')}</p>
++  if (isConnectionRoleLoading || (EDGE_STUDIO && pending)) return <p role="status">{t('modes.checking')}</p>
+   if (!canManage)
+     return (
+       <section className="mx-auto grid w-full max-w-xl gap-4 rounded-xl border bg-card p-6">
+diff --git a/src/app/router/studio-entry.tsx b/src/app/router/studio-entry.tsx
+--- a/src/app/router/studio-entry.tsx
++++ b/src/app/router/studio-entry.tsx
+@@ -7,6 +7,7 @@
+ import { Navigate } from '@tanstack/react-router'
+ 
+ import { useAppConnection } from '#/features/connection/hooks/use-app-connection'
++import { EDGE_STUDIO } from '#/shared/lib/edge-studio'
+ 
+ export function IndexRoute() {
+   const { provider } = useStudioService()
+@@ -19,6 +20,7 @@
+   } = useAppConnection()
+   const { canManage } = useStudioMode()
+   if (isConnectionRoleLoading) return null
++  if (EDGE_STUDIO && connection.adminApiKey && !connection.apiKey) return <Navigate replace to="/admin" />
+   return (
+     <Navigate
+       replace
+diff --git a/src/features/admin/users/components/delete-account-button.tsx b/src/features/admin/users/components/delete-account-button.tsx
+--- a/src/features/admin/users/components/delete-account-button.tsx
++++ b/src/features/admin/users/components/delete-account-button.tsx
+@@ -9,6 +9,7 @@
+ import type { AdminConnection } from '#/shared/api/admin'
+ import { deleteAdminAccount, fetchAdminAccounts } from '#/shared/api/admin'
+ import { PLAIN_INPUT_PROPS } from '#/shared/lib/form-input'
++import { EDGE_STUDIO } from '#/shared/lib/edge-studio'
+ import { Button } from '#/shared/ui/button'
+ import {
+   Dialog,
+@@ -57,7 +58,8 @@
+       setOpen(false)
+       setConfirmation('')
+       toast.success(
+-        t('toast.accountDeletionStarted', { account: accountId, taskId }),
++        EDGE_STUDIO ? t('studio:edge.accountRevoked', { account: accountId }) :
++          t('toast.accountDeletionStarted', { account: accountId, taskId }),
+       )
+ 
+       if (!nextAccountId) {
+@@ -78,7 +80,7 @@
+         onClick={() => setOpen(true)}
+       >
+         <Trash2Icon />
+-        {t('actions.deleteAccount')}
++        {t(EDGE_STUDIO ? 'studio:edge.revokeAccount' : 'actions.deleteAccount')}
+       </Button>
+ 
+       <Dialog
+@@ -102,9 +104,9 @@
+             }}
+           >
+             <DialogHeader>
+-              <DialogTitle>{t('dialogs.deleteAccount.title')}</DialogTitle>
++              <DialogTitle>{t(EDGE_STUDIO ? 'studio:edge.revokeAccount' : 'dialogs.deleteAccount.title')}</DialogTitle>
+               <DialogDescription>
+-                {t('dialogs.deleteAccount.description', { account: accountId })}
++                {t(EDGE_STUDIO ? 'studio:edge.revokeAccountHelp' : 'dialogs.deleteAccount.description', { account: accountId })}
+               </DialogDescription>
+             </DialogHeader>
+             <div className="grid gap-2 py-5">
+@@ -143,7 +145,7 @@
+                 ) : (
+                   <Trash2Icon />
+                 )}
+-                {t('actions.confirmDeleteAccount')}
++                {t(EDGE_STUDIO ? 'studio:edge.revokeAccount' : 'actions.confirmDeleteAccount')}
+               </Button>
+             </DialogFooter>
+           </form>
+diff --git a/src/features/admin/users/components/user-memory-policy-cell.tsx b/src/features/admin/users/components/user-memory-policy-cell.tsx
+--- a/src/features/admin/users/components/user-memory-policy-cell.tsx
++++ b/src/features/admin/users/components/user-memory-policy-cell.tsx
+@@ -8,6 +8,7 @@
+   updateUserMemorySettings,
+ } from '#/shared/api/admin'
+ import { getErrorMessage } from '#/shared/lib/error'
++import { EDGE_STUDIO } from '#/shared/lib/edge-studio'
+ import type { UserMemoryPolicy } from '#/shared/lib/user-memory-policy'
+ import { identifyMemoryPreset } from '#/shared/lib/user-memory-policy'
+ import { Button } from '#/shared/ui/button'
+@@ -79,7 +80,15 @@
+         {t('memoryPolicy.retry')}
+       </Button>
+     )
+-  const preset = identifyMemoryPreset(query.data.memory_policy)
++  const policy = query.data.memory_policy
++  if (policy === null) {
++    return <span className="text-sm text-muted-foreground">{t('studio:edge.memoryPolicyUnavailable')}</span>
++  }
++  const preset = identifyMemoryPreset(policy)
++  if (EDGE_STUDIO) {
++    // Read support does not imply that this deployment can edit a policy.
++    return <span className="text-sm">{t(`memoryPolicy.${preset}.name`)}</span>
++  }
+   return (
+     <>
+       <Tooltip>
+@@ -91,7 +100,7 @@
+               disabled={query.isFetching}
+               onClick={async () => {
+                 const result = await query.refetch()
+-                if (result.isSuccess) setOpen(true)
++                if (result.isSuccess && result.data.memory_policy !== null) setOpen(true)
+               }}
+               aria-label={t('memoryPolicy.editUser', { user: user.userId })}
+             />
+@@ -106,7 +115,7 @@
+           <p className="border-b px-4 py-3 font-semibold">
+             {t(`memoryPolicy.${preset}.name`)}
+           </p>
+-          <MemoryPolicyDetails value={query.data.memory_policy} />
++          <MemoryPolicyDetails value={policy} />
+         </TooltipContent>
+       </Tooltip>
+       <Dialog
+@@ -127,7 +136,7 @@
+           </DialogHeader>
+           <MemoryPolicyPicker
+             editing
+-            value={query.data.memory_policy}
++            value={policy}
+             disabled={update.isPending}
+             onBack={() => setOpen(false)}
+             onSelect={(value) => update.mutate(value)}
+diff --git a/src/features/connection/components/studio-mode-switch.tsx b/src/features/connection/components/studio-mode-switch.tsx
+--- a/src/features/connection/components/studio-mode-switch.tsx
++++ b/src/features/connection/components/studio-mode-switch.tsx
+@@ -20,6 +20,7 @@
+ } from 'lucide-react'
+ import * as React from 'react'
+ import { useTranslation } from 'react-i18next'
++import { EDGE_STUDIO } from '#/shared/lib/edge-studio'
+ 
+ export function StudioModeSwitch({
+   managementMode,
+@@ -88,6 +89,11 @@
+       setPending(false)
+     }
+   }
++  if (EDGE_STUDIO && managementMode) return (
++    <Button nativeButton={false} variant="outline" aria-label={label} className={buttonClass} render={<Link to="/connections/new" />}>
++      {content}
++    </Button>
++  )
+   if (!managementMode && !canManage)
+     return <ManagementKeyDialog className={buttonClass} />
+   if (!managementMode || hasDataIdentity || users.length === 0) {
+diff --git a/src/features/connection/components/studio-scope-switcher.tsx b/src/features/connection/components/studio-scope-switcher.tsx
+--- a/src/features/connection/components/studio-scope-switcher.tsx
++++ b/src/features/connection/components/studio-scope-switcher.tsx
+@@ -9,6 +9,7 @@
+ import { newConnectionPath } from '#/features/connection/lib/studio-mode'
+ import { resolveStudioManagementCapabilities } from '#/features/connection/lib/studio-permissions'
+ import { fetchAdminAccounts, fetchAdminUsers } from '#/shared/api/admin'
++import { EDGE_STUDIO } from '#/shared/lib/edge-studio'
+ import { cn } from '#/shared/lib/utils'
+ import { Button } from '#/shared/ui/button'
+ import { Input } from '#/shared/ui/input'
+@@ -41,6 +42,7 @@
+   value,
+   icon: Icon,
+   readOnly = false,
++  account = false,
+   children,
+ }: React.PropsWithChildren<{
+   open: boolean
+@@ -49,14 +51,16 @@
+   value: string
+   icon: LucideIcon
+   readOnly?: boolean
++  account?: boolean
+ }>) {
++  const identityWidth = EDGE_STUDIO && account && 'max-sm:min-w-24 max-sm:shrink-0'
+   if (readOnly) {
+     return (
+       <div
+         role="group"
+         aria-label={label}
+         title={value}
+-        className="flex h-9 min-w-0 items-center gap-1 px-1.5 text-xs sm:gap-1.5 sm:px-2.5 sm:text-sm"
++        className={cn('flex h-9 min-w-0 items-center gap-1 px-1.5 text-xs sm:gap-1.5 sm:px-2.5 sm:text-sm', identityWidth)}
+       >
+         <Icon className="size-3.5 shrink-0 text-muted-foreground" />
+         <span className="max-w-24 truncate sm:max-w-40">{value}</span>
+@@ -68,7 +72,7 @@
+       <PopoverTrigger
+         aria-label={label}
+         title={value}
+-        className="flex h-9 min-w-0 items-center gap-1 rounded-md px-1.5 text-xs outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring sm:gap-1.5 sm:px-2.5 sm:text-sm"
++        className={cn('flex h-9 min-w-0 items-center gap-1 rounded-md px-1.5 text-xs outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring sm:gap-1.5 sm:px-2.5 sm:text-sm', identityWidth)}
+       >
+         <Icon className="size-3.5 shrink-0 text-muted-foreground" />
+         <span className="max-w-24 truncate sm:max-w-40">{value}</span>
+@@ -376,6 +380,7 @@
+             </span>
+             <ScopeMenu
+               open={open === 'account'}
++              account
+               onOpenChange={changeOpen('account')}
+               label={t(
+                 managementMode && !canListAccounts
+diff --git a/src/features/connection/components/studio-setup.tsx b/src/features/connection/components/studio-setup.tsx
+--- a/src/features/connection/components/studio-setup.tsx
++++ b/src/features/connection/components/studio-setup.tsx
+@@ -194,7 +194,14 @@
+     isValidConnectionUrl(draft.baseUrl)
+   const [busy, setBusy] = useState(false)
+   const [error, setError] = useState<string | Error>('')
+-  const keyRequiredMessage = t(EDGE_STUDIO ? 'studio:edge.keyRequired' : 'keyRequired')
++  const [edgeControl, setEdgeControl] = useState(() => EDGE_STUDIO && Boolean(initialProfile?.connection.adminApiKey && !initialProfile.connection.apiKey))
++  const keySlot = edgeControl ? 'adminApiKey' : 'apiKey'
++  const keyRequiredMessage = t(EDGE_STUDIO ? edgeControl ? 'studio:edge.controlKeyRequired' : 'studio:edge.keyRequired' : 'keyRequired')
++  const keyRejected = EDGE_STUDIO && error instanceof StudioSetupRequestError && error.statusCode === 401
++  const keyInvalid = error === keyRequiredMessage || keyRejected
++  useEffect(() => {
++    if (keyInvalid && !busy) keyInputRef.current?.focus()
++  }, [busy, keyInvalid])
+   const connectionRevisionRef = useRef(0)
+   const verifiedSelectionRef = useRef<string | null>(null)
+   const abortRef = useRef<AbortController | null>(null)
+@@ -350,7 +357,7 @@
+       setError(t('studio:profiles.invalidUrl'))
+       return
+     }
+-    if ((EDGE_STUDIO || draft.serviceSelection === 'volcengine') && !draft.apiKey.trim()) {
++    if ((EDGE_STUDIO || draft.serviceSelection === 'volcengine') && !draft[keySlot].trim()) {
+       setError(keyRequiredMessage)
+       keyInputRef.current?.focus()
+       return
+@@ -441,7 +448,7 @@
+             </p>
+             {EDGE_STUDIO ? (
+               <p role="note" className="mt-3 max-w-sm text-sm text-muted-foreground">
+-                {t('studio:edge.notice')}
++                {t('studio:edge.limitedNotice')}
+               </p>
+             ) : null}
+             <ol
+@@ -732,44 +739,54 @@
+                         {draft.baseUrl}
+                       </p>
+                     </div>
++                    {EDGE_STUDIO ? (
++                      <div className="flex flex-wrap gap-2">
++                        <Button type="button" aria-pressed={!edgeControl} variant={edgeControl ? 'outline' : 'secondary'} onClick={() => { if (edgeControl) { setEdgeControl(false); update({ apiKey: '', adminApiKey: '' }) } }}>
++                          {t('studio:edge.dataProfile')}
++                        </Button>
++                        <Button type="button" aria-pressed={edgeControl} variant={edgeControl ? 'secondary' : 'outline'} onClick={() => { if (!edgeControl) { setEdgeControl(true); update({ apiKey: '', adminApiKey: '' }) } }}>
++                          {t('studio:edge.controlProfile')}
++                        </Button>
++                      </div>
++                    ) : null}
+                     <label
+                       className="grid gap-2 text-sm font-medium"
+                       htmlFor="setup-key"
+                     >
+-                      {t(EDGE_STUDIO ? 'studio:edge.keyLabel' : 'keyLabel')}
++                      {t(EDGE_STUDIO ? edgeControl ? 'studio:edge.controlKey' : 'studio:edge.keyLabel' : 'keyLabel')}
+                       <Input
+                         ref={keyInputRef}
+-                        className="h-11 rounded-lg bg-background/60 text-sm"
++                        className="h-11 rounded-lg bg-background/60 text-base md:text-sm"
+                         id="setup-key"
+-                        name="apiKey"
++                        name={keySlot}
+                         type="password"
+-                        aria-invalid={error === keyRequiredMessage}
++                        aria-invalid={keyInvalid}
+                         aria-describedby={
+-                          error === keyRequiredMessage
++                          keyInvalid
+                             ? 'setup-key-error setup-key-help'
+                             : 'setup-key-help'
+                         }
+-                        value={draft.apiKey}
++                        value={draft[keySlot]}
+                         onChange={(event) =>
+-                          update({ apiKey: event.target.value })
++                          update({ [keySlot]: event.target.value })
+                         }
+                         {...PLAIN_INPUT_PROPS}
+                         autoComplete="off"
+                       />
+                     </label>
+-                    {error === keyRequiredMessage ? (
++                    {keyInvalid ? (
+                       <p
+                         id="setup-key-error"
+                         role="alert"
+                         className="text-sm text-destructive"
+                       >
+-                        {error}
++                        {keyRejected ? t('studio:edge.keyRejected') : keyRequiredMessage}
+                       </p>
+                     ) : null}
+                     <p id="setup-key-help" className="text-sm text-muted-foreground">
+                       {t(
+                         EDGE_STUDIO
+-                          ? 'studio:edge.keyHelp'
++                          ? edgeControl ? 'studio:edge.controlKeyHelp' : 'studio:edge.keyHelp'
+                           : draft.serviceSelection === 'volcengine'
+                             ? 'hostedKeyHelp'
+                             : 'keyHelp',
+@@ -882,7 +899,12 @@
+                       />
+                     </div>
+                   )}
+-                  {error && error !== keyRequiredMessage ? (
++                  {keyRejected && error instanceof Error ? (
++                    <details className="text-sm text-foreground">
++                      <summary className="cursor-pointer">{t('studio:errors.details')}</summary>
++                      <p className="[overflow-wrap:anywhere]">{error.message}</p>
++                    </details>
++                  ) : error && !keyInvalid ? (
+                     <ErrorMessage
+                       error={error}
+                       className="rounded-lg border border-destructive/20 bg-destructive/5 p-3 leading-6"
+diff --git a/src/features/connection/hooks/use-app-connection.tsx b/src/features/connection/hooks/use-app-connection.tsx
+--- a/src/features/connection/hooks/use-app-connection.tsx
++++ b/src/features/connection/hooks/use-app-connection.tsx
+@@ -59,6 +59,8 @@
+   ConnectionRole,
+ } from '#/features/connection/lib/types'
+ import i18n from '#/i18n'
++import { EdgeFeatureProvider } from '#/features/connection/hooks/use-edge-features'
++import { EDGE_STUDIO } from '#/shared/lib/edge-studio'
+ import { normalizeOvClientError, ovClient } from '#/shared/api/ov-client/index'
+ import { identifyServiceProvider } from '#/shared/lib/studio-service'
+ import { useQueryClient } from '@tanstack/react-query'
+@@ -867,7 +869,9 @@
+ 
+   return (
+     <AppConnectionContext.Provider value={value}>
+-      {changingSurface ? null : children}
++      {changingSurface ? null : EDGE_STUDIO ? (
++        <EdgeFeatureProvider connection={value.connection} management={studioMode === 'management'} enabled={serverMode === 'api_key'}>{children}</EdgeFeatureProvider>
++      ) : children}
+     </AppConnectionContext.Provider>
+   )
+ }
+diff --git a/src/features/connection/hooks/use-edge-features.tsx b/src/features/connection/hooks/use-edge-features.tsx
+new file mode 100644
+--- /dev/null
++++ b/src/features/connection/hooks/use-edge-features.tsx
+@@ -0,0 +1,37 @@
++import type { ConnectionDraft } from '#/features/connection/lib/types'
++import type { EdgeFeatures } from '#/shared/lib/edge-capabilities'
++import { fetchEdgeFeatures } from '#/shared/lib/edge-capabilities'
++import { createContext, useContext, useEffect, useMemo, useState } from 'react'
++import type { ReactNode } from 'react'
++
++const closed = { flags: {} as EdgeFeatures, pending: false }
++const EdgeFeatureContext = createContext(closed)
++
++export function EdgeFeatureProvider({ connection, management, enabled, children }: {
++  connection: ConnectionDraft
++  management: boolean
++  enabled: boolean
++  children: ReactNode
++}) {
++  const key = (management ? connection.adminApiKey : connection.apiKey).trim()
++  const { accountId, userId, baseUrl } = connection
++  // A new identity per credential change: no reuse of a request from another profile.
++  const identity = useMemo(() => ({ key, baseUrl, accountId, userId, management, enabled }), [key, baseUrl, accountId, userId, management, enabled])
++  const [result, setResult] = useState<{ identity: typeof identity, flags: EdgeFeatures }>()
++  const ready = enabled && !!key && !!baseUrl
++  useEffect(() => {
++    if (!ready) return
++    const controller = new AbortController()
++    const commit = (flags: EdgeFeatures) => {
++      if (!controller.signal.aborted) setResult({ identity, flags })
++    }
++    void fetchEdgeFeatures(identity.baseUrl, identity.key, controller.signal).then(commit, () => commit({}))
++    return () => controller.abort()
++  }, [identity, ready])
++  const current = result?.identity === identity ? result : undefined
++  return <EdgeFeatureContext.Provider value={ready ? { flags: current?.flags ?? closed.flags, pending: !current } : closed}>{children}</EdgeFeatureContext.Provider>
++}
++
++export function useEdgeFeatures() {
++  return useContext(EdgeFeatureContext)
++}
+diff --git a/src/features/connection/hooks/use-studio-mode.ts b/src/features/connection/hooks/use-studio-mode.ts
+--- a/src/features/connection/hooks/use-studio-mode.ts
++++ b/src/features/connection/hooks/use-studio-mode.ts
+@@ -1,6 +1,8 @@
+ import { useAppConnection } from '#/features/connection/hooks/use-app-connection'
+ import { useStudioService } from '#/features/connection/hooks/use-studio-service'
+ import { canOpenManagement } from '#/features/connection/lib/studio-mode'
++import { useEdgeFeatures } from '#/features/connection/hooks/use-edge-features'
++import { EDGE_STUDIO } from '#/shared/lib/edge-studio'
+ 
+ export function useStudioMode() {
+   const { provider } = useStudioService()
+@@ -11,6 +13,13 @@
+     serverMode,
+     studioMode,
+   } = useAppConnection()
++  const { flags } = useEdgeFeatures()
++  if (EDGE_STUDIO) {
++    return {
++      canManage: studioMode === 'management' && flags.control === true &&
++        canOpenManagement({ provider, connection, role: connectionRole, isRoleLoading: isConnectionRoleLoading, serverMode }),
++    }
++  }
+   return {
+     // This only exposes an entry. Management routes authenticate the control
+     // credential after navigation; showing it must not trigger a Root probe.
+diff --git a/src/features/connection/lib/onboarding.ts b/src/features/connection/lib/onboarding.ts
+--- a/src/features/connection/lib/onboarding.ts
++++ b/src/features/connection/lib/onboarding.ts
+@@ -30,11 +30,12 @@
+ } from '#/shared/api/ov-client/index'
+ import { createRandomUuid } from '#/shared/lib/browser-crypto'
+ import { EDGE_STUDIO } from '#/shared/lib/edge-studio'
++import { fetchEdgeFeatures } from '#/shared/lib/edge-capabilities'
+ 
+ export const SETUP_STORAGE_KEY = 'ov_studio_setup'
+ export const WORKSPACE_SESSION_KEY = 'ov_studio_workspace_selected'
+ export class StudioSetupError extends Error {
+-  constructor(public readonly code: 'invalidService' | 'keyRequired') {
++  constructor(public readonly code: 'invalidService' | 'keyRequired' | 'studio:edge.wrongProfile' | 'studio:edge.unsupportedTitle') {
+     super(code)
+   }
+ }
+@@ -170,6 +171,9 @@
+   if (!isValidConnectionUrl(connection.baseUrl))
+     throw new Error(i18n.t('studio:errors.invalidServerUrl'))
+   if (connection.serviceSelection === 'volcengine') connection.adminApiKey = ''
++  if (EDGE_STUDIO && Boolean(connection.apiKey) === Boolean(connection.adminApiKey)) {
++    throw new StudioSetupError('studio:edge.wrongProfile')
++  }
+   let verifiedKey = connection.apiKey || connection.adminApiKey
+   let health = await fetchConnectionHealth(
+     connection,
+@@ -206,6 +210,18 @@
+     throw new StudioSetupError('invalidService')
+   const mode = resolveServerAuthMode(health)
+   connection.authMode = mode
++  if (EDGE_STUDIO) {
++    if (mode !== 'api_key') throw new StudioSetupError('invalidService')
++    if (connection.apiKey ? health.role !== 'user' && health.role !== 'admin' : health.role !== 'root' && health.role !== 'admin') {
++      throw new StudioSetupError('studio:edge.wrongProfile')
++    }
++    if (connection.adminApiKey) {
++      const flags = await fetchEdgeFeatures(connection.baseUrl, connection.adminApiKey, signal).catch((error: unknown) => {
++        throw new StudioSetupRequestError('data', error, connection)
++      })
++      if (flags.control !== true) throw new StudioSetupError('studio:edge.unsupportedTitle')
++    }
++  }
+   if (mode === 'trusted') {
+     connection.adminApiKey = verifiedKey
+     connection.apiKey = ''
+@@ -244,7 +260,7 @@
+     }
+   } else if (
+     connection.serviceSelection === 'opensource' &&
+-    health.role === 'admin'
++    health.role === 'admin' && !EDGE_STUDIO
+   ) {
+     connection.adminApiKey ||= connection.apiKey
+     connection.apiKey ||= connection.adminApiKey
+@@ -263,6 +279,7 @@
+     if (identity.userId) connection.userId = identity.userId
+   } else if (health.role === 'admin' && identity.accountId) {
+     connection.accountId = identity.accountId
++    if (EDGE_STUDIO && identity.userId) connection.userId = identity.userId
+   }
+   const dataClient = createClient({
+     baseURL: connection.baseUrl,
+@@ -313,6 +330,7 @@
+   connection: ConnectionDraft,
+ ): '/filesystem' | '/admin' | '/home' {
+   if (connection.serviceSelection === 'volcengine') return '/filesystem'
++  if (EDGE_STUDIO) return connection.adminApiKey && !connection.apiKey ? '/admin' : '/home'
+   return resolveStudioEntry({
+     connection,
+     provider: 'opensource',
+diff --git a/src/features/workbench/filesystem/components/data-management-dialog.tsx b/src/features/workbench/filesystem/components/data-management-dialog.tsx
+--- a/src/features/workbench/filesystem/components/data-management-dialog.tsx
++++ b/src/features/workbench/filesystem/components/data-management-dialog.tsx
+@@ -27,8 +27,10 @@
+   createDataManagementClient,
+   exportOvpack,
+   importOvpack,
++  isOvpackFile,
+   listSnapshots,
+ } from '#/features/workbench/filesystem/lib/data-management'
++import { EDGE_STUDIO } from '#/shared/lib/edge-studio'
+ 
+ interface Props {
+   mode: 'history' | 'transfer'
+@@ -37,6 +39,8 @@
+   onChanged: () => void
+   uri: string
+   isDirectory: boolean
++  canImport?: boolean
++  canExport?: boolean
+ }
+ 
+ function errorMessage(error: unknown): string {
+@@ -63,6 +67,8 @@
+   onChanged,
+   uri,
+   isDirectory,
++  canImport = true,
++  canExport = true,
+ }: Props) {
+   const { t } = useTranslation('dataManagement')
+   const source = useMemo(createDataManagementClient, [])
+@@ -72,7 +78,7 @@
+   const [commits, setCommits] = useState<SnapshotCommit[] | null>(null)
+   const [message, setMessage] = useState('')
+   const [file, setFile] = useState<File | null>(null)
+-  const [transferTab, setTransferTab] = useState('export')
++  const [transferTab, setTransferTab] = useState(canExport ? 'export' : 'import')
+   const [conflict, setConflict] = useState<'fail' | 'skip' | 'overwrite'>(
+     'fail',
+   )
+@@ -185,7 +191,7 @@
+           </div>
+         ) : (
+           <Tabs
+-            value={transferTab}
++            value={transferTab === 'export' && !canExport ? 'import' : transferTab === 'import' && !canImport ? 'export' : transferTab}
+             onValueChange={(value) => {
+               if (busy) return
+               setTransferTab(value)
+@@ -193,20 +199,20 @@
+             }}
+           >
+             <TabsList className="w-full" aria-label={t('transferTitle')}>
+-              <TabsTrigger
++              {canExport ? <TabsTrigger
+                 value="export"
+                 disabled={busy && transferTab !== 'export'}
+               >
+                 {t('exportTab')}
+-              </TabsTrigger>
+-              <TabsTrigger
++              </TabsTrigger> : null}
++              {canImport ? <TabsTrigger
+                 value="import"
+                 disabled={busy && transferTab !== 'import'}
+               >
+                 {t('importTab')}
+-              </TabsTrigger>
++              </TabsTrigger> : null}
+             </TabsList>
+-            <TabsContent value="export" className="min-h-52 space-y-4 pt-4">
++            {canExport ? <TabsContent value="export" className="min-h-52 space-y-4 pt-4">
+               <p className="text-xs text-muted-foreground">
+                 {t('exportDescription')}
+               </p>
+@@ -231,8 +237,8 @@
+                   {error}
+                 </p>
+               )}
+-            </TabsContent>
+-            <TabsContent
++            </TabsContent> : null}
++            {canImport ? <TabsContent
+               value="import"
+               keepMounted
+               className="min-h-52 space-y-4 pt-4"
+@@ -247,7 +253,17 @@
+                   aria-label={t('chooseFile')}
+                   className="peer sr-only"
+                   disabled={busy || !isDirectory}
+-                  onChange={(event) => setFile(event.target.files?.[0] ?? null)}
++                  onChange={(event) => {
++                    const selected = event.target.files?.[0] ?? null
++                    if (EDGE_STUDIO && selected && !isOvpackFile(selected)) {
++                      setFile(null)
++                      setError(t('studio:edge.invalidPack'))
++                      event.currentTarget.value = ''
++                    } else {
++                      setError('')
++                      setFile(selected)
++                    }
++                  }}
+                   type="file"
+                 />
+                 <label
+@@ -325,7 +341,7 @@
+                   {error}
+                 </p>
+               )}
+-            </TabsContent>
++            </TabsContent> : null}
+           </Tabs>
+         )}
+         {mode === 'history' && error && (
+diff --git a/src/features/workbench/filesystem/lib/data-management.ts b/src/features/workbench/filesystem/lib/data-management.ts
+--- a/src/features/workbench/filesystem/lib/data-management.ts
++++ b/src/features/workbench/filesystem/lib/data-management.ts
+@@ -11,6 +11,7 @@
+ } from '#/shared/api/ov-client/index'
+ import type { OvClientAdapter } from '#/shared/api/ov-client/types'
+ import { createPatch } from 'diff'
++import { EDGE_STUDIO } from '#/shared/lib/edge-studio'
+ 
+ export interface SnapshotCommit {
+   oid: string
+@@ -212,6 +213,11 @@
+   return data
+ }
+ 
++export function isOvpackFile(file: File): boolean {
++  return file.size > 0 && /\.ovpack$/i.test(file.name) &&
++    ['', 'application/octet-stream', 'application/zip', 'application/x-zip-compressed', 'application/vnd.openviking.ovpack'].includes(file.type.toLowerCase())
++}
++
+ export async function importOvpack(
+   source: OvClientAdapter,
+   parent: string,
+@@ -219,8 +225,11 @@
+   onConflict: 'fail' | 'skip' | 'overwrite',
+   signal: AbortSignal,
+ ): Promise<{ uri: string }> {
++  if (EDGE_STUDIO && !isOvpackFile(file)) throw new Error(i18n.t('studio:edge.invalidPack'))
++  const body = new FormData()
++  if (EDGE_STUDIO) body.set('file', file)
+   const upload = await getOvResult<{ temp_file_id: string }>(
+-    postResourcesTempUpload({
++    EDGE_STUDIO ? source.client.post({ url: '/api/v1/pack/temp_upload', body, signal }) : postResourcesTempUpload({
+       client: source.client,
+       body: { file },
+       signal,
+diff --git a/src/features/workbench/filesystem/page.tsx b/src/features/workbench/filesystem/page.tsx
+--- a/src/features/workbench/filesystem/page.tsx
++++ b/src/features/workbench/filesystem/page.tsx
+@@ -22,6 +22,8 @@
+ 
+ import { useAppConnection } from '#/features/connection/hooks/use-app-connection'
+ import { useStudioService } from '#/features/connection/hooks/use-studio-service'
++import { useEdgeFeatures } from '#/features/connection/hooks/use-edge-features'
++import { EDGE_STUDIO } from '#/shared/lib/edge-studio'
+ import { AddResourceForm } from '#/features/workbench/resources/components/add-resource-page'
+ import { FindPalette } from '#/features/workbench/resources/components/find-palette'
+ import { LazyFilePreview } from '#/features/workbench/resources/components/lazy-file-preview'
+@@ -113,7 +115,10 @@
+   const { t } = useTranslation(['filesystem', 'resources'])
+   const { provider } = useStudioService()
+   const canUseLocalTools = provider === 'opensource'
+-  const canUseCliPanel = canUseLocalTools || provider === 'volcengine'
++  const { flags } = useEdgeFeatures()
++  const canUseCliPanel = !EDGE_STUDIO && (canUseLocalTools || provider === 'volcengine')
++  const canUseHistory = !EDGE_STUDIO || flags.snapshots === true
++  const canUsePacks = !EDGE_STUDIO || flags.packImport === true || flags.packExport === true
+   const { identityScopeKey } = useAppConnection()
+   const search = routeApi.useSearch()
+   const navigate = useNavigate({ from: '/filesystem' })
+@@ -474,11 +479,11 @@
+     setDeleteDialogOpen(false)
+     setTransferOperation(null)
+   }, [selectedUri])
+-  const canManageSelectedUri = selectedUri !== ROOT_URI
++  const canManageSelectedUri = selectedUri !== ROOT_URI && canUseHistory
+   const canDeleteSelectedUri =
+     canUseLocalTools &&
+     selectedUri.replace(/\/$/, '').startsWith('viking://resources/')
+-  const canTransferSelectedUri = transferUri.startsWith('viking://resources/')
++  const canTransferSelectedUri = canUsePacks && transferUri.startsWith('viking://resources/')
+   const displayUri =
+     selectedUri === ROOT_URI ? selectedUri : selectedUri.replace(/\/$/, '')
+   const entries = visibleContextEntries(listQuery.data?.entries ?? [])
+@@ -576,6 +581,20 @@
+     [],
+   )
+ 
++  function adjustPane(side: 'left' | 'right', delta: number) {
++    const limits = side === 'left' ? FILESYSTEM_LEFT_WIDTH : FILESYSTEM_RIGHT_WIDTH
++    const otherWidth = side === 'left' ? (canUseCliPanel && !rightCollapsed ? rightWidth : 0) : leftWidth
++    const layoutWidth = layoutRef.current?.clientWidth
++    const max = layoutWidth ? Math.max(limits.min, Math.min(limits.max, layoutWidth - otherWidth - FILESYSTEM_MAIN_MIN_WIDTH)) : limits.max
++    const width = clampNumber((side === 'left' ? leftWidth : rightWidth) + delta, limits.min, max)
++    if (side === 'left') setLeftWidth(width)
++    else setRightWidth(width)
++    try {
++      window.localStorage.setItem(side === 'left' ? FILESYSTEM_LEFT_WIDTH_STORAGE_KEY : FILESYSTEM_RIGHT_WIDTH_STORAGE_KEY, String(width))
++    } catch { /* Layout is usable without storage. */ }
++  }
++  const adjustablePanes: Array<'left' | 'right'> = canUseCliPanel && !rightCollapsed ? ['left', 'right'] : ['left']
++
+   useEffect(() => {
+     return () => {
+       // Tear down any in-flight drag so the document listeners don't outlive
+@@ -585,7 +604,16 @@
+   }, [])
+ 
+   return (
+-    <div className="-mx-4 -my-6 flex h-[calc(100svh-3rem)] min-h-0 flex-col bg-background md:-mx-6">
++    <div className="-mx-4 flex h-[calc(100svh-3.5rem)] min-h-[32rem] flex-col bg-background md:-mx-6">
++      <div className="hidden flex-wrap items-center gap-x-5 gap-y-2 border-y px-4 py-2 lg:flex">
++        {adjustablePanes.map((side) => (
++          <div key={side} className="flex items-center gap-2" role="group" aria-label={t(side === 'left' ? 'resizeContext' : 'resizeAction')}>
++            <span className="text-xs text-foreground">{t(side === 'left' ? 'resizeContext' : 'resizeAction')}</span>
++            <Button type="button" variant="outline" size="icon-sm" aria-label={t('narrowPane')} onClick={() => adjustPane(side, -32)}><span aria-hidden="true">−</span></Button>
++            <Button type="button" variant="outline" size="icon-sm" aria-label={t('widenPane')} onClick={() => adjustPane(side, 32)}><span aria-hidden="true">+</span></Button>
++          </div>
++        ))}
++      </div>
+       <div
+         ref={layoutRef}
+         className="flex min-h-0 flex-1 flex-col bg-background lg:flex-row"
+@@ -624,7 +652,7 @@
+           onPointerDown={(event) => handleResizeStart('context', event)}
+         />
+ 
+-        <main className="flex min-h-0 min-w-0 flex-1 flex-col lg:border-b-0">
++        <section className="flex min-h-0 min-w-0 flex-1 flex-col lg:border-b-0">
+           <div className="flex min-h-14 items-center gap-3 border-b px-4">
+             <button
+               type="button"
+@@ -651,7 +679,7 @@
+             >
+               <ClipboardIcon className="size-4" />
+             </Button>
+-            {canUseLocalTools &&
++            {canUseLocalTools && (!EDGE_STUDIO || flags.compile === true) &&
+               selectedIsDirectory &&
+               /^viking:\/\/(?:resources(?:\/|$)|user\/[^/]+\/resources(?:\/|$))/.test(
+                 selectedUri,
+@@ -790,7 +818,7 @@
+               showCloseButton={false}
+             />
+           </div>
+-        </main>
++        </section>
+         {canUseCliPanel && !rightCollapsed ? (
+           <FilesystemResizeHandle
+             active={resizingPane === 'action'}
+@@ -921,13 +949,13 @@
+           }}
+         />
+       ) : null}
+-      {dataManagementMode === 'compare' ? (
++      {dataManagementMode === 'compare' && canUseHistory ? (
+         <SnapshotComparisonDialog
+           key={`${identityScopeKey}:${selectedUri}:compare`}
+           onClose={() => setDataManagementMode(null)}
+           uri={selectedUri}
+         />
+-      ) : dataManagementMode ? (
++      ) : (dataManagementMode === 'history' && canUseHistory) || (dataManagementMode === 'transfer' && canUsePacks) ? (
+         <DataManagementDialog
+           key={`${identityScopeKey}:${dataManagementMode === 'transfer' ? transferUri : selectedUri}:${dataManagementMode}`}
+           mode={dataManagementMode}
+@@ -936,6 +964,8 @@
+           onChanged={() => void invalidateAll()}
+           uri={dataManagementMode === 'transfer' ? transferUri : selectedUri}
+           isDirectory={dataManagementMode === 'transfer' || selectedIsDirectory}
++          canImport={!EDGE_STUDIO || flags.packImport === true}
++          canExport={!EDGE_STUDIO || flags.packExport === true}
+         />
+       ) : null}
+       <FindPalette
+diff --git a/src/features/workbench/resources/components/add-resource-page.tsx b/src/features/workbench/resources/components/add-resource-page.tsx
+--- a/src/features/workbench/resources/components/add-resource-page.tsx
++++ b/src/features/workbench/resources/components/add-resource-page.tsx
+@@ -44,6 +44,8 @@
+ import { Textarea } from '#/shared/ui/textarea'
+ import { Tooltip, TooltipContent, TooltipTrigger } from '#/shared/ui/tooltip'
+ 
++import { EDGE_STUDIO } from '#/shared/lib/edge-studio'
++
+ type Mode = 'upload' | 'remote'
+ 
+ const DEFAULT_WEB_OPTIONS: WebResourceOptionsValue = {
+@@ -103,7 +105,7 @@
+   const { enqueueUploads, startRemote, resetRemote, remoteState } =
+     useResourceUpload()
+ 
+-  const [mode, setMode] = useState<Mode>(watchRequired ? 'remote' : initialMode)
++  const [mode, setMode] = useState<Mode>(EDGE_STUDIO ? 'upload' : watchRequired ? 'remote' : initialMode)
+   const [remoteUrl, setRemoteUrl] = useState('')
+   const [remoteResourceType, setRemoteResourceType] =
+     useState<RemoteResourceTypeSelection>('auto')
+@@ -234,6 +236,7 @@
+       return
+     }
+ 
++    if (EDGE_STUDIO) return
+     const url = remoteUrl.trim()
+     if (!url) return
+     startRemote({
+@@ -251,7 +254,7 @@
+     setSelectedFiles([])
+     setRemoteUrl('')
+     setRemoteResourceType('auto')
+-    setMode(watchRequired ? 'remote' : initialMode)
++    setMode(EDGE_STUDIO ? 'upload' : watchRequired ? 'remote' : initialMode)
+     resetRemoteSourceFields()
+     setAdditionalOptions(DEFAULT_ADDITIONAL_OPTIONS)
+     setDestinationMode('parent')
+@@ -278,7 +281,7 @@
+   return (
+     <div className="flex flex-col gap-6">
+       <div className="space-y-5">
+-        {!watchRequired ? (
++        {EDGE_STUDIO ? <p className="text-sm text-foreground">{t('studio:edge.textUploadOnly')}</p> : !watchRequired ? (
+           <div className="flex gap-1 rounded-lg bg-muted p-1">
+             <button
+               type="button"
+diff --git a/src/features/workbench/retrieval/components/loading-hint.tsx b/src/features/workbench/retrieval/components/loading-hint.tsx
+--- a/src/features/workbench/retrieval/components/loading-hint.tsx
++++ b/src/features/workbench/retrieval/components/loading-hint.tsx
+@@ -1,29 +1,13 @@
+ import { Loader2 } from 'lucide-react'
+-import { useEffect, useState } from 'react'
+ import { useTranslation } from 'react-i18next'
+-
+-import { LOADING_HINT_KEYS } from '#/features/workbench/retrieval/constants/retrieval'
+ 
+ export function LoadingHint() {
+   const { t } = useTranslation('retrieval')
+-  const [hintIndex, setHintIndex] = useState(0)
+-
+-  useEffect(() => {
+-    const timer = setInterval(() => {
+-      setHintIndex((i) => (i + 1) % LOADING_HINT_KEYS.length)
+-    }, 1500)
+-    return () => clearInterval(timer)
+-  }, [])
+ 
+   return (
+-    <div className="flex min-h-80 flex-col items-center justify-center gap-3">
+-      <Loader2 className="size-6 animate-spin text-muted-foreground/50" />
+-      <p
+-        key={hintIndex}
+-        className="animate-home-panel-in text-xs text-muted-foreground/60"
+-      >
+-        {t(LOADING_HINT_KEYS[hintIndex])}
+-      </p>
++    <div role="status" className="flex min-h-80 flex-col items-center justify-center gap-3 p-4 text-center">
++      <Loader2 aria-hidden="true" className="size-6 text-foreground motion-safe:animate-spin" />
++      <p className="text-sm text-foreground">{t('edge.searching')}</p>
+     </div>
+   )
+ }
+diff --git a/src/features/workbench/retrieval/components/retrieval-controls.tsx b/src/features/workbench/retrieval/components/retrieval-controls.tsx
+--- a/src/features/workbench/retrieval/components/retrieval-controls.tsx
++++ b/src/features/workbench/retrieval/components/retrieval-controls.tsx
+@@ -5,9 +5,11 @@
+   RotateCcw,
+   SlidersHorizontal,
+ } from 'lucide-react'
+-import { useMemo, useState } from 'react'
++import { useId, useMemo, useState } from 'react'
+ 
+ import type { FindContextType } from '#/shared/api/retrieval'
++import { EDGE_STUDIO } from '#/shared/lib/edge-studio'
++import { useEdgeFeatures } from '#/features/connection/hooks/use-edge-features'
+ import { cn } from '#/shared/lib/utils'
+ import { Button } from '#/shared/ui/button'
+ import { Checkbox } from '#/shared/ui/checkbox'
+@@ -51,6 +53,7 @@
+   t: TFunction<'retrieval'>
+ }) {
+   const [advancedOpen, setAdvancedOpen] = useState(false)
++  const modeName = useId()
+   const semanticMode = mode === 'find' || mode === 'search'
+   const advancedCount = useMemo(
+     () =>
+@@ -104,25 +107,20 @@
+ 
+   return (
+     <div className="space-y-3">
+-      <div
+-        aria-label={t('controls.function')}
+-        className="inline-flex flex-wrap gap-1 rounded-lg border bg-muted/30 p-1"
+-        role="tablist"
+-      >
++      <fieldset className="min-w-0">
++        <legend className="sr-only">{t('controls.function')}</legend>
++        <div className="inline-flex max-w-full flex-wrap gap-1 rounded-lg border bg-muted/30 p-1">
+         {RETRIEVAL_MODES.map((item) => (
+-          <Button
+-            aria-selected={mode === item}
+-            className="h-7 px-3 font-mono text-xs"
++          <label
++            className="relative flex min-h-8 cursor-pointer items-center gap-1.5 rounded-md border border-transparent px-2 font-mono text-xs text-foreground has-checked:border-foreground has-checked:bg-card has-focus-visible:outline-2 has-focus-visible:outline-offset-2 has-focus-visible:outline-current sm:px-3"
+             key={item}
+-            onClick={() => onModeChange(item)}
+-            role="tab"
+-            size="sm"
+-            variant={mode === item ? 'secondary' : 'ghost'}
+           >
++            <input type="radio" name={modeName} checked={mode === item} onChange={() => onModeChange(item)} />
+             {t(`controls.modes.${item}`)}
+-          </Button>
++          </label>
+         ))}
+-      </div>
++        </div>
++      </fieldset>
+ 
+       <p className="text-xs leading-5 text-muted-foreground" aria-live="polite">
+         {t(`modeDescriptions.${mode}`)}
+@@ -174,7 +172,7 @@
+         {options.scope === 'custom' ? (
+           <Input
+             aria-label={t('controls.customScope')}
+-            className="h-8 w-64 font-mono text-sm"
++            className="h-8 w-64 max-w-full font-mono text-base md:text-sm"
+             onChange={(event) =>
+               onOptionsChange({ customPathInput: event.target.value })
+             }
+@@ -191,7 +189,9 @@
+           </span>
+         </div>
+ 
+-        {mode === 'search' ? (
++        {mode === 'search' && EDGE_STUDIO ? (
++          <p className="basis-full text-xs text-foreground">{t('edge.sessionUnavailable')}</p>
++        ) : mode === 'search' ? (
+           <Input
+             aria-label={t('controls.sessionId')}
+             className="h-8 w-52 font-mono text-sm"
+@@ -268,6 +268,7 @@
+   toggleContextType: (type: FindContextType, checked: boolean) => void
+   toggleLevel: (level: number, checked: boolean) => void
+ }) {
++  const { flags } = useEdgeFeatures()
+   return (
+     <div className="rounded-xl border bg-card/50 p-4">
+       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+@@ -367,8 +368,9 @@
+         </ControlGroup>
+       </div>
+ 
+-      <div className="mt-4 flex items-center justify-between border-t pt-3">
+-        <label className="flex items-center gap-2 text-xs">
++      <div className="mt-4 flex flex-wrap items-center justify-between gap-2 border-t pt-3">
++        {EDGE_STUDIO && flags.searchProvenance !== true ? <p className="text-xs text-foreground">{t('edge.provenanceUnavailable')}</p> : (
++          <label className="flex items-center gap-2 text-xs">
+           <Switch
+             checked={options.includeProvenance}
+             onCheckedChange={(checked) =>
+@@ -376,7 +378,8 @@
+             }
+           />
+           {t('advanced.provenance')}
+-        </label>
++          </label>
++        )}
+         <Button className="gap-1.5" onClick={onReset} size="sm" variant="ghost">
+           <RotateCcw className="size-3.5" />
+           {t('advanced.reset')}
+diff --git a/src/features/workbench/retrieval/components/retrieval-results.tsx b/src/features/workbench/retrieval/components/retrieval-results.tsx
+--- a/src/features/workbench/retrieval/components/retrieval-results.tsx
++++ b/src/features/workbench/retrieval/components/retrieval-results.tsx
+@@ -48,23 +48,33 @@
+ export function RetrievalResults({
+   data,
+   error,
++  contextError,
++  contextFailed = false,
+   hasRetrievableContext,
+   hasSubmitted,
+   isCheckingContext,
+   isError,
+   isLoading,
+   onUploadClick,
++  onRetry,
++  onRetryContext,
++  onRemoveUnsupported,
+   resultCount,
+   t,
+ }: {
+   data?: GroupedFindResult
+   error?: unknown
++  contextError?: unknown
++  contextFailed?: boolean
+   hasRetrievableContext: boolean
+   hasSubmitted: boolean
+   isCheckingContext: boolean
+   isError: boolean
+   isLoading: boolean
+   onUploadClick: () => void
++  onRetry?: () => void
++  onRetryContext?: () => void
++  onRemoveUnsupported?: () => void
+   resultCount: number
+   t: TFunction<'retrieval'>
+ }) {
+@@ -86,7 +96,9 @@
+         </h2>
+ 
+         <div className="min-h-80 overflow-hidden rounded-lg border border-dashed bg-card/50">
+-          {!hasSubmitted ? (
++          {!hasSubmitted && contextFailed && !isCheckingContext ? (
++            <RetrievalError error={contextError} title={t('edge.contextFailed')} onRetry={onRetryContext} t={t} />
++          ) : !hasSubmitted ? (
+             <EmptyRetrievalState
+               hasRetrievableContext={hasRetrievableContext}
+               isCheckingContext={isCheckingContext}
+@@ -96,14 +108,14 @@
+           ) : isLoading ? (
+             <LoadingHint />
+           ) : isError ? (
+-            <RetrievalError error={error} t={t} />
++            <RetrievalError error={error} onRetry={onRetry} onRemoveUnsupported={onRemoveUnsupported} t={t} />
+           ) : !hasResults ? (
+-            <div className="flex min-h-80 flex-col items-center justify-center gap-2 text-center">
+-              <SearchIcon className="size-8 text-muted-foreground/25" />
+-              <p className="text-sm text-muted-foreground/60">
++            <div role="status" className="flex min-h-80 flex-col items-center justify-center gap-2 p-4 text-center">
++              <SearchIcon aria-hidden="true" className="size-8 text-muted-foreground" />
++              <p className="text-sm text-foreground">
+                 {t('noResults.title')}
+               </p>
+-              <p className="text-xs text-muted-foreground/40">
++              <p className="text-xs text-foreground">
+                 {t('noResults.subtitle')}
+               </p>
+             </div>
+@@ -130,25 +142,40 @@
+ 
+ function RetrievalError({
+   error,
++  title,
++  onRetry,
++  onRemoveUnsupported,
+   t,
+ }: {
+   error?: unknown
++  title?: string
++  onRetry?: () => void
++  onRemoveUnsupported?: () => void
+   t: TFunction<'retrieval'>
+ }) {
+   const details = getErrorDetails(error, t)
+ 
+   return (
+     <div className="flex min-h-80 items-center justify-center px-6 py-10">
+-      <div className="flex max-w-xl flex-col items-center text-center">
++      <div className="flex min-w-0 max-w-xl flex-col items-center text-center">
+         <div className="flex size-10 items-center justify-center rounded-full bg-destructive/10 text-destructive">
+           <CircleAlert className="size-5" />
+         </div>
+-        <h3 className="mt-3 text-sm font-medium text-foreground">
+-          {t('error.title')}
+-        </h3>
+-        <p className="mt-1.5 text-sm leading-6 text-muted-foreground">
+-          {details.message}
+-        </p>
++        <div role="alert">
++          <h3 className="mt-3 text-sm font-medium text-foreground">{title ?? t('error.title')}</h3>
++          <p className="mt-1.5 text-sm leading-6 text-foreground">{details.message}</p>
++        </div>
++        {onRemoveUnsupported ? (
++          <Button variant="outline" className="mt-3 h-auto min-h-8 whitespace-normal" onClick={onRemoveUnsupported}>{t('edge.removeUnsupported')}</Button>
++        ) : onRetry ? (
++          <Button variant="outline" className="mt-3" onClick={onRetry}>{t('edge.retry')}</Button>
++        ) : null}
++        {details.diagnostic ? (
++          <details className="mt-3 max-w-full text-sm text-foreground">
++            <summary className="cursor-pointer">{t('edge.diagnostics')}</summary>
++            <p className="[overflow-wrap:anywhere]">{details.diagnostic}</p>
++          </details>
++        ) : null}
+         <div className="mt-3 flex flex-wrap justify-center gap-2">
+           {details.code ? (
+             <ErrorMeta label={t('error.code')} value={details.code} />
+@@ -175,6 +202,7 @@
+ 
+   const data = error as Record<string, unknown>
+   const code = typeof data.code === 'string' ? data.code : undefined
++  const unavailable = data.statusCode === 501 || code === 'NOT_IMPLEMENTED'
+   const rawMessage =
+     typeof data.message === 'string' && data.message.trim()
+       ? data.message.trim()
+@@ -185,7 +213,8 @@
+     message:
+       code === 'NETWORK_ERROR'
+         ? t('error.network')
+-        : (rawMessage ?? t('error.fallback')),
++        : unavailable ? t('edge.optionUnavailable') : (rawMessage ?? t('error.fallback')),
++    diagnostic: unavailable ? rawMessage : undefined,
+     requestId: typeof data.requestId === 'string' ? data.requestId : undefined,
+     statusCode:
+       typeof data.statusCode === 'number' ? data.statusCode : undefined,
+@@ -212,27 +241,27 @@
+   t: TFunction<'retrieval'>
+ }) {
+   return (
+-    <div className="flex min-h-80 flex-col items-center justify-center gap-3 text-center">
++    <div className="flex min-h-80 flex-col items-center justify-center gap-3 p-4 text-center text-foreground">
+       {isCheckingContext ? (
+         <>
+-          <Loader2 className="size-8 animate-spin text-muted-foreground/30" />
+-          <p className="text-sm text-muted-foreground">{t('empty.checking')}</p>
++          <Loader2 aria-hidden="true" className="size-8 text-muted-foreground motion-safe:animate-spin" />
++          <p role="status" className="text-sm">{t('empty.checking')}</p>
+         </>
+       ) : hasRetrievableContext ? (
+         <>
+           <SearchIcon className="size-10 text-muted-foreground/25" />
+-          <p className="text-sm text-muted-foreground">
++          <p className="text-sm">
+             {t('empty.readyTitle')}
+           </p>
+-          <p className="text-xs text-muted-foreground/60">
++          <p className="text-xs">
+             {t('empty.readyDescription')}
+           </p>
+         </>
+       ) : (
+         <>
+           <SearchIcon className="size-10 text-muted-foreground/25" />
+-          <p className="text-sm text-muted-foreground">{t('empty.title')}</p>
+-          <p className="text-xs text-muted-foreground/60">
++          <p className="text-sm">{t('empty.title')}</p>
++          <p className="text-xs">
+             {t('empty.description')}
+           </p>
+           <Button
+diff --git a/src/features/workbench/retrieval/components/search-bar.tsx b/src/features/workbench/retrieval/components/search-bar.tsx
+--- a/src/features/workbench/retrieval/components/search-bar.tsx
++++ b/src/features/workbench/retrieval/components/search-bar.tsx
+@@ -1,10 +1,12 @@
+ import { SendIcon } from 'lucide-react'
+ import type { KeyboardEvent, RefObject } from 'react'
++import { useId } from 'react'
+ 
+ import { Button } from '#/shared/ui/button'
+ 
+ export function RetrievalSearchBar({
+   inputRef,
++  label,
+   onChange,
+   onSubmit,
+   placeholder,
+@@ -12,12 +14,14 @@
+   submitLabel,
+ }: {
+   inputRef: RefObject<HTMLInputElement | null>
++  label: string
+   onChange: (value: string) => void
+   onSubmit: () => void
+   placeholder: string
+   query: string
+   submitLabel: string
+ }) {
++  const inputId = useId()
+   const handleKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
+     if (event.key === 'Enter' && !event.nativeEvent.isComposing) {
+       event.preventDefault()
+@@ -26,26 +30,30 @@
+   }
+ 
+   return (
+-    <div className="flex items-center gap-2 rounded-lg border bg-card px-4 py-3">
++    <div className="grid min-w-0 gap-2">
++      <label className="text-sm font-medium text-foreground" htmlFor={inputId}>{label}</label>
++      <div className="flex min-w-0 items-center gap-2 rounded-lg border bg-card px-3 py-2">
+       <input
+         ref={inputRef}
++        id={inputId}
+         type="text"
+         value={query}
+         onChange={(event) => onChange(event.target.value)}
+         onKeyDown={handleKeyDown}
+         placeholder={placeholder}
+-        className="flex-1 bg-transparent text-base outline-none placeholder:text-muted-foreground/60 md:text-sm"
++        className="min-h-10 min-w-0 flex-1 rounded-sm bg-transparent px-1.5 text-base text-foreground placeholder:text-muted-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-current md:text-sm"
+       />
+       <Button
+         aria-label={submitLabel}
+         variant="ghost"
+         size="icon"
+-        className="size-8 shrink-0"
++        className="size-10 shrink-0"
+         onClick={onSubmit}
+         disabled={query.trim().length === 0}
+       >
+         <SendIcon className="size-4" />
+       </Button>
++      </div>
+     </div>
+   )
+ }
+diff --git a/src/features/workbench/retrieval/page.tsx b/src/features/workbench/retrieval/page.tsx
+--- a/src/features/workbench/retrieval/page.tsx
++++ b/src/features/workbench/retrieval/page.tsx
+@@ -29,6 +29,8 @@
+   RetrievalSearch,
+ } from '#/features/workbench/retrieval/types/retrieval'
+ import type { FindContextType } from '#/shared/api/retrieval'
++import { EDGE_STUDIO } from '#/shared/lib/edge-studio'
++import { useEdgeFeatures } from '#/features/connection/hooks/use-edge-features'
+ 
+ const routeApi = getRouteApi('/retrieval')
+ 
+@@ -65,6 +67,7 @@
+ 
+ export function RetrievalPage() {
+   const { t } = useTranslation('retrieval')
++  const { flags } = useEdgeFeatures()
+   const navigate = useNavigate({ from: '/retrieval' })
+   const search = routeApi.useSearch()
+   const hasUrlSearch = hasRetrievalSearch(search)
+@@ -142,6 +145,21 @@
+   const handleUploadClick = useCallback(() => {
+     void navigate({ to: '/filesystem', search: { upload: true } })
+   }, [navigate])
++  const canRemoveUnsupported = EDGE_STUDIO && retrievalQuery.isError && (
++    (flags.searchProvenance !== true && ['find', 'search'].includes(submittedMode) && submittedOptions.includeProvenance) ||
++    (submittedMode === 'search' && Boolean(submittedOptions.sessionId))
++  )
++  const removeUnsupported = () => {
++    const next = { ...submittedOptions, includeProvenance: Boolean(flags.searchProvenance && submittedOptions.includeProvenance), sessionId: undefined }
++    const nextSearch = buildSearchFromOptions(submittedQuery, submittedMode, next)
++    setRetrievalMode(submittedMode)
++    setQuery(submittedQuery)
++    setOptions(next)
++    setSubmittedOptions(next)
++    writeLastRetrievalSearch(nextSearch)
++    void navigate({ replace: true, search: nextSearch })
++    inputRef.current?.focus()
++  }
+ 
+   useEffect(() => {
+     inputRef.current?.focus()
+@@ -175,6 +193,7 @@
+     <div className="flex w-full min-w-0 flex-col gap-5">
+       <RetrievalSearchBar
+         inputRef={inputRef}
++        label={t('edge.queryLabel')}
+         onChange={setQuery}
+         onSubmit={handleSubmit}
+         placeholder={t(`placeholders.${retrievalMode}`)}
+@@ -195,10 +214,15 @@
+         hasRetrievableContext={resourceProbeQuery.data?.hasContext ?? false}
+         hasSubmitted={hasSubmitted}
+         error={retrievalQuery.error}
+-        isCheckingContext={resourceProbeQuery.isLoading}
++        contextError={resourceProbeQuery.error}
++        contextFailed={resourceProbeQuery.isError}
++        isCheckingContext={resourceProbeQuery.isFetching && !resourceProbeQuery.data}
+         isError={retrievalQuery.isError}
+-        isLoading={retrievalQuery.isLoading}
++        isLoading={retrievalQuery.isLoading || (retrievalQuery.isFetching && retrievalQuery.isError)}
+         onUploadClick={handleUploadClick}
++        onRetry={() => { inputRef.current?.focus(); void retrievalQuery.refetch() }}
++        onRetryContext={() => { inputRef.current?.focus(); void resourceProbeQuery.refetch() }}
++        onRemoveUnsupported={canRemoveUnsupported ? removeUnsupported : undefined}
+         resultCount={submittedOptions.resultCount}
+         t={t}
+       />
+diff --git a/src/i18n/locales/en/activity.ts b/src/i18n/locales/en/activity.ts
+--- a/src/i18n/locales/en/activity.ts
++++ b/src/i18n/locales/en/activity.ts
+@@ -148,6 +148,8 @@
+     copied: 'URI copied',
+     copyFailed: 'Copy failed',
+     resizeContext: 'Resize filesystem width',
++    narrowPane: 'Make pane narrower',
++    widenPane: 'Make pane wider',
+     resizeAction: 'Resize Terminal and Agent width',
+     readFailed: 'Failed to read {{uri}}',
+     resourceActionsMenu: 'Resource actions',
+diff --git a/src/i18n/locales/en/resources.ts b/src/i18n/locales/en/resources.ts
+--- a/src/i18n/locales/en/resources.ts
++++ b/src/i18n/locales/en/resources.ts
+@@ -480,6 +480,17 @@
+     },
+   },
+   retrieval: {
++    edge: {
++      queryLabel: 'Search query',
++      searching: 'Searching…',
++      contextFailed: 'Could not check available resources',
++      retry: 'Try again',
++      diagnostics: 'Technical details',
++      optionUnavailable: 'This operation is not available on this server.',
++      removeUnsupported: 'Remove unavailable filters and search again',
++      provenanceUnavailable: 'Retrieval provenance is not available on this server.',
++      sessionUnavailable: 'Search with session context is not available on this server.',
++    },
+     modeDescriptions: {
+       find: 'Find relevant context by meaning for a standalone query.',
+       search: 'Search by meaning, optionally using session context.',
+diff --git a/src/i18n/locales/en/studio.ts b/src/i18n/locales/en/studio.ts
+--- a/src/i18n/locales/en/studio.ts
++++ b/src/i18n/locales/en/studio.ts
+@@ -6,6 +6,24 @@
+     keyLabel: 'User API key',
+     keyHelp: 'Enter the User API key issued for this Worker.',
+     keyRequired: 'Enter a User API key to continue.',
++    keyRejected: 'This server rejected the API key. Check the key and try again.',
++    unsupportedTitle: 'Not available on this server',
++    unsupportedDescription: 'This Studio page needs an API that is not available on this deployment.',
++    limitedNotice: 'VikingBot and other optional features require server support. Remote URL imports are not available on this deployment.',
++    workspaceRequired: 'Use a separate User API key to open the workspace.',
++    textUploadOnly: 'Choose local UTF-8 text files. Remote URLs and folder imports are not available here.',
++    dataProfile: 'Workspace',
++    controlProfile: 'Administration',
++    controlKey: 'Root or account Admin API key',
++    controlKeyRequired: 'Enter a Root or account Admin API key to continue.',
++    controlKeyHelp: 'This key is verified for administration only and is not used for workspace requests.',
++    wrongProfile: 'This API key does not match the selected connection type. Choose the appropriate type and verify again.',
++    useAnotherProfile: 'Choose another connection',
++    invalidPack: 'Choose a nonempty .ovpack file of the supported archive type.',
++    revokeAccount: 'Revoke account access',
++    revokeAccountHelp: 'Revoke access to {{account}} permanently. The workspace data is kept; no purge is started.',
++    accountRevoked: 'Access to {{account}} was revoked. Workspace data was retained.',
++    memoryPolicyUnavailable: 'Memory policy not available',
+     explorer: 'File Explorer',
+     retrieval: 'Context Search',
+   },
+diff --git a/src/i18n/locales/zh-CN/activity.ts b/src/i18n/locales/zh-CN/activity.ts
+--- a/src/i18n/locales/zh-CN/activity.ts
++++ b/src/i18n/locales/zh-CN/activity.ts
+@@ -141,6 +141,8 @@
+     copied: '已复制 URI',
+     copyFailed: '复制失败',
+     resizeContext: '调整文件系统宽度',
++    narrowPane: '缩窄面板',
++    widenPane: '加宽面板',
+     resizeAction: '调整终端和 Agent 面板宽度',
+     readFailed: '无法读取 {{uri}}',
+     resourceActionsMenu: '资源操作',
+diff --git a/src/i18n/locales/zh-CN/resources.ts b/src/i18n/locales/zh-CN/resources.ts
+--- a/src/i18n/locales/zh-CN/resources.ts
++++ b/src/i18n/locales/zh-CN/resources.ts
+@@ -459,6 +459,17 @@
+     },
+   },
+   retrieval: {
++    edge: {
++      queryLabel: '搜索内容',
++      searching: '正在搜索…',
++      contextFailed: '无法检查可用资源',
++      retry: '重试',
++      diagnostics: '技术详情',
++      optionUnavailable: '此服务器不支持该操作。',
++      removeUnsupported: '移除不支持的筛选条件并重新搜索',
++      provenanceUnavailable: '此服务器不支持检索溯源。',
++      sessionUnavailable: '此服务器不支持基于会话上下文搜索。',
++    },
+     modeDescriptions: {
+       find: '按语义查找相关上下文，适合单次问题。',
+       search: '按语义检索，可结合会话上下文查找相关内容。',
+diff --git a/src/i18n/locales/zh-CN/studio.ts b/src/i18n/locales/zh-CN/studio.ts
+--- a/src/i18n/locales/zh-CN/studio.ts
++++ b/src/i18n/locales/zh-CN/studio.ts
+@@ -6,6 +6,24 @@
+     keyLabel: '用户 API 密钥',
+     keyHelp: '请输入为此 Worker 签发的用户 API 密钥。',
+     keyRequired: '请输入用户 API 密钥以继续。',
++    keyRejected: '服务器拒绝了此 API 密钥。请检查密钥后重试。',
++    unsupportedTitle: '此服务器不支持',
++    unsupportedDescription: '此 Studio 页面需要当前部署未提供的 API。',
++    limitedNotice: 'VikingBot 等可选功能须由服务器提供。此部署不支持远程 URL 导入。',
++    workspaceRequired: '使用单独的用户 API 密钥打开工作区。',
++    textUploadOnly: '请选择本地 UTF-8 文本文件。此处不支持远程 URL 或文件夹导入。',
++    dataProfile: '工作区',
++    controlProfile: '管理',
++    controlKey: 'Root 或账号管理员 API 密钥',
++    controlKeyRequired: '请输入 Root 或账号管理员 API 密钥以继续。',
++    controlKeyHelp: '此密钥仅用于验证管理权限，不会用于工作区请求。',
++    wrongProfile: '此 API 密钥与所选连接类型不符。请选择相应类型后重新验证。',
++    useAnotherProfile: '选择其他连接',
++    invalidPack: '请选择非空、类型受支持的 .ovpack 文件。',
++    revokeAccount: '撤销账号访问权限',
++    revokeAccountHelp: '将永久撤销对 {{account}} 的访问权限。工作区数据会保留，不会启动清除任务。',
++    accountRevoked: '已撤销对 {{account}} 的访问权限，工作区数据仍保留。',
++    memoryPolicyUnavailable: '记忆策略不可用',
+     explorer: '文件浏览器',
+     retrieval: '上下文搜索',
+   },
+diff --git a/src/shared/api/admin.ts b/src/shared/api/admin.ts
+--- a/src/shared/api/admin.ts
++++ b/src/shared/api/admin.ts
+@@ -1,6 +1,8 @@
+ import type { ApiKeyAuth } from '#/shared/api/auth'
+ import { createApiKeyHeaders, resolveApiKeyAuth } from '#/shared/api/auth'
+ import type { ServerMode } from '#/shared/types/auth'
++import { EDGE_STUDIO } from '#/shared/lib/edge-studio'
++import i18n from '#/i18n/core'
+ import axios from 'axios'
+ 
+ import { createClient } from '#/gen/ov-client/client'
+@@ -479,8 +481,8 @@
+ export async function deleteAdminAccount(
+   connection: AdminConnection,
+   accountId: string,
+-): Promise<string> {
+-  const result = await getOvResult<{ task_id: string }>(
++): Promise<string | undefined> {
++  const result = await getOvResult<{ task_id?: string; status?: string; data_retained?: boolean } | null>(
+     deleteAdminAccountByAccountId({
+       client: createAdminClient(connection),
+       path: {
+@@ -488,7 +490,12 @@
+       },
+     }),
+   )
+-  return result.task_id
++  if (EDGE_STUDIO) {
++    if (result?.status !== 'revoked' || result.data_retained !== true)
++      throw new Error(i18n.t('studio:errors.requestFailed'))
++    return undefined
++  }
++  return result?.task_id
+ }
+ 
+ export async function createAdminUser(
+@@ -569,7 +576,7 @@
+   )
+ }
+ 
+-export type UserMemorySettings = { memory_policy: UserMemoryPolicy }
++export type UserMemorySettings = { memory_policy: UserMemoryPolicy | null }
+ 
+ export async function fetchUserMemorySettings(
+   connection: AdminConnection,
+diff --git a/src/shared/lib/edge-capabilities.ts b/src/shared/lib/edge-capabilities.ts
+new file mode 100644
+--- /dev/null
++++ b/src/shared/lib/edge-capabilities.ts
+@@ -0,0 +1,48 @@
++import { allowsStudioApiBase } from './edge-studio'
++
++const keys = ['control', 'packImport', 'packExport', 'searchProvenance', 'bot', 'compile', 'skills', 'snapshots', 'webdav', 'oauth', 'watches'] as const
++export type EdgeFeatures = Partial<Record<(typeof keys)[number], true>>
++
++function record(value: unknown): Record<string, unknown> | undefined {
++  return value !== null && typeof value === 'object' && !Array.isArray(value)
++    ? value as Record<string, unknown> : undefined
++}
++
++export function readEdgeFeatures(payload: unknown): EdgeFeatures {
++  const envelope = record(payload)
++  const flags = record(record(envelope?.result)?.features)
++  if (envelope?.status !== 'ok' || !flags) return {}
++  return Object.fromEntries(keys.filter((flag) => flags[flag] === true).map((flag) => [flag, true]))
++}
++
++export async function fetchEdgeFeatures(baseUrl: string, key: string, signal: AbortSignal): Promise<EdgeFeatures> {
++  const base = new URL(baseUrl)
++  if (!key || base.username || base.password || !allowsStudioApiBase(base)) return {}
++  const response = await fetch(new URL('/api/v1/system/edge-capabilities', base), {
++    headers: { 'X-API-Key': key, Accept: 'application/json' },
++    redirect: 'error',
++    cache: 'no-store',
++    credentials: 'omit',
++    signal: AbortSignal.any([signal, AbortSignal.timeout(8000)]),
++  })
++  if (!response.ok) return {}
++  return readEdgeFeatures(await response.json())
++}
++
++function at(path: string, root: string) {
++  return path === root || path.startsWith(`${root}/`)
++}
++
++/** This is presentation only; the Worker authorizes every request. */
++export function edgeAllowsPage(path: string, flags: EdgeFeatures, canManage: boolean): boolean {
++  if (at(path, '/admin')) {
++    const simple = path.replace(/\/+$/, '')
++    return canManage && (simple === '/admin' || simple === '/admin/users' || simple === '/admin/users/groups')
++  }
++  if (at(path, '/vikingbot')) return flags.bot === true
++  if (at(path, '/compile')) return flags.compile === true
++  if (at(path, '/skills')) return flags.skills === true
++  if (at(path, '/oauth')) return flags.oauth === true
++  if (at(path, '/watches')) return flags.watches === true
++  return ['/home', '/filesystem', '/directory', '/memories', '/retrieval', '/sessions', '/tasks'].some((root) => at(path, root))
++}

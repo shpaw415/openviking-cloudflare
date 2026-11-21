@@ -1,0 +1,56 @@
+diff --git a/src/features/connection/hooks/use-app-connection.tsx b/src/features/connection/hooks/use-app-connection.tsx
+--- a/src/features/connection/hooks/use-app-connection.tsx
++++ b/src/features/connection/hooks/use-app-connection.tsx
+@@ -94,7 +94,11 @@
+   const hostDiscoveryRef = React.useRef<Promise<Record<
+     string,
+     unknown
+   > | null> | null>(null)
++  const adoptedHostRef = React.useRef<{
++    connection: ConnectionDraft
++    surface: ReturnType<typeof resolveStudioMode>
++  } | null>(null)
+   const profileEntryPending = React.useRef(false)
+   const navigate = useNavigate()
+   const pathname = useRouterState({
+@@ -313,6 +317,12 @@
+   }, [connection, storeProfiles])
+ 
+   React.useEffect(() => {
++    const adopted = adoptedHostRef.current
++    adoptedHostRef.current = null
++    // Skip only the rerender caused by installing this exact anonymous connection.
++    // Other profiles, reconnects and surfaces still run their own health probes.
++    if (adopted?.connection === connection && adopted.surface === studioMode) return
++
+     let cancelled = false
+     const controller = new AbortController()
+ 
+@@ -332,6 +342,7 @@
+         const host = await hostDiscoveryRef.current
+         if (isCancelled()) return
+         if (host?.service === 'openviking-gateway') {
++          const mode = resolveServerAuthMode(host)
+           setIsGatewayHost(true)
+           setOpenvikingUrl(
+             typeof host.openviking_url === 'string' ? host.openviking_url : '',
+@@ -345,12 +356,18 @@
+               accountId: 'default',
+               userId: 'default',
+             },
+-            'checking',
++            mode,
+             studioMode,
+           )
++          adoptedHostRef.current = { connection: next, surface: studioMode }
+           queryClient.clear()
+           connectionGenerationRef.current += 1
+           setConnection(next)
++          setServerHealth({
++            key: studioMode + createConnectionRoleProbeKey(next, 'checking'),
++            data: host,
++          })
++          setServerMode(mode)
+           return
+         }
+       }

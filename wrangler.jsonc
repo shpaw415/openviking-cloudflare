@@ -1,0 +1,20 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "openviking-cloudflare",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-11-19",
+  "workers_dev": false,
+  "preview_urls": false,
+  "upload_source_maps": false,
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "run_worker_first": true,
+    "html_handling": "none",
+    "not_found_handling": "none"
+  },
+  "durable_objects": { "bindings": [{ "name": "WORKSPACES", "class_name": "Workspace" }, { "name": "CONTROL", "class_name": "Control" }, { "name": "OAUTH", "class_name": "OAuth" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Workspace"] }, { "tag": "v2-control", "new_sqlite_classes": ["Control"] }, { "tag": "v3-oauth", "new_sqlite_classes": ["OAuth"] }],
+  "observability": { "enabled": false },
+  "ai": { "binding": "AI", "remote": false }
+}

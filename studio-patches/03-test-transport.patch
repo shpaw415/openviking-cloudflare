@@ -1,0 +1,15 @@
+diff --git a/vite.config.ts b/vite.config.ts
+--- a/vite.config.ts
++++ b/vite.config.ts
+@@ -23,7 +23,11 @@
+     viteReact(),
+   ],
+   test: {
++    // The isolated packaging run avoids child-process pool teardown stalls.
++    // Keep the official test inputs and per-file isolation unchanged.
++    ...(process.env.VITE_STUDIO_EDGE === 'true'
++      ? { pool: 'threads' as const, maxWorkers: 2 }
++      : {}),
+     setupFiles: ['./src/test/setup.ts'],
+   },
+ })

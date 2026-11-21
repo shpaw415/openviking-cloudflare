@@ -1,0 +1,16 @@
+/upstream/
+/.work/
+/dist/
+/node_modules/
+/.wrangler/
+.dev.vars*
+.env*
+*.sqlite*
+*.key
+*.pem
+*.p12
+*.pfx
+*.log
+__pycache__/
+*.py[cod]
+.pytest_cache/

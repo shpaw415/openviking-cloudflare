@@ -1,0 +1,318 @@
+diff --git a/src/features/admin/gateway/lib/use-gateway.ts b/src/features/admin/gateway/lib/use-gateway.ts
+--- a/src/features/admin/gateway/lib/use-gateway.ts
++++ b/src/features/admin/gateway/lib/use-gateway.ts
+@@ -157,13 +157,17 @@
+   })
+ }
+ 
++const accessCacheOptions = {
++  retry: false,
++  retryOnMount: false,
++  staleTime: 30_000,
++} as const
++
+ export const useAccess = (options?: GatewayQueryOptions<GatewayAccess>) =>
+   useGatewayQuery('access', [], getAccess, {
+-    retry: false,
+-    retryOnMount: false,
+-    staleTime: 30_000,
++    ...accessCacheOptions,
+     ...options,
+   })
+ 
+ /** Connection plus the permissions /access grants; pages read only these. */
+@@ -212,6 +216,36 @@
+ export const useKeys = (options?: GatewayQueryOptions<GatewayKey[]>) =>
+   useGatewayQuery('keys', [], listKeys, options)
+ 
+-/** Users of this account a key can act as, and whether the server can read their key. */
+-export const useKeyUsers = (options?: GatewayQueryOptions<KeyUser[]>) =>
+-  useGatewayQuery('users', [], listKeyUsers, options)
++/** Permissions come from an API response; unknown is not the self-only grant. */
++export function keyOwnerPermission(access: unknown): boolean | undefined {
++  if (!access || typeof access !== 'object' || !('can_issue_for_others' in access)) {
++    return undefined
++  }
++  const permission = access.can_issue_for_others
++  return typeof permission === 'boolean' ? permission : undefined
++}
++
++/** Start the scoped directory read on authorization, not on the next form paint. */
++export function useKeyUsers(
++  open: boolean,
++  accessQuery: ReturnType<typeof useAccess>,
++) {
++  const { allowed, connection, scope } = useGatewayConnection()
++  const queryClient = useQueryClient()
++  const queryKey = gatewayQueryKey(scope, 'users')
++  return useQuery<KeyUser[], GatewayError>({
++    queryKey,
++    enabled:
++      open &&
++      allowed &&
++      (accessQuery.isPending ||
++        (accessQuery.isSuccess && keyOwnerPermission(accessQuery.data) === true)),
++    queryFn: async ({ signal }) => {
++      if (!allowed) throw new Error(i18n.t('studio:errors.gatewayUnavailable'))
++      // Join the existing access request/cache for the same account and keys.
++      const access = await queryClient.fetchQuery({
++        ...accessCacheOptions,
++        queryKey: gatewayQueryKey(scope, 'access'),
++        queryFn: () => getAccess(connection),
++      })
++      if (signal.aborted) return []
++      if (
++        keyOwnerPermission(access) !== true ||
++        !queryClient.getQueryCache().find({ queryKey, exact: true })?.isActive()
++      ) {
++        // No directory result exists. Revert rather than cache a synthetic empty list.
++        void queryClient.cancelQueries({ queryKey, exact: true })
++        return []
++      }
++      return listKeyUsers(connection)
++    },
++  })
++}
+diff --git a/src/features/admin/gateway/components/keys-issue-dialog.tsx b/src/features/admin/gateway/components/keys-issue-dialog.tsx
+--- a/src/features/admin/gateway/components/keys-issue-dialog.tsx
++++ b/src/features/admin/gateway/components/keys-issue-dialog.tsx
+@@ -53,8 +53,9 @@
+ import { requestManagementUnlock } from '#/features/admin/gateway/lib/management-key'
+ import { NEW_ID } from '#/features/admin/gateway/lib/search'
+ import { servedModels } from '#/features/admin/gateway/lib/upstream-schema'
+ import {
++  keyOwnerPermission,
+   useGateway,
+   useKeyUsers,
+ } from '#/features/admin/gateway/lib/use-gateway'
+@@ -138,7 +138,7 @@
+ }
+ 
+ /** Whether the admin picks the key's user or pastes that user's OpenViking key. */
+-type OwnerMode = 'self' | 'user' | 'key'
++type OwnerMode = 'checking' | 'blocked' | 'self' | 'user' | 'key'
+ 
+ /** Form state; keeps the picked user and the pasted key while switching modes. */
+ type KeyDraft = Omit<KeyRequest, keyof KeyOwner> & {
+@@ -174,14 +174,22 @@
+   const { t } = useTranslation('gateway')
+   const {
+     connection,
++    allowed,
+     invalidate,
+     access,
++    accessQuery,
+     devMode,
+     readOnly,
+-    canIssueForOthers: canPickUser,
+   } = useGateway()
+   const selfId = access?.user_id ?? connection.userId
+-  const usersQuery = useKeyUsers({ enabled: open && canPickUser })
++  const permission =
++    allowed && accessQuery.isSuccess ? keyOwnerPermission(access) : undefined
++  const canPickUser = permission === true
++  const usersQuery = useKeyUsers(open, accessQuery)
++  const checkingOwner =
++    allowed && (accessQuery.isPending || (canPickUser && usersQuery.isPending))
++  const cannotCheckOwner = !checkingOwner && !canPickUser && permission !== false
++  const ownerUnavailable = checkingOwner || cannotCheckOwner
+   const formId = React.useId()
+   const userTriggerRef = React.useRef<HTMLButtonElement>(null)
+   const keyInputRef = React.useRef<HTMLInputElement>(null)
+@@ -215,8 +223,9 @@
+   })
+   const pending = issue.isPending
+ 
+-  const users = [...(usersQuery.data ?? [])].sort((a, b) =>
+-    a.user_id.localeCompare(b.user_id),
++  const users = React.useMemo(
++    () => [...(usersQuery.data ?? [])].sort((a, b) =>
++      a.user_id.localeCompare(b.user_id),
++    ),
++    [usersQuery.data],
+   )
+   const fallback =
+     canPickUser && usersQuery.isError
+@@ -224,8 +233,16 @@
+       : canPickUser && usersQuery.isSuccess && !users.length
+         ? 'none'
+         : undefined
+-  const mode: OwnerMode =
+-    fallback || chosenMode === 'key' ? 'key' : canPickUser ? 'user' : 'self'
++  const mode: OwnerMode = checkingOwner
++    ? 'checking'
++    : cannotCheckOwner
++      ? 'blocked'
++      : !canPickUser
++        ? 'self'
++        : fallback || chosenMode === 'key'
++          ? 'key'
++          : 'user'
+   // Prefer the current identity, and preserve an explicit selection across retries.
+-  const userId = draft.user_id
+-    ? users.some((user) => user.user_id === draft.user_id)
+-      ? draft.user_id
+-      : ''
+-    : users.some((user) => user.user_id === selfId)
+-      ? selfId
+-      : users.length === 1
+-        ? users[0].user_id
+-        : ''
++  const userId = !canPickUser
++    ? ''
++    : draft.user_id
++      ? users.some((user) => user.user_id === draft.user_id)
++        ? draft.user_id
++        : ''
++      : users.some((user) => user.user_id === selfId)
++        ? selfId
++        : users.length === 1
++          ? users[0].user_id
++          : ''
+   const selectedUser = users.find((user) => user.user_id === userId)
+   // The server can't read this user's key; the caller's own (non-root) key
+   // is used as is, so issuing for yourself never needs one.
+@@ -295,8 +312,12 @@
+   const focusedField = React.useRef(focusField)
+   React.useEffect(() => {
+-    if (focusedField.current === focusField) return
++    const previous = focusedField.current
+     focusedField.current = focusField
+-    const field = focusField === 'user' ? userTriggerRef : keyInputRef
+-    field.current?.focus()
++    if (focusField === 'key' && previous !== 'key') {
++      keyInputRef.current?.focus()
++    } else if (focusField === 'user' && previous === 'key') {
++      userTriggerRef.current?.focus()
++    }
+   }, [focusField])
+ 
+   function switchMode(next: 'user' | 'key') {
+@@ -315,6 +336,7 @@
+ 
+   function submit(event: React.FormEvent) {
+     event.preventDefault()
++    if (!open || pending || ownerUnavailable) return
+     setSubmitted(true)
+     if (Object.keys(validateKeyRequest(request)).length) return
+@@ -363,7 +385,34 @@
+             />
+           </SettingField>
+ 
+-          {mode === 'self' ? (
++          <p role="status" className="sr-only">
++            {checkingOwner
++              ? t('keys.form.user.loading')
++              : mode === 'user'
++                ? t('keys.form.user.ready')
++                : ''}
++          </p>
++          {mode === 'blocked' ? (
++            <SettingField label={t('keys.form.user.label')}>
++              <p role="alert" className="text-sm text-destructive">
++                {t('keys.form.user.accessUnavailable')}
++              </p>
++            </SettingField>
++          ) : mode === 'self' ? (
+             <SettingField label={t('keys.form.user.label')}>
+               <p className="text-sm text-muted-foreground">
+                 {t(
+@@ -373,33 +417,41 @@
+                 )}
+               </p>
+             </SettingField>
+-          ) : mode === 'user' ? (
++          ) : mode === 'user' || mode === 'checking' ? (
+             <SettingField
+               label={t('keys.form.user.label')}
+               htmlFor={id('user')}
+               description={
+-                <>
+-                  {t('keys.form.user.description')}{' '}
+-                  <ModeSwitch
+-                    disabled={pending}
+-                    onClick={() => switchMode('key')}
+-                  >
+-                    {t('keys.form.openvikingKey.paste')}
+-                  </ModeSwitch>
+-                </>
++                mode === 'user' ? (
++                  <>
++                    {t('keys.form.user.description')}{' '}
++                    <ModeSwitch
++                      disabled={pending}
++                      onClick={() => switchMode('key')}
++                    >
++                      {t('keys.form.openvikingKey.paste')}
++                    </ModeSwitch>
++                  </>
++                ) : undefined
+               }
+               error={pasteForUser ? undefined : keyError}
+             >
+               <Select
+                 value={userId || null}
+-                disabled={pending || !usersQuery.isSuccess}
++                disabled={pending || checkingOwner}
+                 onValueChange={(value) => {
+                   if (value) update({ user_id: value })
+                 }}
+               >
+                 <SelectTrigger
+                   ref={userTriggerRef}
+                   id={id('user')}
+                   className="w-full"
++                  aria-busy={checkingOwner || undefined}
+                   aria-invalid={!pasteForUser && Boolean(keyError)}
+                 >
+                   <SelectValue>
+-                    {selectedUser ? (
++                    {selectedUser && !checkingOwner ? (
+                       <KeyUserLabel user={selectedUser} />
+                     ) : (
+                       <span className="text-muted-foreground">
+-                        {usersQuery.isSuccess
+-                          ? t('keys.form.user.placeholder')
+-                          : t('keys.form.user.loading')}
++                        {checkingOwner
++                          ? t('keys.form.user.loading')
++                          : t('keys.form.user.placeholder')}
+                       </span>
+                     )}
+@@ -643,7 +690,7 @@
+           >
+             {t('actions.cancel')}
+           </Button>
+-          <Button type="submit" form={id('form')} disabled={pending}>
++          <Button type="submit" form={id('form')} disabled={pending || ownerUnavailable}>
+             {pending ? (
+               <LoaderCircleIcon className="animate-spin" />
+             ) : (
+diff --git a/src/i18n/locales/en/gateway/keys.ts b/src/i18n/locales/en/gateway/keys.ts
+--- a/src/i18n/locales/en/gateway/keys.ts
++++ b/src/i18n/locales/en/gateway/keys.ts
+@@ -76,7 +76,9 @@
+       developmentIdentity: 'Read and write memory as {{user}}.',
+       label: 'Who is this for?',
+       placeholder: 'Choose an OpenViking user',
+-      loading: 'Loading users…',
++      loading: 'Checking who this key can be issued for…',
++      ready: 'OpenViking users are ready to choose.',
++      accessUnavailable: 'Could not verify who this key can be issued for. Close this dialog and check the Gateway connection.',
+       description:
+         'The gateway recalls and saves memory as this user. Their user API key is read on the server, stored encrypted by the gateway and never shown.',
+       roles: {
+diff --git a/src/i18n/locales/zh-CN/gateway/keys.ts b/src/i18n/locales/zh-CN/gateway/keys.ts
+--- a/src/i18n/locales/zh-CN/gateway/keys.ts
++++ b/src/i18n/locales/zh-CN/gateway/keys.ts
+@@ -73,7 +73,9 @@
+       developmentIdentity: '以 {{user}} 的身份读写记忆。',
+       label: '给谁用',
+       placeholder: '选择 OpenViking 用户',
+-      loading: '正在加载用户…',
++      loading: '正在核查可为哪些用户签发此密钥…',
++      ready: '现在可选择 OpenViking 用户。',
++      accessUnavailable: '无法确认可为哪些用户签发此密钥。请关闭对话框并检查网关连接。',
+       description:
+         '网关会以这个用户的身份召回和保存记忆。该用户的用户 API 密钥在服务端读取，由网关加密保存，不会显示。',
+       roles: {

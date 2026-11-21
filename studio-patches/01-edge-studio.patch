@@ -1,0 +1,184 @@
+diff --git a/src/shared/lib/edge-studio.ts b/src/shared/lib/edge-studio.ts
+new file mode 100644
+--- /dev/null
++++ b/src/shared/lib/edge-studio.ts
+@@ -0,0 +1,14 @@
++export const EDGE_STUDIO = import.meta.env.VITE_STUDIO_EDGE === 'true'
++
++/** This artifact does not accept a remote API origin or an API subpath. */
++export function allowsStudioApiBase(url: URL): boolean {
++  return (
++    !EDGE_STUDIO ||
++    (typeof window !== 'undefined' &&
++      url.origin === window.location.origin &&
++      url.pathname === '/' &&
++      !url.search &&
++      !url.hash)
++  )
++}
+diff --git a/src/shared/lib/studio-service.ts b/src/shared/lib/studio-service.ts
+--- a/src/shared/lib/studio-service.ts
++++ b/src/shared/lib/studio-service.ts
+@@ -1,3 +1,5 @@
++import { allowsStudioApiBase, EDGE_STUDIO } from '#/shared/lib/edge-studio'
++
+ export type ServiceProvider = 'opensource' | 'volcengine' | 'unknown'
+ export type ServiceSelection = 'auto' | Exclude<ServiceProvider, 'unknown'>
+ export type StudioDomain = 'workspace' | 'extensions' | 'management'
+@@ -12,6 +14,9 @@
+ export function identifyServiceProvider(baseUrl: string): ServiceProvider {
+   try {
+-    const { hostname, protocol } = new URL(baseUrl)
++    const url = new URL(baseUrl)
++    const { hostname, protocol } = url
+     if (!['http:', 'https:'].includes(protocol)) return 'unknown'
++    if (!allowsStudioApiBase(url)) return 'unknown'
++    if (EDGE_STUDIO) return 'opensource'
+     if (/^api\.vikingdb\.[a-z0-9-]+\.volces\.com$/.test(hostname)) {
+       return 'volcengine'
+@@ -29,6 +34,7 @@
+   baseUrl: string,
+   selection: ServiceSelection = 'auto',
+ ): ServiceProvider {
+   const detected = identifyServiceProvider(baseUrl)
++  if (EDGE_STUDIO) return detected
+   return detected === 'volcengine'
+     ? detected
+diff --git a/src/features/connection/lib/profiles.ts b/src/features/connection/lib/profiles.ts
+--- a/src/features/connection/lib/profiles.ts
++++ b/src/features/connection/lib/profiles.ts
+@@ -5,5 +5,6 @@
+ } from '#/features/connection/lib/credential-storage'
+ import type { ConnectionDraft } from '#/features/connection/lib/types'
+ import { createRandomUuid } from '#/shared/lib/browser-crypto'
++import { allowsStudioApiBase, EDGE_STUDIO } from '#/shared/lib/edge-studio'
+ import { resolveConfiguredServiceProvider } from '#/shared/lib/studio-service'
+@@ -117,7 +118,8 @@
+     const url = new URL(value.trim())
+     return (
+       ['http:', 'https:'].includes(url.protocol) &&
+       !url.username &&
+-      !url.password
++      !url.password &&
++      allowsStudioApiBase(url)
+     )
+@@ -181,7 +183,8 @@
+             ['accountId', 'userId', 'apiKey', 'adminApiKey', 'baseUrl'].every(
+               (key) => typeof connection[key] === 'string',
+             ) &&
++            (!EDGE_STUDIO || isValidConnectionUrl(connection.baseUrl)) &&
+             ['opensource', 'volcengine'].includes(connection.serviceSelection)
+           )
+diff --git a/src/features/connection/lib/connection-runtime.ts b/src/features/connection/lib/connection-runtime.ts
+--- a/src/features/connection/lib/connection-runtime.ts
++++ b/src/features/connection/lib/connection-runtime.ts
+@@ -11,7 +11,8 @@
+   resolveServerAuthMode,
+ } from '#/features/connection/lib/health'
+ import type { ConnectionProfile } from '#/features/connection/lib/profiles'
++import { isValidConnectionUrl } from '#/features/connection/lib/profiles'
+ import type { StudioMode } from '#/features/connection/lib/studio-mode'
+ import type {
+   ConnectionDraft,
+@@ -20,5 +21,6 @@
+ import { fetchAdminAccounts } from '#/shared/api/admin'
+ import { resolveApiKeyAuth } from '#/shared/api/auth'
+ import { isOvClientError, ovClient } from '#/shared/api/ov-client/index'
++import { EDGE_STUDIO } from '#/shared/lib/edge-studio'
+ import { identifyServiceProvider } from '#/shared/lib/studio-service'
+@@ -474,6 +476,11 @@
+ }
+ 
+ export function readInitialConnection(): ConnectionDraft {
+-  const storedConnection = readStoredConnection()
++  const stored = readStoredConnection()
++  // Do not retarget a legacy profile's saved credentials to this deployment.
++  const storedConnection =
++    EDGE_STUDIO && (!stored.baseUrl || !isValidConnectionUrl(stored.baseUrl))
++      ? {}
++      : stored
+   const adminApiKey =
+diff --git a/src/features/connection/components/studio-setup.tsx b/src/features/connection/components/studio-setup.tsx
+--- a/src/features/connection/components/studio-setup.tsx
++++ b/src/features/connection/components/studio-setup.tsx
+@@ -15,5 +15,6 @@
+   connectionProfileFingerprint,
+   isValidConnectionUrl,
+ } from '#/features/connection/lib/profiles'
++import { EDGE_STUDIO } from '#/shared/lib/edge-studio'
+ import { PLAIN_INPUT_PROPS } from '#/shared/lib/form-input'
+@@ -438,5 +439,10 @@
+             </p>
++            {EDGE_STUDIO ? (
++              <p role="note" className="mt-3 max-w-sm text-sm text-muted-foreground">
++                {t('studio:edge.notice')}
++              </p>
++            ) : null}
+             <ol
+               className="mt-5 flex gap-6 lg:mt-12 lg:flex-col lg:gap-7"
+               aria-label={t('steps')}
+@@ -508,6 +514,7 @@
+                             type="radio"
+                             name="provider"
+                             value={provider}
++                            disabled={EDGE_STUDIO && provider === 'volcengine'}
+                             checked={draft.serviceSelection === provider}
+                             onChange={() => switchProvider(provider)}
+@@ -585,7 +592,8 @@
+                             className="h-11 rounded-lg"
+                             type="url"
+                             value={draft.baseUrl}
+-                            placeholder="http://127.0.0.1:1933"
++                            readOnly={EDGE_STUDIO}
++                            placeholder={EDGE_STUDIO ? undefined : 'http://127.0.0.1:1933'}
+                             aria-invalid={
+                               Boolean(draft.baseUrl) && !canContinue
+@@ -600,5 +608,5 @@
+                             className="text-xs text-muted-foreground"
+                           >
+                             {draft.baseUrl && !canContinue
+                               ? t('studio:profiles.invalidUrl')
+-                              : t('newAddressHint')}
++                              : t(EDGE_STUDIO ? 'studio:edge.originHint' : 'newAddressHint')}
+                           </p>
+                         </div>
+diff --git a/src/app/layouts/studio-layout.tsx b/src/app/layouts/studio-layout.tsx
+--- a/src/app/layouts/studio-layout.tsx
++++ b/src/app/layouts/studio-layout.tsx
+@@ -25,4 +25,5 @@
+   isStudioFeatureVisible,
+ } from '#/shared/lib/studio-service'
++import { EDGE_STUDIO } from '#/shared/lib/edge-studio'
+ import { ScrollArea } from '#/shared/ui/scroll-area'
+@@ -330,5 +331,10 @@
+         <SidebarInset className="min-h-0 flex-1 overflow-hidden rounded-none border-0 bg-background shadow-none ring-0 md:m-0 md:ml-0">
+           <ScrollArea className="min-h-0 flex-1">
+             <div className="flex w-full flex-col gap-6 px-4 py-6 md:px-6">
++              {EDGE_STUDIO ? (
++                <p role="note" className="rounded-md border border-border bg-muted/40 px-3 py-2 text-sm text-foreground">
++                  {t('studio:edge.notice')}
++                </p>
++              ) : null}
+               {children}
+diff --git a/src/i18n/locales/en/studio.ts b/src/i18n/locales/en/studio.ts
+--- a/src/i18n/locales/en/studio.ts
++++ b/src/i18n/locales/en/studio.ts
+@@ -1,4 +1,9 @@
+ const studio = {
++  edge: {
++    notice:
++      'Partial API support on this deployment. Some features, including administration, VikingBot and remote imports, are not available here. Studio shows errors returned by the server.',
++    originHint: 'Studio connects only to the server hosting this page.',
++  },
+   credentialStorage: {
+diff --git a/src/i18n/locales/zh-CN/studio.ts b/src/i18n/locales/zh-CN/studio.ts
+--- a/src/i18n/locales/zh-CN/studio.ts
++++ b/src/i18n/locales/zh-CN/studio.ts
+@@ -1,4 +1,9 @@
+ const studio = {
++  edge: {
++    notice:
++      '此部署仅支持部分 API。管理后台、VikingBot 和远程导入等功能在此不可用。Studio 会显示服务器返回的错误。',
++    originHint: 'Studio 只连接到托管此页面的服务器。',
++  },
+   credentialStorage: {

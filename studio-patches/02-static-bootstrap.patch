@@ -1,0 +1,110 @@
+diff --git a/index.html b/index.html
+--- a/index.html
++++ b/index.html
+@@ -1,7 +1,8 @@
+ <!doctype html>
+ <html lang="en">
+   <head>
+     <meta charset="UTF-8" />
++    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; base-uri 'none'; form-action 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self'; font-src 'self' data:; img-src 'self' data: blob:; media-src 'self' blob:; worker-src 'self' blob:; frame-src 'self' blob:" />
+     <link rel="icon" type="image/x-icon" sizes="32x32" href="%BASE_URL%favicon.ico" />
+@@ -22,50 +23,5 @@
+     <meta name="apple-mobile-web-app-capable" content="yes" />
+     <meta name="apple-mobile-web-app-title" content="OpenViking" />
+     <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+     <!-- Runs before Vite's module graph so dependencies can safely call crypto.randomUUID. -->
+-    <script>
+-      ;(() => {
+-        const cryptoObject = globalThis.crypto
+-        if (!cryptoObject || typeof cryptoObject.randomUUID === 'function') {
+-          return
+-        }
+-
+-        const createUuid = () => {
+-          const bytes = new Uint8Array(16)
+-          if (typeof cryptoObject.getRandomValues === 'function') {
+-            cryptoObject.getRandomValues(bytes)
+-          } else {
+-            for (let index = 0; index < bytes.length; index += 1) {
+-              bytes[index] = Math.floor(Math.random() * 256)
+-            }
+-          }
+-
+-          bytes[6] = (bytes[6] & 0x0f) | 0x40
+-          bytes[8] = (bytes[8] & 0x3f) | 0x80
+-
+-          const hex = Array.from(bytes, (byte) =>
+-            byte.toString(16).padStart(2, '0'),
+-          )
+-
+-          return `${hex.slice(0, 4).join('')}-${hex
+-            .slice(4, 6)
+-            .join('')}-${hex.slice(6, 8).join('')}-${hex
+-            .slice(8, 10)
+-            .join('')}-${hex.slice(10, 16).join('')}`
+-        }
+-
+-        try {
+-          Object.defineProperty(cryptoObject, 'randomUUID', {
+-            configurable: true,
+-            value: createUuid,
+-          })
+-        } catch {
+-          try {
+-            cryptoObject.randomUUID = createUuid
+-          } catch {
+-            // Ignore browsers that expose a non-extensible Crypto object.
+-          }
+-        }
+-      })()
+-    </script>
++    <script src="%BASE_URL%assets/uuid-bootstrap.js"></script>
+     <title>OpenViking Studio</title>
+diff --git a/public/assets/uuid-bootstrap.js b/public/assets/uuid-bootstrap.js
+new file mode 100644
+--- /dev/null
++++ b/public/assets/uuid-bootstrap.js
+@@ -0,0 +1,43 @@
++;(() => {
++  const cryptoObject = globalThis.crypto
++  if (!cryptoObject || typeof cryptoObject.randomUUID === 'function') {
++    return
++  }
++
++  const createUuid = () => {
++    const bytes = new Uint8Array(16)
++    if (typeof cryptoObject.getRandomValues === 'function') {
++      cryptoObject.getRandomValues(bytes)
++    } else {
++      for (let index = 0; index < bytes.length; index += 1) {
++        bytes[index] = Math.floor(Math.random() * 256)
++      }
++    }
++
++    bytes[6] = (bytes[6] & 0x0f) | 0x40
++    bytes[8] = (bytes[8] & 0x3f) | 0x80
++
++    const hex = Array.from(bytes, (byte) =>
++      byte.toString(16).padStart(2, '0'),
++    )
++
++    return `${hex.slice(0, 4).join('')}-${hex
++      .slice(4, 6)
++      .join('')}-${hex.slice(6, 8).join('')}-${hex
++      .slice(8, 10)
++      .join('')}-${hex.slice(10, 16).join('')}`
++  }
++
++  try {
++    Object.defineProperty(cryptoObject, 'randomUUID', {
++      configurable: true,
++      value: createUuid,
++    })
++  } catch {
++    try {
++      cryptoObject.randomUUID = createUuid
++    } catch {
++      // Ignore browsers that expose a non-extensible Crypto object.
++    }
++  }
++})()

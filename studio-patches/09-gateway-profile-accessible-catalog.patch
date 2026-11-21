@@ -1,0 +1,220 @@
+diff --git a/src/features/admin/gateway/components/profiles-settings.tsx b/src/features/admin/gateway/components/profiles-settings.tsx
+--- a/src/features/admin/gateway/components/profiles-settings.tsx
++++ b/src/features/admin/gateway/components/profiles-settings.tsx
+@@ -239,49 +239,115 @@
+   checked,
+   onCheckedChange,
+   label,
+-  description,
+-  badge,
+ }: {
+   checked: boolean
+   onCheckedChange: (checked: boolean) => void
+   label: string
+-  description?: string
+-  /** Shown after the label, such as a tool's read-only mark. */
+-  badge?: React.ReactNode
+ }) {
+   const readOnly = useReadOnly()
+-  if (!description && !badge) {
+-    return (
+-      <Label className="font-normal">
+-        <Checkbox
+-          disabled={readOnly}
+-          checked={checked}
+-          aria-label={label}
+-          onCheckedChange={(value) => onCheckedChange(Boolean(value))}
+-        />
+-        {label}
+-      </Label>
+-    )
+-  }
+   return (
+-    <Label className="cursor-pointer items-start gap-3 rounded-lg border p-3 leading-normal font-normal transition-colors hover:bg-muted/30">
++    <Label className="font-normal">
+       <Checkbox
+         disabled={readOnly}
+         checked={checked}
+         aria-label={label}
+-        className="mt-0.5"
+         onCheckedChange={(value) => onCheckedChange(Boolean(value))}
++      />
++      {label}
++    </Label>
++  )
++}
++
++function GatewayToolCheckbox({
++  tool,
++  checked,
++  onChange,
++}: {
++  tool: GatewayTool
++  checked: boolean
++  onChange: (checked: boolean) => void
++}) {
++  const { t } = useTranslation('gateway')
++  const readOnly = useReadOnly()
++  const descriptionId = React.useId()
++  const badgeId = `${descriptionId}-hint`
++  const hint = tool.annotations?.readOnlyHint
++  const hasHint = typeof hint === 'boolean'
++  const describedBy = [hasHint ? badgeId : '', tool.description ? descriptionId : ''].filter(Boolean).join(' ')
++  return (
++    <Label className="cursor-pointer items-start gap-3 rounded-lg border p-3 leading-normal font-normal transition-colors hover:bg-muted/30 has-[:disabled]:cursor-default">
++      <input
++        type="checkbox"
++        disabled={readOnly}
++        checked={checked}
++        aria-checked={checked}
++        aria-label={tool.name}
++        aria-describedby={describedBy || undefined}
++        className="mt-0.5 size-4 shrink-0 accent-primary focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:opacity-50"
++        onChange={(event) => onChange(event.currentTarget.checked)}
+       />
+       <span className="grid min-w-0 gap-1">
+         <span className="flex flex-wrap items-center gap-2 font-medium">
+-          <span className="break-all">{label}</span>
+-          {badge}
++          <span className="break-all">{tool.name}</span>
++          {hasHint ? (
++            <Badge id={badgeId} variant="secondary">
++              {t(hint ? 'profiles.tools.readOnly' : 'profiles.tools.modifiesData')}
++            </Badge>
++          ) : null}
+         </span>
+-        <span className="text-xs whitespace-pre-wrap text-muted-foreground">
+-          {description}
+-        </span>
++        {tool.description ? (
++          <span id={descriptionId} className="text-xs whitespace-pre-wrap text-muted-foreground">
++            {tool.description}
++          </span>
++        ) : null}
+       </span>
+     </Label>
++  )
++}
++
++// A late catalog response should update the catalog, not rerender the rest of
++// the editor before its controls become available.
++function GatewayToolCatalog({ disabledTools, onChange }: {
++  disabledTools: string[]
++  onChange: (patch: Partial<ProfileSettings>) => void
++}) {
++  const { t } = useTranslation('gateway')
++  const tools = useTools()
++  const catalog = tools.data ?? []
++  const names = catalog.map((tool) => tool.name)
++  return (
++    <OptionGroup
++      id="profile-disabled_tools"
++      label={t('profiles.tools.available.label')}
++      description={t('profiles.tools.available.description')}
++    >
++      {tools.isPending ? (
++        <LoadingState className="min-h-24" />
++      ) : tools.isError ? (
++        <ErrorState
++          className="min-h-24"
++          title={t('profiles.tools.loadFailed')}
++          error={tools.error}
++          retrying={tools.isFetching}
++          onRetry={() => void tools.refetch()}
++        />
++      ) : catalog.length === 0 ? (
++        <Notice tone="info">{t('profiles.tools.empty')}</Notice>
++      ) : (
++        <div className="grid gap-2 md:grid-cols-2">
++          {catalog.map((tool) => (
++            <GatewayToolCheckbox
++              key={tool.name}
++              tool={tool}
++              checked={!disabledTools.includes(tool.name)}
++              onChange={(checked) => onChange({
++                disabled_tools: toggleItem(disabledTools, tool.name, !checked, names),
++              })}
++            />
++          ))}
++        </div>
++      )}
++    </OptionGroup>
+   )
+ }
+ 
+@@ -302,7 +368,6 @@
+   errors,
+ }: ProfileSettingsFormProps) {
+   const { t, i18n } = useTranslation('gateway')
+-  const tools = useTools({ enabled: value.gateway_tools })
+   const locale = i18n.resolvedLanguage
+   // Limits the admin turned off, restored if they turn the limit back on.
+   const [lastQuotas, setLastQuotas] = React.useState(value.quotas)
+@@ -362,36 +427,6 @@
+       </SettingField>
+     )
+   }
+-
+-  const toolOption = (tool: GatewayTool) => (
+-    <OptionCheckbox
+-      key={tool.name}
+-      checked={!value.disabled_tools.includes(tool.name)}
+-      label={tool.name}
+-      description={tool.description}
+-      badge={
+-        typeof tool.annotations?.readOnlyHint === 'boolean' ? (
+-          <Badge variant="secondary">
+-            {t(
+-              tool.annotations.readOnlyHint
+-                ? 'profiles.tools.readOnly'
+-                : 'profiles.tools.modifiesData',
+-            )}
+-          </Badge>
+-        ) : undefined
+-      }
+-      onCheckedChange={(checked) =>
+-        onChange({
+-          disabled_tools: toggleItem(
+-            value.disabled_tools,
+-            tool.name,
+-            !checked,
+-            (tools.data ?? []).map((entry) => entry.name),
+-          ),
+-        })
+-      }
+-    />
+-  )
+ 
+   const limitByCategory = Object.keys(value.quotas).length > 0
+   const quotasError = message('quotas')
+@@ -672,29 +707,7 @@
+           </div>
+         }
+       >
+-        <OptionGroup
+-          id="profile-disabled_tools"
+-          label={t('profiles.tools.available.label')}
+-          description={t('profiles.tools.available.description')}
+-        >
+-          {tools.isPending ? (
+-            <LoadingState className="min-h-24" />
+-          ) : tools.isError ? (
+-            <ErrorState
+-              className="min-h-24"
+-              title={t('profiles.tools.loadFailed')}
+-              error={tools.error}
+-              retrying={tools.isFetching}
+-              onRetry={() => void tools.refetch()}
+-            />
+-          ) : tools.data.length === 0 ? (
+-            <Notice tone="info">{t('profiles.tools.empty')}</Notice>
+-          ) : (
+-            <div className="grid gap-2 md:grid-cols-2">
+-              {tools.data.map(toolOption)}
+-            </div>
+-          )}
+-        </OptionGroup>
++        {value.gateway_tools ? <GatewayToolCatalog disabledTools={value.disabled_tools} onChange={onChange} /> : null}
+         <Notice tone="warning">{t('profiles.tools.executionNotice')}</Notice>
+         <ToggleRow
+           id="profile-show_tool_calls"

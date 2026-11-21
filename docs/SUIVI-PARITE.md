@@ -1,0 +1,25 @@
+# Réception locale et suite de parité
+
+Objectif : continuer jusqu’à la parité native du Worker et du Web Studio d’origine, avec les tests originaux. Un palier validé ne clôt pas le projet. L’amont reste en lecture seule au SHA `000f0765d7ec183886fbabbc22e69bc289cc429d`. Ne pas lancer de déploiement, publier ou déplacer de données réelles pour obtenir un test vert.
+
+## Preuves acquises à ce palier
+
+| Périmètre | Résultat et portée |
+|---|---|
+| Port local | **206/206** sous Workerd/DO SQLite sur une [copie figée](../.work/frozen-local-snYptS/receipt.json) SHA de sources `7acb99873432b4774965bdd2481088a2f2c59044cb66c7e542434f45917a5cb3`, TypeScript vert, entrées relues à l’identique après le test (`p-5bac5da8`). L’ancien **180/180** est historique, pas additionné. Le nouveau candidat se contrôle avec `node scripts/qualify-local.mjs`. |
+| Vraies assertions HTTP | **52/52** scénarios sélectionnés sur 8809. **12/12** nouveaux cas sur 8817 (L0/L1 de fixture, recherche avec session, snapshots, Skills et cinq refus attendus). **3/3** cas d’origine sur 8818 valident séparément l’import synchrone sans `to` et la lecture des résumés générés avec un fournisseur fictif, sur la vraie URI du fichier. Le cas original de réindexation en `mode:full`, refusé aussi au pin, n’est pas compté vert. La régénération `semantic_and_vectors` a ses tests locaux distincts. [Reçus par nœud](ORIGINAL-REPLAY.md). Ne pas additionner les campagnes ni créditer les modules non admis. |
+| CLI d’origine | **72/72** (0 échec, 0 saut, 0 désélection) en **une exécution** sur Workerd 8816, bundle `ab69453299e1a3e8b0adda4b18ff709df0431ae68ec88cb09e1bcb8a706025d0`. Le même binaire Rust amont et ses assertions ont été conservés. La preuve de log snapshots inclut l’écriture imbriquée et le vrai filtrage, pas seulement un état de sortie. [Rapport et reçus](CLI-REPLAY.md). |
+| Démarrage Wrangler | Rouge initial : Wrangler refuse le binding AI inférent dans `--local`. Le profil sans AI a démarré, servi le vrai Studio, authentifié le compte via SQLite et fermé l’accès anonyme. `node scripts/wrangler-smoke.mjs <port-libre>`. Aucun repli distant ni opération réelle d’IA. |
+| Build Web Studio | Candidat stagé `f6ff17c7…` : **1 939/1 939 tests d’origine** dans 221 fichiers et **28/28 tests Edge à chacun des deux passages**. Les 614 actifs ont été revérifiés. L’ancien candidat à 1 936/1 939 reste dans l’historique. Le Studio effectivement servi reste `9fd48ee4…` tant que le navigateur n’a pas qualifié le nouveau manifeste. [Preuves du correctif Gateway](../.work/studio/GATEWAY-KEYS.md) · [Reçu](../.work/studio/qualify-keys-vawty9hw/qualification.json). |
+| Navigateur | Workerd `8810`, vrai Studio SHA `9fd48ee49904e3e443c8c9a14d06756499255189c51e3fd6bce3fce50550c00d` : correction Users Root et sélecteur de compte prouvée à 320/390 ; **9,5/10** sur le périmètre de la contre-revue. [Audit](UX-PARITY.md). VikingBot a réellement exécuté son flux navigateur SSE sur `8806` avec un fournisseur de test, pas avec un modèle Cloudflare distant. |
+| Défense | ACL descendantes, attribution de groupe pendant une tâche, consentement OAuth anonyme, préconditions DAV et métadonnées historiques corrigées avec témoins bornés. [Audit de la parité](SECURITY-PARITY.md). Le verdict se limite à la source/artefact relus et aux vrais résultats attribués, sans WAF/Access ni feu vert distant. |
+
+## Travaux non fermés
+
+- [CLI Rust et SDK](CLI-REPLAY.md) : Rust Linux **549/549**, distinct de Workerd ; rejeu CLI complet 8816 **72/72** confirmé ci-dessus. Les rouges 8807, 8812 et 8814 restent conservés. Le SDK TypeScript a sa propre preuve hors réseau, **63/63** sous Node 24.11.1 et verrou exact ; `format:check` reste rouge sur `src/client.ts` de l’amont. Ni ce lot ni le CLI ne couvrent tous les fournisseurs ou identités.
+- Élargissement des scénarios HTTP d’origine admis. Les preuves Linux (Lite, ASGI et lots larges) restent distinctes de Workerd, ainsi que les échecs Linux déjà recensés.
+- Recette navigateur indépendante du Studio stagé (`openviking-parite-reception`) : distinguer les scénarios d’interface testés avec des données fictives des capacités effectivement offertes par le Worker. Aucune promotion sur la seule base des tests automatisés ni d’une recette portant sur l’ancien artefact.
+- [Identité OIDC native](OIDC.md) montée en lecture seule et éprouvée (**24/24 OIDC + contrôle** au lot, dont conservation du contrat clé seule de `/health`). Les flux d’identité externes, toutes les variantes de traitement, les connecteurs et la sauvegarde/restauration globale ne sont pas à parité.
+- Qualifier de nouveau les frontières sensibles sur le candidat qui intègre ces remises. Workers AI réel et exposition distante hors recette locale ; pas de clé ou de compte à demander pour les tests synthétiques.
+
+La cohorte HTTP 8817 (`openviking-parite-services`) est réceptionnée. Le suivi de la parité se poursuit avec des preuves séparées ; les instances anciennes ne sont pas des ports de production ni des sources de nouveaux résultats.

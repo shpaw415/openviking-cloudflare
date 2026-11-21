@@ -1,0 +1,151 @@
+diff --git a/src/features/connection/components/studio-setup.tsx b/src/features/connection/components/studio-setup.tsx
+--- a/src/features/connection/components/studio-setup.tsx
++++ b/src/features/connection/components/studio-setup.tsx
+@@ -193,6 +193,7 @@
+     (draft.serviceSelection === 'opensource' && !needsNewAddress) ||
+     isValidConnectionUrl(draft.baseUrl)
+   const [busy, setBusy] = useState(false)
+   const [error, setError] = useState<string | Error>('')
++  const keyRequiredMessage = t(EDGE_STUDIO ? 'studio:edge.keyRequired' : 'keyRequired')
+   const connectionRevisionRef = useRef(0)
+@@ -347,9 +348,9 @@
+     if (!isValidConnectionUrl(draft.baseUrl)) {
+       setError(t('studio:profiles.invalidUrl'))
+       return
+     }
+-    if (draft.serviceSelection === 'volcengine' && !draft.apiKey.trim()) {
+-      setError(t('keyRequired'))
++    if ((EDGE_STUDIO || draft.serviceSelection === 'volcengine') && !draft.apiKey.trim()) {
++      setError(keyRequiredMessage)
+       keyInputRef.current?.focus()
+       return
+@@ -376,6 +377,7 @@
+         }
+         setControlVerified(
++          !EDGE_STUDIO &&
+           result.serviceSelection === 'opensource' &&
+             Boolean(result.adminApiKey),
+         )
+@@ -738,13 +740,13 @@
+                       className="grid gap-2 text-sm font-medium"
+                       htmlFor="setup-key"
+                     >
+-                      {t('keyLabel')}
++                      {t(EDGE_STUDIO ? 'studio:edge.keyLabel' : 'keyLabel')}
+                       <Input
+                         ref={keyInputRef}
+                         className="h-11 rounded-lg bg-background/60 text-sm"
+                         id="setup-key"
+                         name="apiKey"
+                         type="password"
+-                        aria-invalid={error === t('keyRequired')}
++                        aria-invalid={error === keyRequiredMessage}
+                         aria-describedby={
+-                          error === t('keyRequired')
+-                            ? 'setup-key-error'
+-                            : undefined
++                          error === keyRequiredMessage
++                            ? 'setup-key-error setup-key-help'
++                            : 'setup-key-help'
+                         }
+                         value={draft.apiKey}
+@@ -761,6 +763,6 @@
+                         autoComplete="off"
+                       />
+                     </label>
+-                    {error === t('keyRequired') ? (
++                    {error === keyRequiredMessage ? (
+                       <p
+                         id="setup-key-error"
+@@ -770,13 +772,15 @@
+                         {error}
+                       </p>
+                     ) : null}
+-                    <p className="text-sm text-muted-foreground">
++                    <p id="setup-key-help" className="text-sm text-muted-foreground">
+                       {t(
+-                        draft.serviceSelection === 'volcengine'
+-                          ? 'hostedKeyHelp'
+-                          : 'keyHelp',
++                        EDGE_STUDIO
++                          ? 'studio:edge.keyHelp'
++                          : draft.serviceSelection === 'volcengine'
++                            ? 'hostedKeyHelp'
++                            : 'keyHelp',
+                       )}
+                     </p>
+-                    {draft.serviceSelection === 'opensource' && (
++                    {!EDGE_STUDIO && draft.serviceSelection === 'opensource' && (
+                       <div className="grid gap-2 text-sm font-medium">
+@@ -803,6 +807,6 @@
+                       </div>
+                     )}
+-                    {draft.serviceSelection === 'opensource' &&
++                    {!EDGE_STUDIO && draft.serviceSelection === 'opensource' &&
+                     !controlVerified ? (
+                       <div>
+@@ -885,7 +889,7 @@
+                       />
+                     </div>
+                   )}
+-                  {error && error !== t('keyRequired') ? (
++                  {error && error !== keyRequiredMessage ? (
+                     <ErrorMessage
+                       error={error}
+diff --git a/src/app/layouts/studio-layout.tsx b/src/app/layouts/studio-layout.tsx
+--- a/src/app/layouts/studio-layout.tsx
++++ b/src/app/layouts/studio-layout.tsx
+@@ -332,9 +332,20 @@
+           <ScrollArea className="min-h-0 flex-1">
+             <div className="flex w-full flex-col gap-6 px-4 py-6 md:px-6">
+               {EDGE_STUDIO ? (
+-                <p role="note" className="rounded-md border border-border bg-muted/40 px-3 py-2 text-sm text-foreground">
+-                  {t('studio:edge.notice')}
+-                </p>
++                <div role="note" className="rounded-md border border-border bg-muted/40 px-3 py-2 text-sm text-foreground">
++                  <p>{t('studio:edge.notice')}</p>
++                  <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1">
++                    <Link to="/filesystem" className="underline underline-offset-4 focus-visible:outline-2 focus-visible:outline-offset-2">
++                      {t('studio:edge.explorer')}
++                    </Link>
++                    <Link to="/retrieval" className="underline underline-offset-4 focus-visible:outline-2 focus-visible:outline-offset-2">
++                      {t('studio:edge.retrieval')}
++                    </Link>
++                  </div>
++                </div>
+               ) : null}
+               {children}
+diff --git a/src/i18n/locales/en/studio.ts b/src/i18n/locales/en/studio.ts
+--- a/src/i18n/locales/en/studio.ts
++++ b/src/i18n/locales/en/studio.ts
+@@ -1,8 +1,13 @@
+ const studio = {
+   edge: {
+     notice:
+-      'Partial API support on this deployment. Some features, including administration, VikingBot and remote imports, are not available here. Studio shows errors returned by the server.',
++      'This deployment supports file exploration and context search. Administration, VikingBot and remote imports are not available here.',
+     originHint: 'Studio connects only to the server hosting this page.',
++    keyLabel: 'User API key',
++    keyHelp: 'Enter the User API key issued for this Worker.',
++    keyRequired: 'Enter a User API key to continue.',
++    explorer: 'File Explorer',
++    retrieval: 'Context Search',
+   },
+   credentialStorage: {
+diff --git a/src/i18n/locales/zh-CN/studio.ts b/src/i18n/locales/zh-CN/studio.ts
+--- a/src/i18n/locales/zh-CN/studio.ts
++++ b/src/i18n/locales/zh-CN/studio.ts
+@@ -1,8 +1,13 @@
+ const studio = {
+   edge: {
+     notice:
+-      '此部署仅支持部分 API。管理后台、VikingBot 和远程导入等功能在此不可用。Studio 会显示服务器返回的错误。',
++      '此部署支持浏览文件和搜索上下文，不支持管理后台、VikingBot 和远程导入。',
+     originHint: 'Studio 只连接到托管此页面的服务器。',
++    keyLabel: '用户 API 密钥',
++    keyHelp: '请输入为此 Worker 签发的用户 API 密钥。',
++    keyRequired: '请输入用户 API 密钥以继续。',
++    explorer: '文件浏览器',
++    retrieval: '上下文搜索',
+   },
+   credentialStorage: {

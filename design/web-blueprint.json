@@ -1,0 +1,34 @@
+{
+  "id": "3c648350-bb4a-40d9-a8d3-0e5eec39a254",
+  "title": "openviking-cloudflare",
+  "description": "Portage natif de Web Studio et de son API vers un Worker, avec tests de non-régression amont.",
+  "revision": 1,
+  "createdAt": "2026-11-21T14:15:15.118Z",
+  "updatedAt": "2026-11-21T14:15:15.118Z",
+  "metadata": {
+    "reference": "openviking-cloudflare",
+    "client": "",
+    "owner": "",
+    "kind": "application",
+    "objective": "Conserver le Web Studio d’origine et faire exécuter l’API par workerd sans serveur séparé.",
+    "audience": "Utilisateurs du Web Studio et intégrateurs OpenViking",
+    "state": "active",
+    "tags": ["Workers", "OpenViking", "Web Studio"],
+    "notes": "Conserver les composants et libellés de l’amont. Ne pas maquiller les fonctions indisponibles en succès. Valider les parcours réels dans le navigateur et séparer tests de référence et tests Worker.",
+    "relations": [{ "id": "d5bef4c3-96fe-43a6-9fad-663818fc50c1", "type": "git", "label": "OpenViking amont", "target": "https://github.com/volcengine/OpenViking", "note": "Référence au SHA 000f0765d7ec183886fbabbc22e69bc289cc429d." }]
+  },
+  "nodes": [
+    { "id": "8d9f5e02-1c62-4333-80e9-6fa3efb7f401", "type": "page", "title": "Connexion Web Studio", "x": 50, "y": 50, "width": 300, "height": 140, "route": "/studio/", "status": "doing", "notes": "Écran d’origine, API same-origin, erreurs de connexion visibles et gestion par clavier." },
+    { "id": "8d9f5e02-1c62-4333-80e9-6fa3efb7f402", "type": "page", "title": "Navigateur de fichiers", "x": 470, "y": 20, "width": 300, "height": 140, "route": "/studio/filesystem", "status": "todo", "notes": "Espace vide, arbre, ajout, lecture d’un document, rechargement, et erreurs. Vérifier le reflow en largeur mobile." },
+    { "id": "8d9f5e02-1c62-4333-80e9-6fa3efb7f403", "type": "page", "title": "Recherche de contexte", "x": 470, "y": 250, "width": 300, "height": 140, "status": "todo", "notes": "Résultats reliés à leur URI ; vider/erreur/aucun résultat distincts ; pas de recherche sémantique simulée." },
+    { "id": "8d9f5e02-1c62-4333-80e9-6fa3efb7f404", "type": "text", "title": "Parité des autres écrans", "x": 470, "y": 480, "width": 300, "height": 140, "status": "todo", "notes": "Sessions, bot, administration, compilation et observabilité : contrôler chaque dépendance API et afficher les limites." },
+    { "id": "8d9f5e02-1c62-4333-80e9-6fa3efb7f405", "type": "backend", "title": "API Cloudflare Worker", "x": 930, "y": 220, "width": 330, "height": 155, "status": "doing", "backend": "Durable Objects SQLite, binding d’embeddings, ressources statiques. Vérifier l’identité avant accès. Pas de repli amont." }
+  ],
+  "edges": [
+    { "id": "8d9f5e02-1c62-4333-80e9-6fa3efb7f411", "from": "8d9f5e02-1c62-4333-80e9-6fa3efb7f401", "to": "8d9f5e02-1c62-4333-80e9-6fa3efb7f402", "label": "Connexion valide" },
+    { "id": "8d9f5e02-1c62-4333-80e9-6fa3efb7f412", "from": "8d9f5e02-1c62-4333-80e9-6fa3efb7f402", "to": "8d9f5e02-1c62-4333-80e9-6fa3efb7f403", "label": "Indexer puis rechercher" },
+    { "id": "8d9f5e02-1c62-4333-80e9-6fa3efb7f413", "from": "8d9f5e02-1c62-4333-80e9-6fa3efb7f402", "to": "8d9f5e02-1c62-4333-80e9-6fa3efb7f405", "label": "Lister et lire" },
+    { "id": "8d9f5e02-1c62-4333-80e9-6fa3efb7f414", "from": "8d9f5e02-1c62-4333-80e9-6fa3efb7f403", "to": "8d9f5e02-1c62-4333-80e9-6fa3efb7f405", "label": "Recherche" },
+    { "id": "8d9f5e02-1c62-4333-80e9-6fa3efb7f415", "from": "8d9f5e02-1c62-4333-80e9-6fa3efb7f401", "to": "8d9f5e02-1c62-4333-80e9-6fa3efb7f404", "label": "Nav d’origine" }
+  ]
+}
