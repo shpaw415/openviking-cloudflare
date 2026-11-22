@@ -5,10 +5,12 @@ import { ApiError, apiError, isRecord, ok, readBytes, readJson } from './http.js
 import { LIMIT, absent, bad, boolParam, directory, fields, forbidden, hasCallerShape, id, memberIds, newKey, rejectSeed, role, unavailable } from './control/input.js'
 import { fixedCallers, Registry } from './control/registry.js'
 import type { ModelProbeBinding } from './control/provider.js'
-import { probeKind, probeModel } from './control/provider.js'
+import { probeActiveModel, probeKind, probeModel } from './control/provider.js'
 import { configurationPatch, evolution, Settings, systemPatch, userPatch } from './control/settings.js'
 import { memoryTypes } from './control/template-defaults.js'
 import { memoryType, Templates } from './control/templates.js'
+import { bindModel, configFileLimit, legacyEmbedding, patchModels, selectedVlm } from './model-config.js'
+import type { ModelEnv, ModelSettings } from './model-config.js'
 
 export type { ControlCaller } from './context.js'
 
@@ -49,7 +51,7 @@ async function optionalRotationBody(request: Request): Promise<void> {
   rejectSeed(value.seed)
 }
 
-export class Control extends DurableObject<{ AI?: Ai }> {
+export class Control extends DurableObject<ModelEnv> {
   #registry = new Registry(this.ctx.storage)
   #settings = new Settings(this.#registry.sql)
   #templates = new Templates(this.#registry.sql)
@@ -62,6 +64,9 @@ export class Control extends DurableObject<{ AI?: Ai }> {
   }
 
   probe(): boolean { return this.#registry.sql.exec<{ n: number }>('SELECT 1 AS n').one().n === 1 }
+
+  /** Private DO RPC: operational defaults only, never a deployment secret. */
+  modelSettings(): ModelSettings { return this.#settings.models().settings }
 
   groupsFor(caller: Caller): string[] { return this.#registry.groupsFor(caller) }
 
@@ -137,9 +142,47 @@ export class Control extends DurableObject<{ AI?: Ai }> {
     }
     if (section === 'configuration') {
       root(caller)
+      if (path.length === 2 && account === 'import') {
+        if (verb !== 'GET' && verb !== 'POST') throw methodError()
+        if ([...params.keys()].some(key => verb !== 'POST' || (key !== 'dry_run' && key !== 'if_revision') || params.getAll(key).length > 1)) {
+          throw bad('Invalid configuration import options.')
+        }
+        const view = (revision: number, settings: ModelSettings, dry_run: boolean) => {
+          const vlm = selectedVlm(this.env, settings)
+          const embedding = settings.embedding?.dense ?? legacyEmbedding
+          return ok({ revision, dry_run, settings, effective: {
+            vlm: vlm ? { ...vlm, configured: !!bindModel(this.env, vlm) } : null,
+            embedding: { ...embedding, configured: !!bindModel(this.env, embedding), scope: 'new_workspaces' },
+            default_search_limit: settings.default_search_limit ?? 10,
+          } })
+        }
+        if (verb === 'GET') {
+          const current = this.#settings.models()
+          return view(current.revision, current.settings, false)
+        }
+        const dryRun = boolParam(params, 'dry_run', false)
+        const match = params.get('if_revision')
+        if (match !== null && (!/^\d+$/.test(match) || !Number.isSafeInteger(Number(match)))) throw bad('Invalid configuration revision.')
+        const body = await readJson(request, configFileLimit)
+        return write(() => {
+          const current = this.#settings.models()
+          if (match !== null && Number(match) !== current.revision) throw new ApiError(409, 'CONFLICT', 'Configuration revision changed.')
+          const settings = patchModels(current.settings, body, this.env)
+          const changed = JSON.stringify(settings) !== JSON.stringify(current.settings)
+          const revision = !dryRun && changed ? current.revision + 1 : current.revision
+          if (!dryRun && changed) this.#settings.saveModels(revision, settings)
+          return view(revision, settings, dryRun)
+        })
+      }
       if (path.length === 2 && account === 'test-model') {
         if (verb !== 'POST') throw methodError()
-        const kind = probeKind(await readBody(request))
+        const body = await readBody(request)
+        if (body.active === true) {
+          fields(body, ['kind', 'active'])
+          if (body.kind !== 'embedding' && body.kind !== 'vlm') throw bad('Select the embedding or vlm model.')
+          return ok(await probeActiveModel(this.env, this.modelSettings(), body.kind, () => write(() => registry.reserveProbe())))
+        }
+        const kind = probeKind(body)
         const ai = this.env.AI as unknown as ModelProbeBinding | undefined
         return ok(await probeModel(ai, kind, () => write(() => registry.reserveProbe())))
       }

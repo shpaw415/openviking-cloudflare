@@ -34,6 +34,7 @@ export interface Env {
   OPENVIKING_EDGE_OIDC?: string
   OPENVIKING_EDGE_KEYS?: string
   OPENVIKING_EDGE_GENERATION?: string
+  OPENVIKING_EDGE_PROVIDERS?: string
   OPENVIKING_EDGE_AUDIT?: string
   OPENVIKING_EDGE_TEXT_SOURCES?: string
   OPENVIKING_EDGE_MCP?: string
@@ -54,6 +55,8 @@ export interface WorkspaceContext {
   aclPrincipals?: { users: readonly string[], groups: readonly string[] }
   auditEnabled?: boolean
   hasEmbedding?: boolean
+  embeddingModel?: string
+  defaultSearchLimit?: number
   remoteText?: { allows: (url: string) => boolean; read: (url: string) => Promise<string> }
   registerWatch?: (body: Record<string, unknown>) => Promise<Response | undefined>
   mcpMode?: string

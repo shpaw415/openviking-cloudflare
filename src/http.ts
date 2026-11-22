@@ -21,7 +21,7 @@ export function apiError(error: unknown, requestId: string): Response {
   return Response.json({ status: 'error', error: { code, message } }, { status, headers })
 }
 
-export async function readBytes(request: Request, maxBytes: number): Promise<Uint8Array<ArrayBuffer>> {
+export async function readBytes(request: Request | Response, maxBytes: number): Promise<Uint8Array<ArrayBuffer>> {
   const taggedLength = request.headers.get('content-length')
   if (taggedLength !== null && (!/^\d+$/.test(taggedLength) || Number(taggedLength) > maxBytes)) {
     throw new ApiError(413, 'RESOURCE_EXHAUSTED', `Request body exceeds ${maxBytes} bytes.`)
@@ -57,7 +57,7 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
-export async function readJson(request: Request, maxBytes = 512 * 1024): Promise<Record<string, unknown>> {
+export async function readJson(request: Request | Response, maxBytes = 512 * 1024): Promise<Record<string, unknown>> {
   const type = request.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase()
   if (type !== 'application/json') {
     throw new ApiError(415, 'INVALID_ARGUMENT', 'Expected an application/json body.')

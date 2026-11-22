@@ -1,8 +1,10 @@
 # openviking-cloudflare
 
-Portage natif de [OpenViking](https://github.com/volcengine/OpenViking) sur Cloudflare Workers. Le Worker ne délègue pas à un serveur OpenViking, à un proxy ni à un conteneur. Il sert Web Studio d’origine sur `/studio/`. Le plan de données, le contrôle des comptes et les autorisations OAuth séparées utilisent des Durable Objects SQLite. **La parité complète n’est pas encore attestée ; aucune mise en ligne.**
+Portage natif de [OpenViking](https://github.com/volcengine/OpenViking) sur Cloudflare Workers. Le Worker ne délègue pas à un serveur OpenViking, à un proxy ni à un conteneur. Il sert Web Studio d’origine sur `/studio/`. Le plan de données, le contrôle des comptes et les autorisations OAuth séparées utilisent des Durable Objects SQLite. **La parité complète n’est pas encore attestée.** Ce dépôt contient les sources et les guides, pas les réglages propres à une instance.
 
 Référence : `000f0765d7ec183886fbabbc22e69bc289cc429d`. Licence : [AGPL-3.0](LICENSE). Les scripts construisent l’interface à partir du checkout amont épinglé et des adaptations sous `studio-patches/`. Ne pas distribuer le binaire Studio seul : conserver les notices d’origine et rendre le code correspondant accessible conformément à l’AGPL avant exposition réseau publique.
+
+[Tutoriels du portage](DOC/README.md) : déploiement sur Cloudflare Workers, administration distante des comptes et clés, configuration et vérification locale.
 
 ## Démarrer en local
 
@@ -25,7 +27,7 @@ Pour tester le **bundle d’empaquetage** en local, `npm run dev` utilise la con
 
 Wrangler ne démarre pas avec le binding Workers AI en mode strictement local. `npm run dev` dérive donc un profil **sans IA et sans compte Cloudflare**, sans modifier `wrangler.jsonc`. L’API d’IA répond indisponible au lieu d’accéder à un service distant. `node scripts/wrangler-smoke.mjs <port-libre>` vérifie ce profil sur une base jetable ; le harnais Studio séparé permet de tester les parcours IA avec fixtures.
 
-Le modèle du Worker est `@cf/baai/bge-base-en-v1.5`, 768 dimensions, via **Workers AI**, sans repli lexical automatique. Indexer ou rechercher peut transmettre du texte de ressources ou de requête à ce service. Sans binding utilisable, l’opération sémantique échoue explicitement ; ne pas activer l’inférence distante pour des données sensibles sans autorisation. Les limites applicatives sont de 128 vecteurs/minute et 8 192/jour par compte, avec sous-quotas de 64/minute et 4 096/jour par utilisateur, en plus des quotas Cloudflare. Aucun déploiement ni trafic IA distant n’est requis pour les tests locaux.
+Le modèle vectoriel par défaut est `@cf/baai/bge-base-en-v1.5`, 768 dimensions, via **Workers AI**, sans repli lexical automatique. Le [fichier de configuration Edge](DOC/FOURNISSEURS.md) permet à root de sélectionner un modèle de génération ou le modèle vectoriel des nouveaux espaces, sur Workers AI ou une API OpenAI-compatible autorisée. Indexer ou rechercher peut transmettre du texte de ressources ou de requête au fournisseur sélectionné. Sans fournisseur utilisable, l’opération sémantique échoue explicitement ; ne pas activer l’inférence distante pour des données sensibles sans autorisation. Les limites applicatives sont de 128 vecteurs/minute et 8 192/jour par compte, avec sous-quotas de 64/minute et 4 096/jour par utilisateur, en plus des quotas fournisseur. Aucun déploiement ni trafic IA distant n’est requis pour les tests locaux.
 
 Fonctions opt-in, non vérifiées sur Cloudflare distant :
 

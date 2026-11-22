@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { Generation, GenerationStream, ModelMessage, WorkspaceContext } from './context.js'
 import { ApiError, isRecord } from './http.js'
+import { maxGenerationTokens } from './model-config.js'
+import type { BoundModel, VlmConfig } from './model-config.js'
+import { modelChat, workersChat } from './model-runtime.js'
 
-export const generationModel = '@cf/meta/llama-3.1-8b-instruct'
+export { generationModel } from './model-config.js'
 const encoder = new TextEncoder()
 const bad = () => new ApiError(400, 'INVALID_ARGUMENT', 'Generation input is invalid or too large.')
 const unavailable = () => new ApiError(503, 'GENERATION_UNAVAILABLE', 'The configured generation provider is unavailable.')
@@ -30,7 +33,7 @@ function reserve(ctx: WorkspaceContext, units: number): void {
 }
 
 async function authorizeInput(ctx: WorkspaceContext, messages: ModelMessage[], max: number) {
-    if (!Array.isArray(messages) || !messages.length || messages.length > 48 || !Number.isSafeInteger(max) || max < 1 || max > 2048) throw bad()
+    if (!Array.isArray(messages) || !messages.length || messages.length > 48 || !Number.isSafeInteger(max) || max < 1 || max > maxGenerationTokens) throw bad()
     let bytes = 0
     const input = messages.map(msg => {
       if (!msg || !['system', 'user', 'assistant'].includes(msg.role) || typeof msg.content !== 'string') throw bad()
@@ -45,13 +48,18 @@ async function authorizeInput(ctx: WorkspaceContext, messages: ModelMessage[], m
     return input
 }
 
-export function generation(ctx: WorkspaceContext, ai: Ai): Generation {
+function outputLimit(requested: number | undefined, config: VlmConfig): number {
+  const max = requested ?? 512
+  if (!Number.isSafeInteger(max) || max < 1 || max > maxGenerationTokens) throw bad()
+  return Math.min(max, config.max_tokens ?? max)
+}
+
+export function generation(ctx: WorkspaceContext, binding: BoundModel, config: VlmConfig): Generation {
   return async (messages, options = {}) => {
-    const max = options.maxTokens ?? 512
+    const max = outputLimit(options.maxTokens, config)
     const input = await authorizeInput(ctx,messages,max)
-    const modelInvoker = ai as unknown as { run(model: string, input: unknown): Promise<unknown> }
     let output: unknown
-    try { output = await modelInvoker.run(generationModel, { messages: input, max_tokens: max, stream: false }) } catch { throw unavailable() }
+    try { output = await modelChat(binding, config, input, max) } catch { throw unavailable() }
     if (!isRecord(output) || typeof output.response !== 'string' || !output.response.trim() || encoder.encode(output.response).byteLength > 65_536) throw unavailable()
     const usage = isRecord(output.usage) ? output.usage : {}
     const metric = (x: unknown) => typeof x === 'number' && Number.isSafeInteger(x) && x >= 0 && x <= 1_000_000 ? x : null
@@ -60,14 +68,13 @@ export function generation(ctx: WorkspaceContext, ai: Ai): Generation {
 }
 
 /** Return the real binding byte stream, enforcing resource and authorization bounds. */
-export function streamGeneration(ctx: WorkspaceContext, ai: Ai): GenerationStream {
+export function streamGeneration(ctx: WorkspaceContext, ai: Ai, config: VlmConfig): GenerationStream {
   return async (messages, options = {}) => {
-    const max = options.maxTokens ?? 512
+    const max = outputLimit(options.maxTokens, config)
     if(options.signal?.aborted)throw new ApiError(409,'INTERRUPTED','Generation interrupted.')
     const input = await authorizeInput(ctx,messages,max)
-    const modelInvoker=ai as unknown as {run(model:string,input:unknown):Promise<unknown>}
     let provider:unknown
-    try{provider=await modelInvoker.run(generationModel,{messages:input,max_tokens:max,stream:true})}catch{throw unavailable()}
+    try{provider=await workersChat(ai,config,input,max,true)}catch{throw unavailable()}
     if(!(provider instanceof ReadableStream))throw unavailable()
     const reader=provider.getReader(),started=Date.now()
     let lastCheck=started,bytes=0,terminated=false,timer:ReturnType<typeof setTimeout>|undefined

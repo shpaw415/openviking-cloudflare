@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { ApiError, isRecord } from '../http.js'
+import type { ModelSettings } from '../model-config.js'
 import { bad, fields, forbidden, unavailable } from './input.js'
 
 type SystemSettings = {
@@ -120,6 +121,19 @@ export class Settings {
       account_id TEXT NOT NULL, user_id TEXT NOT NULL, data TEXT NOT NULL CHECK (json_valid(data) AND json_type(data) = 'object'),
       PRIMARY KEY (account_id, user_id)
     ) WITHOUT ROWID`)
+    sql.exec(`CREATE TABLE IF NOT EXISTS ov_control_model_settings (
+      id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL, data TEXT NOT NULL CHECK(json_valid(data))
+    )`)
+  }
+
+  models(): { settings: ModelSettings; revision: number } {
+    const row = this.sql.exec<{ revision: number; data: string }>('SELECT revision,data FROM ov_control_model_settings WHERE id=1').toArray()[0]
+    return row ? { revision: row.revision, settings: JSON.parse(row.data) as ModelSettings } : { revision: 0, settings: {} }
+  }
+
+  saveModels(revision: number, settings: ModelSettings): void {
+    this.sql.exec(`INSERT INTO ov_control_model_settings VALUES (1,?,?)
+      ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,data=excluded.data`, revision, JSON.stringify(settings))
   }
 
   private get<T>(account: string, user: string): T {

@@ -15,6 +15,9 @@ export interface GatewayProvider {
 
 export interface GatewayContext extends WorkspaceContext {
   gatewayProvider?: GatewayProvider
+  workersAIModel?: string
+  /** Text generation configured on the operator adapter is not a Workers AI route. */
+  externalGeneration?: boolean
   /** Server-generated correlation ID; never copied from an HTTP header. */
   gatewayRequestId?: string
 }
@@ -28,13 +31,13 @@ export type Upstream = {
 export type SavedUpstream = Upstream & { id: string; revision: number }
 
 export function manifest(ctx: GatewayContext, binding: Binding): readonly string[] {
-  if (binding === 'workers_ai') return [generationModel] // Fixed allowlist even when the binding is absent.
+  if (binding === 'workers_ai') return ctx.externalGeneration ? [] : [ctx.workersAIModel ?? generationModel]
   const models = ctx.gatewayProvider?.models
   return Array.isArray(models) && models.length > 0 && models.length <= 32 && models.every(modelId) ? models : []
 }
 
 export function isBound(ctx: GatewayContext, binding: Binding): boolean {
-  return binding === 'workers_ai' ? typeof ctx.generate === 'function' :
+  return binding === 'workers_ai' ? !ctx.externalGeneration && typeof ctx.generate === 'function' :
     manifest(ctx, binding).length > 0 && typeof ctx.gatewayProvider?.generate === 'function'
 }
 
@@ -153,7 +156,7 @@ export async function generate(ctx: GatewayContext, target: Target, messages: Mo
       }, () => { timedOut = true; return timeout() })
     } catch (error) {
       if (error instanceof GatewayError) throw error
-      if (!operator && error instanceof ApiError && ['AUTH_UNAVAILABLE', 'RATE_LIMITED', 'UNAUTHENTICATED', 'PERMISSION_DENIED'].includes(error.code)) throw error
+      if (error instanceof ApiError && ['AUTH_UNAVAILABLE', 'RATE_LIMITED', 'UNAUTHENTICATED', 'PERMISSION_DENIED'].includes(error.code)) throw error
       throw providerFailure()
     }
     if (!isRecord(output) || typeof output.text !== 'string' || !output.text.trim() || bytes(output.text) > maxOutputBytes || /\p{Cs}/u.test(output.text)) {

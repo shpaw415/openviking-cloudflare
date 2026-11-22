@@ -67,7 +67,7 @@ export async function rankedHits(fs: Filesystem, body: Record<string, unknown>, 
     .flatMap(item => str(item, 'context_type', undefined, 128).split(',').map(part => part.trim().toLowerCase()).filter(Boolean))
   if (selected.some(type => !contextTypes.includes(type as ContextKind))) invalid('Unknown context_type.')
   const requested = levels(body.level)
-  const fallback = int(body.limit, 'limit', 10, 1, maxHits)
+  const fallback = int(body.limit, 'limit', fs.ctx.defaultSearchLimit ?? 10, 1, maxHits)
   const limit = int(body.node_limit ?? undefined, 'node_limit', fallback, 1, maxHits)
   const threshold = body.score_threshold ?? 0.1
   if (typeof threshold !== 'number' || !Number.isFinite(threshold) || threshold < -1 || threshold > 1) invalid('score_threshold must be between -1 and 1.')

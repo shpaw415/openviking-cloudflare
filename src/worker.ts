@@ -4,7 +4,7 @@ import { authenticate, authenticateApiKey, configuredPrincipals, controlFor, fed
 import type { AuthGrant } from './auth.js'
 import type { Caller, ControlCaller, Env, WorkspaceContext } from './context.js'
 import { initEmbeddingBudget, reserveEmbeddingBudget } from './embedding-budget.js'
-import { embed, embeddingModel } from './embeddings.js'
+import { embed, initEmbeddingSelection, pinEmbedding, workspaceEmbedding } from './embeddings.js'
 import { initFilesystem, routeFilesystem, runContentBatchJob } from './filesystem.js'
 import { ApiError, apiError, isRecord, ok, readJson } from './http.js'
 import { initSessions, routeSessions, runSessionCommit } from './sessions.js'
@@ -24,6 +24,9 @@ import { converter, initDocuments } from './documents.js'
 import { routeStorageInspection } from './storage-inspection.js'
 import { retrievalContext } from './session-search-context.js'
 import { cancelGatewayStream, initGateway, isGatewayPath, routeGateway } from './gateway.js'
+import type { GatewayContext } from './gateway.js'
+import { bindModel, legacyEmbedding, selectedVlm } from './model-config.js'
+import type { EmbeddingConfig } from './model-config.js'
 import type { JobKind } from './tasks.js'
 import { claimWatch, identityForWatch, initWatches, prepareWatchRegistrar, remoteTextSource, revokeWatch, routeWatches, runRemoteImport, runWatch, scheduleWatch } from './watches.js'
 
@@ -114,23 +117,30 @@ async function ready(env: Env): Promise<Response> {
   }, { status: healthy ? 200 : 503 })
 }
 
-function capabilities(env: Env, caller: ControlCaller, readOnlyFederation=false): Response {
+async function capabilities(env: Env, caller: ControlCaller, readOnlyFederation=false): Promise<Response> {
+  const settings = await controlFor(env)?.modelSettings() ?? {}
+  const vlm = selectedVlm(env, settings)
+  const generationEnabled = !!vlm && !!bindModel(env, vlm)
+  const embeddingDefault = settings.embedding?.dense ?? legacyEmbedding
+  const { role } = caller
+  const embedding = role === 'root' ? embeddingDefault
+    : await workspace(env, { ...caller, role }).embeddingSelection({ ...caller, role }, embeddingDefault)
   const result={
     runtime: 'cloudflare-workers', upstream_commit: upstream, version, parity: 'partial',
     storage: 'durable-object-sqlite', unsupported_api_status: 501,
-    embedding: { model: embeddingModel, binding_present: !!env.AI, probed: false },
-    generation: { model: generationModel, configured: !!env.AI && env.OPENVIKING_EDGE_GENERATION === '1', probed: false },
+    embedding: { model: embedding.model, provider: embedding.provider, dimension: embedding.dimension, binding_present: !!bindModel(env, embedding), probed: false },
+    generation: { model: vlm?.model ?? generationModel, configured: generationEnabled, probed: false },
     features: {
       control: !!env.CONTROL && caller.role !== 'user', packImport: caller.role !== 'root', packExport: caller.role !== 'root', searchProvenance: caller.role !== 'root',
-      bot: caller.role !== 'root' && !!env.AI && env.OPENVIKING_EDGE_GENERATION === '1',
-      compile: caller.role !== 'root' && !!env.AI && env.OPENVIKING_EDGE_GENERATION === '1',
+      bot: caller.role !== 'root' && generationEnabled,
+      compile: caller.role !== 'root' && generationEnabled,
       skills: caller.role !== 'root', snapshots: caller.role !== 'root', webdav: caller.role !== 'root',
       oauth: !!env.OAUTH && !!env.CONTROL && !!env.OPENVIKING_OAUTH_ISSUER && !!env.OPENVIKING_OAUTH_CLIENTS,
       watches: caller.role !== 'root' && !!remoteTextSource(env),
       privacyConfigs: caller.role !== 'root', tasks: caller.role !== 'root', audit: caller.role !== 'root' && env.OPENVIKING_EDGE_AUDIT !== '0',
       mcp: caller.role !== 'root' && ['read','read-write'].includes(env.OPENVIKING_EDGE_MCP ?? ''),
       documents: caller.role !== 'root' && !!env.AI && env.OPENVIKING_EDGE_DOCUMENT_CONVERSION === '1',
-      gateway: caller.role !== 'root' && !!env.AI && env.OPENVIKING_EDGE_GENERATION === '1',
+      gateway: caller.role !== 'root' && generationEnabled,
     },
   }
   if(readOnlyFederation) {
@@ -285,6 +295,7 @@ export class Workspace extends DurableObject<Env> {
       initFilesystem(context)
       initSessions(context)
       initEmbeddingBudget(context.sql)
+      initEmbeddingSelection(context.sql)
       initGeneration(context.sql)
       initTasks(context.sql)
       initPolicies(context)
@@ -301,16 +312,13 @@ export class Workspace extends DurableObject<Env> {
     this.initialized = true
   }
 
-  private localContext(caller: Caller): WorkspaceContext {
+  private localContext(caller: Caller): GatewayContext {
     const storage = this.ctx.storage
     const context: WorkspaceContext = {
       sql: storage.sql,
       storage,
       caller,
-      embed: texts => embed(this.env.AI, texts, count => reserveEmbeddingBudget(storage, caller.userId, count), count=>{
-        try{reportUsage(context,{embedding:count})}catch{console.error('OpenViking Edge usage accounting unavailable')}
-      }),
-      hasEmbedding: !!this.env.AI,
+      embed: async () => { throw new ApiError(503, 'EMBEDDING_UNAVAILABLE', 'No embedding context was admitted.') },
       auditEnabled: this.env.OPENVIKING_EDGE_AUDIT !== '0',
       remoteText: remoteTextSource(this.env),
       compileExampleSkills: compileExampleSkills(),
@@ -318,6 +326,11 @@ export class Workspace extends DurableObject<Env> {
     }
     this.initialize(context)
     return context
+  }
+
+  /** Private DO RPC used by the authenticated capability route, without any provider I/O. */
+  embeddingSelection(caller: Caller, configured: EmbeddingConfig): EmbeddingConfig {
+    return workspaceEmbedding(this.localContext(caller).sql, caller.accountId, configured)
   }
 
   private async workspaceContext(grant: AuthGrant, taskId?: string, request?: Request): Promise<WorkspaceContext> {
@@ -359,14 +372,45 @@ export class Workspace extends DurableObject<Env> {
       context.registerWatch = prepareWatchRegistrar(context,grant.digest)
       if (grant.managed) context.compileScheduleCredential = grant.digest
     }
-    if (!grant.oauth && !grant.oidc && this.env.AI && this.env.OPENVIKING_EDGE_GENERATION === '1') {
-      const invoke = generation(context, this.env.AI)
-      context.generateStream = streamGeneration(context,this.env.AI)
+    const settings = await control?.modelSettings() ?? {}
+    const embedding = workspaceEmbedding(context.sql, caller.accountId, settings.embedding?.dense ?? legacyEmbedding)
+    const embeddingBinding = bindModel(this.env, embedding)
+    context.embeddingModel = embedding.model
+    context.hasEmbedding = !!embeddingBinding
+    context.defaultSearchLimit = settings.default_search_limit
+    context.embed = async texts => {
+      if (embeddingBinding?.kind === 'openai') await context.reauthorize?.()
+      context.assertActive?.()
+      const vectors = await embed(embeddingBinding, embedding, texts,
+        count => reserveEmbeddingBudget(context.storage, caller.userId, count), count => {
+          try { reportUsage(context, { embedding: count }) }
+          catch { console.error('OpenViking Edge usage accounting unavailable') }
+        })
+      await context.reauthorize?.()
+      context.assertActive?.()
+      pinEmbedding(context.sql, embedding)
+      return vectors
+    }
+    const vlm = selectedVlm(this.env, settings)
+    const binding = vlm ? bindModel(this.env, vlm) : undefined
+    if (!grant.oauth && !grant.oidc && vlm && binding) {
+      const invoke = generation(context, binding, vlm)
       context.generate = async (messages, options) => {
         const result = await invoke(messages, options)
         try { reportUsage(context, {input:result.inputTokens,output:result.outputTokens}) }
         catch { console.error('OpenViking Edge usage accounting unavailable') }
         return result
+      }
+      if (binding.kind === 'workers_ai') {
+        context.workersAIModel = vlm.model
+        context.generateStream = streamGeneration(context, binding.ai, vlm)
+      } else {
+        context.externalGeneration = true
+        const generate = context.generate
+        context.gatewayProvider = { models: [vlm.model], async generate(model, messages, options) {
+          if (model !== vlm.model) throw new ApiError(409, 'CONFLICT', 'The configured generation model changed.')
+          return generate(messages, options)
+        } }
       }
     }
     if (!grant.oauth && !grant.oidc && this.env.AI && this.env.OPENVIKING_EDGE_DOCUMENT_CONVERSION === '1') {

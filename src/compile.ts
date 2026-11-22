@@ -219,14 +219,15 @@ export async function routeCompile(request: Request, url: URL, ctx: WorkspaceCon
       if (path.space === null || !['skill', 'resource'].includes(path.kind)) invalid('Expected a resource or Skill target.')
       files.ensureRead(path.uri)
       if (ctx.hasEmbedding === false) throw new ApiError(503, 'EMBEDDING_UNAVAILABLE', 'The Compile embedding provider is not configured.')
-      if (body.expected_model != null && body.expected_model !== embeddingModel) invalid('The Compile embedding model changed.')
+      const model = ctx.embeddingModel ?? embeddingModel
+      if (body.expected_model != null && body.expected_model !== model) invalid('The Compile embedding model changed.')
       const texts = body.texts === undefined ? [] : body.texts
       if (!Array.isArray(texts) || texts.length > 32 || texts.some(text => !str(text, 'text', undefined, 4096).trim())) invalid('Expected up to 32 nonblank texts.')
       if (encoder.encode(JSON.stringify(texts)).length > 64_000) quota('Embedding input limit exceeded.')
       const vectors = texts.length ? await ctx.embed(texts as string[]) : []
       await ctx.reauthorize?.()
       files.ensureRead(path.uri)
-      return ok({ model: embeddingModel, vectors })
+      return ok({ model, vectors })
     }
     case '/api/v1/rules/compile': {
       method(request, 'POST')

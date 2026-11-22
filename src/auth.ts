@@ -3,6 +3,7 @@ import type { Caller, ControlCaller, Env } from './context.js'
 import { ApiError, isRecord } from './http.js'
 import { authenticateOidc, reauthorizeOidc } from './oidc.js'
 import type { OidcGrant, ResolveOidcUser } from './oidc.js'
+import type { ModelSettings } from './model-config.js'
 
 interface Principal {
   key: string
@@ -25,6 +26,7 @@ type ControlClient = {
   principalsFor(accountId: string, fixed?: ControlCaller[]): Promise<{ users: string[], groups: string[] }>
   admitFixed(caller: Caller): Promise<boolean>
   probe(): Promise<boolean>
+  modelSettings(): Promise<ModelSettings>
 }
 
 export function controlFor(env: Env): ControlClient | null {

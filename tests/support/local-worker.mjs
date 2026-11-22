@@ -15,8 +15,8 @@ export function testPrincipal(accountId, userId, role = 'user', agentId = 'defau
 // The real workerd service and DO run normally, replacing only the AI binding here.
 function testingEntry(mode) {
   if (mode !== 'fixture' && mode !== 'broken') throw new TypeError('Unknown test embedding mode')
-  return `import worker, { Workspace as ProductionWorkspace } from './src/worker.ts';
-export { Control, OAuth } from './src/worker.ts';
+  return `import worker, { Workspace as ProductionWorkspace, Control as ProductionControl } from './src/worker.ts';
+export { OAuth } from './src/worker.ts';
 const fakeAI = ${mode === 'fixture' ? `{
   async toMarkdown(input) {
     if (input.blob.type !== 'application/pdf' || !input.name.endsWith('.pdf')) return {format:'error',error:'Fixture accepts only PDF'};
@@ -57,10 +57,13 @@ export default {fetch(request,env,execution){return worker.fetch(request,{...env
 export class Workspace extends ProductionWorkspace {
   constructor(ctx, env) { super(ctx, {...env, AI: fakeAI}); }
 }
+export class Control extends ProductionControl {
+  constructor(ctx, env) { super(ctx, {...env, AI: fakeAI}); }
+}
 `
 }
 
-export async function localWorker({ principals, embeddings = 'missing', assetsDir, persist, port = 0, vars = {}, serviceBindings } = {}) {
+export async function localWorker({ principals, embeddings = 'missing', assetsDir, persist, port = 0, vars = {}, serviceBindings, outboundService } = {}) {
   const worker = await build({
     absWorkingDir: project,
     ...(embeddings === 'missing' ? { entryPoints: ['src/worker.ts'] } : {
@@ -70,10 +73,11 @@ export async function localWorker({ principals, embeddings = 'missing', assetsDi
     external: ['cloudflare:workers'],
   })
   const options = convertV4MiniflareOptions({
-    name: 'openviking-edge-local', host: '127.0.0.1', port, modules: true, script: worker.outputFiles[0].text,
+    name: 'openviking-edge-local', host: '127.0.0.1', port, modules: true, script: worker.outputFiles[0].text, cf: false,
     compatibilityDate: '2026-11-19',
     durableObjects: { WORKSPACES: { className: 'Workspace', useSQLite: true }, CONTROL: { className: 'Control', useSQLite: true }, OAUTH: { className: 'OAuth', useSQLite: true } },
     ...(serviceBindings && { serviceBindings }),
+    ...(outboundService && { outboundService }),
     bindings: { ...vars, ...(principals && { OPENVIKING_EDGE_KEYS: JSON.stringify(principals) }) },
     ...(assetsDir && { assets: {
       directory: assetsDir, binding: 'ASSETS', run_worker_first: true,
