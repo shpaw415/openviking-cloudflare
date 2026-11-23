@@ -26,6 +26,7 @@ test('root capabilities do not grant tenant data access', async () => {
   const flags = await payload(await req(root,'/system/edge-capabilities'))
   assert.equal(flags.features.control,true)
   assert.equal(flags.features.tasks,false)
+  assert.equal(flags.features.monitoring,false)
   assert.equal((await req(root,'/fs/ls?uri=viking://')).status,403)
   assert.equal((await req(root,'/system/status')).status,200)
   assert.equal((await req(root,'/admin/accounts')).status,200)
@@ -71,8 +72,73 @@ test('dashboard and observer use measured local requests, with no body or query 
   assert.equal((await payload(await req(observer,'/console/audit?api_type=find'))).total,0)
   assert.equal((await payload(await req(other,'/console/dashboard/summary'))).today_retrievals.find,0)
   const monitor = await payload(await req(owner,'/observer/system?format=json'))
+  assert.equal(monitor.is_healthy,true)
+  assert.deepEqual(monitor.errors,[])
+  assert.equal(monitor.components.models.is_healthy,null)
   assert.equal(monitor.components.models.status.probed,false)
   assert.ok(monitor.components.retrieval.status.find.n >=1)
+  assert.equal((await payload(await req(observer,'/observer/retrieval?format=json'))).status.find.n,0)
+  assert.equal((await payload(await req(other,'/observer/retrieval?format=json'))).status.find.n,0)
+})
+
+test('the original Monitoring read contract is available to workspace keys, not root or anonymous callers', async () => {
+  const path='/observer/system'
+  assert.equal((await req(undefined,path)).status,401)
+  assert.equal((await req(root,path)).status,403)
+  for (const principal of [owner,observer]) {
+    assert.equal((await payload(await req(principal,'/system/edge-capabilities'))).features.monitoring,true)
+    const health=await api(runtime,principal)('/health')
+    assert.equal(health.status,200)
+    assert.equal((await health.json()).healthy,true)
+    const response=await req(principal,path)
+    assert.match(response.headers.get('cache-control') ?? '',/private, no-store/)
+    const overview=await payload(response)
+    assert.deepEqual(Object.keys(overview.components).sort(),['filesystem','lock','models','queue','retrieval','vikingdb'])
+    assert.ok(Object.values(overview.components).every(component => typeof component.status === 'string'))
+    assert.equal(overview.components.models.is_healthy,null)
+    assert.equal(overview.components.models.status,'No model usage data available.')
+    const models=await payload(await req(principal,'/observer/models?format=json'))
+    assert.deepEqual(models.status,{
+      embedding_binding:true,generation_binding:true,probed:false,
+    })
+    assert.match(overview.components.queue.status,/\| Queue\s+\| In Progress\s+\| Pending\s+\| Processed\s+\| Errors\s+\| Total\s+\|/)
+    assert.match(overview.components.vikingdb.status,/\| Durable Object SQLite\s+\| OK\s+\|/)
+    assert.equal((await req(principal,path+'?format=invalid')).status,400)
+    const head=await req(principal,path,{method:'HEAD'})
+    assert.equal(head.status,200)
+    assert.equal(await head.text(),'')
+  }
+})
+
+test('a real failed indexing task degrades the scoped Monitoring overview without probing a model', async t => {
+  const editor=testPrincipal('monitoring-failure','editor','admin')
+  const member=testPrincipal('monitoring-failure','member')
+  const outsider=testPrincipal('monitoring-other','editor','admin')
+  const isolated=await localWorker({principals:[editor,member,outsider],embeddings:'broken'})
+  t.after(() => isolated.dispose())
+  const read = principal => api(isolated,principal)('/api/v1/observer/system?format=json')
+  assert.equal((await payload(await read(editor))).is_healthy,true)
+  const write=api(isolated,editor)
+  const rootUri='viking://~/resources/monitoring'
+  await payload(await write('/api/v1/fs/mkdir',{method:'POST',body:{uri:rootUri}}))
+  const job=await payload(await write('/api/v1/content/batch-write',{method:'POST',body:{
+    root_uri:rootUri,wait:false,operations:[{uri:`${rootUri}/example.md`,content:'Synthetic index failure'}],
+  }}))
+  await payload(await write('/api/v1/system/wait',{method:'POST',body:{timeout:5}}))
+  assert.equal((await payload(await write('/api/v1/tasks/'+job.task_id))).status,'failed')
+  const status=await payload(await read(editor))
+  assert.equal(status.is_healthy,false)
+  assert.deepEqual(status.errors,['queue'])
+  assert.equal(status.components.queue.status.failed,1)
+  assert.equal(status.components.models.status.probed,false)
+  const queue=await payload(await write('/api/v1/observer/queue?format=table'))
+  assert.match(queue.status,/\| TOTAL\s+\| 0\s+\| 0\s+\| 0\s+\| 1\s+\| 1\s+\|/)
+  for (const principal of [member,outsider]) {
+    const scoped=await payload(await read(principal))
+    assert.equal(scoped.components.queue.status.failed,0)
+    assert.equal(scoped.is_healthy,true)
+    assert.deepEqual(scoped.errors,[])
+  }
 })
 
 test('zone validation and actual commit series are not replaced by fabricated zeros', async () => {

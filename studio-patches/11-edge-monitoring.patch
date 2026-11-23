@@ -1,0 +1,242 @@
+diff --git a/src/app/layouts/studio-feature-boundary.tsx b/src/app/layouts/studio-feature-boundary.tsx
+--- a/src/app/layouts/studio-feature-boundary.tsx
++++ b/src/app/layouts/studio-feature-boundary.tsx
+@@ -43,7 +43,9 @@
+   if (EDGE_STUDIO && pathname !== '/' && !isConnectionSettingsPath(pathname)) {
+     const management = isManagementPath(pathname)
+     const hasWorkspace = Boolean(connection.apiKey)
+-    const allowed = (management || hasWorkspace) && edgeAllowsPage(pathname, flags, canManage)
++    const allowed =
++      (management || hasWorkspace) &&
++      edgeAllowsPage(pathname, flags, canManage, studioMode === 'management')
+     if (!allowed) return (
+       <section className="mx-auto grid w-full max-w-xl gap-4 rounded-xl border bg-card p-5" aria-live="polite">
+         <h1 className="text-lg font-medium">{t(pending ? 'states.checking.title' : 'edge.unsupportedTitle')}</h1>
+diff --git a/src/app/layouts/studio-layout.tsx b/src/app/layouts/studio-layout.tsx
+--- a/src/app/layouts/studio-layout.tsx
++++ b/src/app/layouts/studio-layout.tsx
+@@ -116,7 +116,11 @@
+   const capabilities = useStudioCapabilities()
+   const { flags } = useEdgeFeatures()
+   const visibleNavItems = NAV_ITEMS.filter((item) => {
+-    if (EDGE_STUDIO && !edgeAllowsPage(item.to, flags, canManage)) return false
++    if (
++      EDGE_STUDIO &&
++      !edgeAllowsPage(item.to, flags, canManage, studioMode === 'management')
++    ) return false
+     const feature = featureForPath(item.to)
+     return (
+       !feature ||
+diff --git a/src/features/workbench/monitoring/page.tsx b/src/features/workbench/monitoring/page.tsx
+--- a/src/features/workbench/monitoring/page.tsx
++++ b/src/features/workbench/monitoring/page.tsx
+@@ -27,13 +27,14 @@
+   getHealth,
+   getObserverSystem,
+   getOvResult,
+ } from '#/shared/api/ov-client/index'
++import { EDGE_STUDIO } from '#/shared/lib/edge-studio'
+ import { cn } from '#/shared/lib/utils'
+ import { Card, CardContent, CardHeader, CardTitle } from '#/shared/ui/card'
+ 
+ type ObserverComponent = {
+   has_errors: boolean
+-  is_healthy: boolean
++  is_healthy: boolean | null
+   name: string
+   status: string
+ }
+@@ -68,13 +69,23 @@
+   if (!isRecord(value)) return undefined
+ 
+   return {
+     has_errors: value.has_errors === true,
+-    is_healthy: value.is_healthy === true,
++    is_healthy:
++      EDGE_STUDIO && name === 'models' && value.is_healthy === null
++        ? null
++        : value.is_healthy === true,
+     name: typeof value.name === 'string' ? value.name : name,
+     status: typeof value.status === 'string' ? value.status : '',
+   }
+ }
+ 
++function componentHealth(
++  component: ObserverComponent | undefined,
++): boolean | undefined {
++  if (component?.has_errors) return false
++  return component?.is_healthy ?? undefined
++}
++
+ async function fetchMonitoringOverview(): Promise<MonitoringOverview> {
+   const [health, observer] = await Promise.all([
+     getOvResult<Record<string, unknown>>(getHealth()),
+@@ -150,10 +161,18 @@
+   const overview = monitoringQuery.data
++  const models = overview?.components.models
++  const partialHealth =
++    EDGE_STUDIO &&
++    overview?.healthy === true &&
++    models?.is_healthy === null &&
++    !models.has_errors
++  const summaryHealth = partialHealth ? undefined : overview?.healthy === true
+   const selectedComponent =
+     activeType === 'overview' ? undefined : overview?.components[activeType]
++  const selectedHealth = componentHealth(selectedComponent)
+   const SelectedMonitorIcon =
+     MONITOR_TYPES.find(([name]) => name === activeType)?.[1] ?? ActivityIcon
+   const healthyCount = Object.values(overview?.components ?? {}).filter(
+-    (component) => component.is_healthy && !component.has_errors,
++    (component) => componentHealth(component) === true,
+   ).length
+   const totalCount = Object.keys(overview?.components ?? {}).length
+   const updatedAt = monitoringQuery.dataUpdatedAt
+@@ -242,21 +261,27 @@
+                 <div
+                   className={cn(
+                     'flex size-10 items-center justify-center rounded-xl',
+-                    overview?.healthy
+-                      ? 'bg-emerald-500/10 text-emerald-600'
+-                      : 'bg-destructive/10 text-destructive',
++                    summaryHealth === undefined
++                      ? 'bg-muted text-muted-foreground'
++                      : summaryHealth
++                        ? 'bg-emerald-500/10 text-emerald-600'
++                        : 'bg-destructive/10 text-destructive',
+                   )}
+                 >
+-                  {overview?.healthy ? (
++                  {summaryHealth === undefined ? (
++                    <ActivityIcon className="size-5" />
++                  ) : summaryHealth ? (
+                     <CheckCircle2Icon className="size-5" />
+                   ) : (
+                     <CircleAlertIcon className="size-5" />
+                   )}
+                 </div>
+                 <div>
+                   <p className="font-medium">
+-                    {overview?.healthy
+-                      ? t('summary.healthy')
+-                      : t('summary.unhealthy')}
++                    {summaryHealth === undefined
++                      ? t('summary.partial')
++                      : summaryHealth
++                        ? t('summary.healthy')
++                        : t('summary.unhealthy')}
+                   </p>
+                   <p className="text-sm text-muted-foreground">
+@@ -269,9 +294,11 @@
+               </div>
+               <HealthBadge
+-                healthy={overview?.healthy === true}
++                healthy={summaryHealth}
+                 label={
+-                  overview?.healthy
+-                    ? t('health.healthy')
+-                    : t('health.unhealthy')
++                  summaryHealth === undefined
++                    ? t('health.unknown')
++                    : summaryHealth
++                      ? t('health.healthy')
++                      : t('health.unhealthy')
+                 }
+               />
+@@ -307,10 +334,7 @@
+           {activeType === 'overview' ? (
+             <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+               {MONITOR_TYPES.slice(1).map(([name, Icon]) => {
+-                const component = overview?.components[name]
+-                const healthy = component
+-                  ? component.is_healthy && !component.has_errors
+-                  : undefined
++                const healthy = componentHealth(overview?.components[name])
+                 return (
+                   <button
+                     key={name}
+@@ -359,17 +383,11 @@
+                     </div>
+                   </div>
+                   <HealthBadge
+-                    healthy={
+-                      selectedComponent
+-                        ? selectedComponent.is_healthy &&
+-                          !selectedComponent.has_errors
+-                        : undefined
+-                    }
++                    healthy={selectedHealth}
+                     label={
+-                      !selectedComponent
++                      selectedHealth === undefined
+                         ? t('health.unknown')
+-                        : selectedComponent.is_healthy &&
+-                            !selectedComponent.has_errors
++                        : selectedHealth
+                           ? t('health.healthy')
+                           : t('health.unhealthy')
+                     }
+diff --git a/src/i18n/locales/en/workspace.ts b/src/i18n/locales/en/workspace.ts
+--- a/src/i18n/locales/en/workspace.ts
++++ b/src/i18n/locales/en/workspace.ts
+@@ -169,6 +169,7 @@
+     },
+     summary: {
+       healthy: 'All components are healthy',
++      partial: 'Some components have not been checked',
+       unhealthy: 'Some components need attention',
+       components: '{{healthy}} of {{total}} components healthy',
+     },
+diff --git a/src/i18n/locales/zh-CN/workspace.ts b/src/i18n/locales/zh-CN/workspace.ts
+--- a/src/i18n/locales/zh-CN/workspace.ts
++++ b/src/i18n/locales/zh-CN/workspace.ts
+@@ -166,6 +166,7 @@
+     },
+     summary: {
+       healthy: '所有组件运行正常',
++      partial: '部分组件尚未检查',
+       unhealthy: '部分组件需要关注',
+       components: '{{healthy}} / {{total}} 个组件正常',
+     },
+diff --git a/src/shared/lib/edge-capabilities.ts b/src/shared/lib/edge-capabilities.ts
+--- a/src/shared/lib/edge-capabilities.ts
++++ b/src/shared/lib/edge-capabilities.ts
+@@ -1,6 +1,6 @@
+-import { allowsStudioApiBase } from './edge-studio'
++import { allowsStudioApiBase, EDGE_STUDIO } from './edge-studio'
+ 
+-const keys = ['control', 'packImport', 'packExport', 'searchProvenance', 'bot', 'compile', 'skills', 'snapshots', 'webdav', 'oauth', 'watches'] as const
++const keys = ['control', 'packImport', 'packExport', 'searchProvenance', 'bot', 'compile', 'skills', 'snapshots', 'webdav', 'oauth', 'watches', 'monitoring'] as const
+ export type EdgeFeatures = Partial<Record<(typeof keys)[number], true>>
+ 
+ function record(value: unknown): Record<string, unknown> | undefined {
+@@ -23,7 +23,8 @@
+     headers: { 'X-API-Key': key, Accept: 'application/json' },
+     redirect: 'error',
+     cache: 'no-store',
+-    credentials: 'omit',
++    // The Edge origin guard above permits the same-origin Access session cookie.
++    credentials: EDGE_STUDIO ? 'same-origin' : 'omit',
+     signal: AbortSignal.any([signal, AbortSignal.timeout(8000)]),
+   })
+   if (!response.ok) return {}
+@@ -35,7 +36,12 @@
+ }
+ 
+ /** This is presentation only; the Worker authorizes every request. */
+-export function edgeAllowsPage(path: string, flags: EdgeFeatures, canManage: boolean): boolean {
++export function edgeAllowsPage(
++  path: string,
++  flags: EdgeFeatures,
++  canManage: boolean,
++  managementMode = false,
++): boolean {
+   if (at(path, '/admin')) {
+     const simple = path.replace(/\/+$/, '')
+     return canManage && (simple === '/admin' || simple === '/admin/users' || simple === '/admin/users/groups')
+@@ -44,5 +50,6 @@
+   if (at(path, '/skills')) return flags.skills === true
+   if (at(path, '/oauth')) return flags.oauth === true
+   if (at(path, '/watches')) return flags.watches === true
++  if (at(path, '/monitoring')) return !managementMode && flags.monitoring === true
+   return ['/home', '/filesystem', '/directory', '/memories', '/retrieval', '/sessions', '/tasks'].some((root) => at(path, root))
+ }

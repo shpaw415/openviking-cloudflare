@@ -200,23 +200,57 @@ function logs(ctx: WorkspaceContext, url: URL) {
 }
 
 const observerNames = ['queue','vikingdb','models','lock','retrieval','filesystem'] as const
+
+// The original Studio renders the observer's ASCII table as a semantic table.
+// Cells here are fixed labels/values or scoped numeric counters, never user text.
+function observerTable(headers: string[], rows: (string | number)[][]): string {
+  const cells = [headers, ...rows.map(row => row.map(String))]
+  const widths = headers.map((_, index) => Math.max(...cells.map(row => row[index].length)))
+  const border = '+' + widths.map(width => '-'.repeat(width + 2)).join('+') + '+'
+  const line = (row: string[]) => '| ' + row.map((cell, index) => cell.padEnd(widths[index])).join(' | ') + ' |'
+  return [border, line(headers), border, ...cells.slice(1).map(line), border].join('\n')
+}
+
 function observe(ctx: WorkspaceContext, scope: string, format: string | null) {
   if (format !== null && format !== 'table' && format !== 'json') throw bad('Invalid observer format.')
   const membershipScope = membership(ctx)
   const totals = (kind: string) => ctx.sql.exec<{ n:number, failures:number }>(`SELECT COUNT(*) n, COALESCE(SUM(status_code>=400),0) failures
     FROM ov_edge_audit WHERE ${membershipScope.where} AND api_type=?`,...membershipScope.args,kind).one()
   const queue = jobCounts(ctx)
+  const find = totals('find'), search = totals('search'), files = totals('filesystem')
+  const sqlite = ctx.sql.exec<Count>('SELECT 1 n').one().n===1
   const components = {
     queue: { name:'queue', is_healthy:true, has_errors:queue.failed>0, status:{...queue,driver:'durable-object-alarms'} },
-    vikingdb: { name:'vikingdb', is_healthy:ctx.sql.exec<Count>('SELECT 1 n').one().n===1, has_errors:false, status:{driver:'durable-object-sqlite',index:'sqlite-vector-scan'} },
+    vikingdb: { name:'vikingdb', is_healthy:sqlite, has_errors:false, status:{driver:'durable-object-sqlite',index:'sqlite-vector-scan'} },
     models: { name:'models', is_healthy:null,has_errors:false,status:{embedding_binding:ctx.hasEmbedding ?? false,generation_binding:!!ctx.generate,probed:false} },
     lock: { name:'lock',is_healthy:true,has_errors:false,status:{driver:'sqlite-transactions',distributed_lock_count:null} },
-    retrieval: { name:'retrieval',is_healthy:true,has_errors:false,status:{find:totals('find'),search:totals('search'),provider_quality_probed:false} },
-    filesystem: { name:'filesystem',is_healthy:true,has_errors:false,status:{requests:totals('filesystem'),driver:'durable-object-sqlite'} },
+    retrieval: { name:'retrieval',is_healthy:true,has_errors:false,status:{find,search,provider_quality_probed:false} },
+    filesystem: { name:'filesystem',is_healthy:true,has_errors:false,status:{requests:files,driver:'durable-object-sqlite'} },
+  }
+  const tables: Record<string,string> = {}
+  if (format !== 'json') {
+    const active = queue.running + queue.cancelling
+    // Cancelled jobs do not enter the original table's active/processed/error totals.
+    tables.queue = observerTable(['Queue','In Progress','Pending','Processed','Errors','Total'], [
+      ['TOTAL',active,queue.pending,queue.completed,queue.failed,active+queue.pending+queue.completed+queue.failed],
+    ])
+    tables.vikingdb = observerTable(['Provider','Status'], [['Durable Object SQLite',sqlite?'OK':'ERROR']])
+    tables.models = 'No model usage data available.'
+    tables.lock = observerTable(['Metric','Value'], [['Driver','SQLite transactions']])
+    tables.retrieval = find.n || search.n ? observerTable(['Operation','Queries','Errors'], [
+      ['Find',find.n,find.failures], ['Search',search.n,search.failures],
+    ]) : 'No retrieval queries recorded.'
+    tables.filesystem = files.n ? observerTable(['Operation','Count','Errors'], [['Filesystem',files.n,files.failures]])
+      : 'No operation statistics recorded yet.'
   }
   const formatted = Object.fromEntries(Object.entries(components).map(([key,value])=>[key,{...value,
-    status:format==='json'?value.status:JSON.stringify(value.status)}]))
-  if (scope==='system') return {is_healthy:true,errors:[],components:formatted}
+    status:format==='json'?value.status:tables[key]}]))
+  if (scope==='system') {
+    // Aggregate observed failures without treating an unprobed model as down.
+    const errors = Object.values(components).filter(component => component.is_healthy === false || component.has_errors)
+      .map(component => component.name)
+    return {is_healthy:errors.length===0,errors,components:formatted}
+  }
   return formatted[scope]
 }
 

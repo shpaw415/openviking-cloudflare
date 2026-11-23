@@ -138,6 +138,7 @@ async function capabilities(env: Env, caller: ControlCaller, readOnlyFederation=
       oauth: !!env.OAUTH && !!env.CONTROL && !!env.OPENVIKING_OAUTH_ISSUER && !!env.OPENVIKING_OAUTH_CLIENTS,
       watches: caller.role !== 'root' && !!remoteTextSource(env),
       privacyConfigs: caller.role !== 'root', tasks: caller.role !== 'root', audit: caller.role !== 'root' && env.OPENVIKING_EDGE_AUDIT !== '0',
+      monitoring: role !== 'root' && !!env.WORKSPACES,
       mcp: caller.role !== 'root' && ['read','read-write'].includes(env.OPENVIKING_EDGE_MCP ?? ''),
       documents: caller.role !== 'root' && !!env.AI && env.OPENVIKING_EDGE_DOCUMENT_CONVERSION === '1',
       gateway: caller.role !== 'root' && generationEnabled,

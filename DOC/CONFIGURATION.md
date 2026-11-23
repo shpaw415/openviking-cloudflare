@@ -41,4 +41,10 @@ Les options ci-dessous sont des bindings ou variables du **Worker**, pas des ré
 
 Le Studio utilise la même origine que l’API. Pour un client OpenViking, fournissez **un** en-tête `X-API-Key` ou `Authorization: Bearer`, pas les deux. Les en-têtes d’identité ne changent pas les droits. `GET /api/v1/system/edge-capabilities`, sous l’identité courante, expose les fonctions montées et `parity: partial` : un flag positif n’est pas une sonde de fournisseur, et un flag absent ou faux n’est pas à contourner.
 
+## Voir l’état du service dans le Studio
+
+Dans le menu de l’espace de travail, ouvrez **Monitoring** (`/studio/monitoring`), la même rubrique que dans OpenViking. Connectez-vous avec une clé OpenViking User ou Admin dans le profil de travail, pas avec la clé Root du profil d’administration. Si l’instance passe par Cloudflare Access, sa connexion reste nécessaire en plus de la clé OpenViking.
+
+Le tableau utilise `/health` et `/api/v1/observer/system`. Les détails reflètent le stockage SQLite et les tâches de la portée autorisée. **No data** dans **Models** veut dire que les modèles n’ont pas été testés : consulter l’écran n’appelle aucun fournisseur IA. Une tâche échouée dans la file de la portée courante est signalée dans l’état général. `/ready` reste une sonde de préparation distincte.
+
 Pour le fonctionnement commun (URI `viking://`, workflows, CLI, SDK), utilisez la [documentation officielle](README.md). Pour les résultats locaux et les écarts encore ouverts, consultez le [rapport de portage](../docs/PORTAGE.md) et le [suivi de parité](../docs/SUIVI-PARITE.md).

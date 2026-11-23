@@ -1,0 +1,14 @@
+diff --git a/src/features/workbench/monitoring/page.tsx b/src/features/workbench/monitoring/page.tsx
+--- a/src/features/workbench/monitoring/page.tsx
++++ b/src/features/workbench/monitoring/page.tsx
+@@ -126,7 +126,9 @@
+         'gap-1.5 font-normal',
+         healthy === undefined
+           ? 'text-muted-foreground'
+           : healthy
+-            ? 'border-emerald-500/30 text-emerald-600'
++            ? EDGE_STUDIO
++              ? 'border-emerald-500/30 text-emerald-700 dark:text-emerald-400'
++              : 'border-emerald-500/30 text-emerald-600'
+             : 'border-destructive/30 text-destructive',
+       )}

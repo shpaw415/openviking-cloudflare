@@ -511,10 +511,18 @@ def adapt_tinypool(studio):
 
 
 def apply_patches(studio):
+    # The exported Studio is not part of the enclosing Git checkout. Without this
+    # ceiling git apply can silently skip every path when started in .work/.
+    env = dict(GIT_ENV, GIT_CEILING_DIRECTORIES=str(studio.parent.resolve()))
+    repo = subprocess.run(['/usr/bin/git', 'rev-parse', '--git-dir'], cwd=studio, env=env,
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if repo.returncode == 0:
+        raise RuntimeError('Studio patches must apply to an isolated export, not a Git working tree')
     for patch in sorted(PATCHES.glob('*.patch')):
         cmd = ['/usr/bin/git', 'apply', '--recount', '--whitespace=error', str(patch)]
-        subprocess.run([*cmd[:2], '--check', *cmd[2:]], cwd=studio, env=GIT_ENV, check=True)
-        subprocess.run(cmd, cwd=studio, env=GIT_ENV, check=True)
+        subprocess.run([*cmd[:2], '--check', *cmd[2:]], cwd=studio, env=env, check=True)
+        subprocess.run(cmd, cwd=studio, env=env, check=True)
+        subprocess.run([*cmd[:2], '--reverse', '--check', *cmd[2:]], cwd=studio, env=env, check=True)
 
 
 def stage_assets(studio, logs):

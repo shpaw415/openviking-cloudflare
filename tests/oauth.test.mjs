@@ -307,6 +307,8 @@ test('OAuth consent, one-use exchange and read-only grant use real managed crede
   assert.equal((await h.send('/api/v1/search/search', { method: 'POST', key: tokens.access_token, body: {} })).status, 403)
   assert.equal((await h.send(accounts, { key: tokens.access_token })).status, 403)
   assert.equal((await h.send('/api/v1/privacy-configs', { key: tokens.access_token })).status, 403)
+  assert.equal((await h.send('/api/v1/observer/system', { key: tokens.access_token })).status, 403)
+  assert.equal((await h.send('/api/v1/system/edge-capabilities', { key: tokens.access_token })).status, 403)
 })
 
 test('OAuth stays on the configured origin and requires approved client, redirect, resource, state and S256', async t => {

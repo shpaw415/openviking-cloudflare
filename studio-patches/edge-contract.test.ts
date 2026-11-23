@@ -17,7 +17,7 @@ it('never treats links, truthy values or a 200 without the envelope as capabilit
   expect(edgeAllowsPage('/vikingbot', { bot: true }, false)).toBe(true)
 })
 
-it('reads flags with just the selected key, no redirects or third-party HTTP', async () => {
+it('reads flags with the selected key and same-origin session only, without redirects', async () => {
   const fetch = vi.fn(async () => Response.json({ status: 'ok', result: { features: { control: true } } }))
   vi.stubGlobal('fetch', fetch)
   const signal = new AbortController().signal
@@ -26,7 +26,7 @@ it('reads flags with just the selected key, no redirects or third-party HTTP', a
   expect(await fetchEdgeFeatures(window.location.origin, 'synthetic-key', signal)).toEqual({ control: true })
   expect(fetch).toHaveBeenCalledOnce()
   expect(fetch).toHaveBeenCalledWith(new URL('/api/v1/system/edge-capabilities', window.location.origin), expect.objectContaining({
-    headers: { 'X-API-Key': 'synthetic-key', Accept: 'application/json' }, redirect: 'error', cache: 'no-store', credentials: 'omit',
+    headers: { 'X-API-Key': 'synthetic-key', Accept: 'application/json' }, redirect: 'error', cache: 'no-store', credentials: 'same-origin',
   }))
   fetch.mockResolvedValueOnce(new Response(null, { status: 501 }))
   expect(await fetchEdgeFeatures(window.location.origin, 'synthetic-key', signal)).toEqual({})

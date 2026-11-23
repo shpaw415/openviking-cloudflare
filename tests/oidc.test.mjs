@@ -265,13 +265,15 @@ test('mounted Worker: cross-account isolation and actual reads/search, never wri
   const gated = result(await h.send('/api/v1/system/edge-capabilities', { jwt: green }))
   assert.equal(gated.unsupported_api_status, 403)
   assert.equal(gated.generation.configured, false)
+  assert.equal(gated.features.monitoring, false)
   assert.ok(Object.keys(gated.features).length > 0 && Object.values(gated.features).every(value => value === false))
   const dataKey = result(await h.send('/api/v1/system/edge-capabilities', { key: north.key }))
   assert.equal(dataKey.features.tasks, true)
+  assert.equal(dataKey.features.monitoring, true)
   for (const [method, path, body] of [
     ['POST', write, { uri, content: 'denied write', defer_processing: true }], ['GET', accounts],
     ['GET', '/api/v1/tasks'], ['POST', '/api/v1/system/wait', {}], ['POST', '/api/v1/search/find', { query: 'proof' }],
-    ['GET', '/api/v1/debug/health'], ['GET', '/webdav/resources'], ['GET', '/metrics'],
+    ['GET', '/api/v1/debug/health'], ['GET', '/api/v1/observer/system'], ['GET', '/webdav/resources'], ['GET', '/metrics'],
   ]) denied(await h.send(path, { method, jwt: green, body }), 403, 'PERMISSION_DENIED', path)
   assert.equal(result(await h.send(read, { key: north.key })), 'green proof')
   denied(await h.send(status, { jwt: green, key: north.key }))

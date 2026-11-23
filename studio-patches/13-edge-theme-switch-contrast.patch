@@ -1,0 +1,17 @@
+diff --git a/src/main.tsx b/src/main.tsx
+--- a/src/main.tsx
++++ b/src/main.tsx
+@@ -60,7 +60,12 @@
+   if (!rootElement.innerHTML) {
+     const root = ReactDOM.createRoot(rootElement)
+     root.render(
+-      <ThemeProvider attribute="class" defaultTheme="system" enableSystem>
++      <ThemeProvider
++        attribute="class"
++        defaultTheme="system"
++        enableSystem
++        disableTransitionOnChange={EDGE_STUDIO}
++      >
+         <QueryClientProvider client={queryClient}>
+           <TooltipProvider>
+             <RouterProvider router={router} />
