@@ -17,8 +17,8 @@ import { clearFileLevels, initFileLevels } from './file-levels.js'
 export const ACCOUNT_ENTRIES = 1500
 export const ACCOUNT_BYTES = 16 * 1024 * 1024
 export const ACCOUNT_VECTOR_BYTES = 24 * 1024 * 1024
-const PRIVATE_ENTRIES = 400
-const PRIVATE_BYTES = 4 * 1024 * 1024
+export const PRIVATE_ENTRIES = 400
+export const PRIVATE_BYTES = 4 * 1024 * 1024
 const PRIVATE_VECTOR_BYTES = 6 * 1024 * 1024
 
 export function initFilesystem({ sql }: WorkspaceContext): void {

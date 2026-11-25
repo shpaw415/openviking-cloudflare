@@ -1,0 +1,599 @@
+diff --git a/src/features/admin/gateway/components/keys-issue-dialog.tsx b/src/features/admin/gateway/components/keys-issue-dialog.tsx
+--- a/src/features/admin/gateway/components/keys-issue-dialog.tsx
++++ b/src/features/admin/gateway/components/keys-issue-dialog.tsx
+@@ -49,13 +49,13 @@
+   Upstream,
+ } from '#/features/admin/gateway/lib/api'
+ import { issueKey, toGatewayError } from '#/features/admin/gateway/lib/api'
++import { edgeKeyModels } from '#/features/admin/gateway/lib/edge-key-catalog'
+ import type { Translate } from '#/features/admin/gateway/lib/localize'
+ import { gatewayErrorMessage } from '#/features/admin/gateway/lib/localize'
+ import { requestManagementUnlock } from '#/features/admin/gateway/lib/management-key'
+ import { NEW_ID } from '#/features/admin/gateway/lib/search'
+ import { servedModels } from '#/features/admin/gateway/lib/upstream-schema'
+ import {
+-  edgeRoutableModels,
+   useGatewayPresentation,
+   keyOwnerPermission,
+   useGateway,
+@@ -154,6 +154,8 @@
+   workspaceOnly?: boolean
+   open: boolean
+   onOpenChange: (open: boolean) => void
++  finalFocus?: React.ComponentProps<typeof DialogContent>['finalFocus']
++  onClosed?: () => void
+   profiles: Profile[]
+   upstreams: Upstream[]
+   /** Receives the new key, whose secret is only available now. */
+@@ -171,6 +173,8 @@
+ export function KeysIssueDialog({
+   open,
+   onOpenChange,
++  finalFocus,
++  onClosed,
+   profiles,
+   upstreams,
+   onIssued,
+@@ -201,6 +205,7 @@
+   const formId = React.useId()
+   const userTriggerRef = React.useRef<HTMLButtonElement>(null)
+   const keyInputRef = React.useRef<HTMLInputElement>(null)
++  const modelInputRef = React.useRef<HTMLInputElement>(null)
+   const [draft, setDraft] = React.useState<KeyDraft>(() => ({
+     name: '',
+     user_id: '',
+@@ -213,26 +218,36 @@
+   /** 'key' once the admin switches to pasting, or the server asks for it. */
+   const [chosenMode, setChosenMode] = React.useState<'user' | 'key'>('user')
+   const [submitted, setSubmitted] = React.useState(false)
++  const [modelRefusals, setModelRefusals] = React.useState(0)
++  const handledModelRefusal = React.useRef(0)
+ 
+   const issue = useMutation({
+     ...(EDGE_STUDIO ? { gcTime: 0 } : {}),
+     mutationFn: async (input: { request: KeyRequest; current: () => boolean }) => {
++      let issued: IssuedKey
+       try {
+-        const issued = await issueKey(connection, input.request)
+-        return input.current() ? issued : null
++        issued = await issueKey(connection, input.request)
+       } finally {
+         if (workspaceOnly && input.request.openviking_key !== undefined) input.request.openviking_key = ''
+       }
++      if (!input.current()) return null
++      if (!workspaceOnly) return issued
++      // The close transition may outlive the form. Never put the Edge secret in mutation data.
++      onIssued(issued)
++      return true as const
+     },
+     onSuccess: async (issued, { current }) => {
+       if (!issued || !current()) return
+-      onIssued(issued)
++      if (issued !== true) onIssued(issued)
+       await invalidate('keys', 'overview', 'tools')
+     },
+-    onError: (error, { current }) => {
++    onError: (error, { current, request }) => {
+       if (!current()) return
+       // A user, profile or upstream changed meanwhile; show the current lists.
+       const { status, reason } = toGatewayError(error)
++      if (workspaceOnly && reason === 'model_not_allowed' && request.models.length) {
++        setModelRefusals((count) => count + 1)
++      }
+       if (reason === 'user_key_unreadable') setChosenMode('key')
+       if (status === 400 || status === 409) {
+         void invalidate('users', 'profiles', 'upstreams')
+@@ -240,6 +255,11 @@
+     },
+   })
+   const pending = issue.isPending
++  React.useLayoutEffect(() => {
++    if (!open || pending || modelRefusals === handledModelRefusal.current) return
++    handledModelRefusal.current = modelRefusals
++    modelInputRef.current?.focus()
++  }, [open, pending, modelRefusals])
+ 
+   const users = React.useMemo(
+     () => [...(usersQuery.data ?? [])].sort((a, b) =>
+@@ -329,16 +349,17 @@
+   const sortedProfiles = byName(profiles)
+   const sortedUpstreams = byName(upstreams)
+   const selectedProfile = profiles.find((p) => p.id === draft.policy_id)
+-  const modelSuggestions = [
++  const modelSuggestions = workspaceOnly ? edgeKeyModels(upstreams, request.upstream_ids) : [
+     ...new Set(
+       upstreams
+         .filter((upstream) => draft.upstream_ids.includes(upstream.id))
+-        .flatMap(workspaceOnly ? edgeRoutableModels : servedModels),
++        .flatMap(servedModels),
+     ),
+   ].sort()
+   const badModel = workspaceOnly && request.models.some((model) => !modelSuggestions.includes(model))
+   const rejectedModel = workspaceOnly && issue.isError && toGatewayError(issue.error).reason === 'model_not_allowed'
+-  const modelError = (submitted && badModel) || rejectedModel ? t('keys.edge.modelError') : undefined
++  const rejectedRestriction = rejectedModel && issue.variables.request.models.length > 0
++  const modelError = (submitted && badModel) || rejectedRestriction ? t('keys.edge.modelError') : undefined
+ 
+   function pickRecipient(user_id: string) {
+     setConfirmedUser('')
+@@ -381,7 +402,11 @@
+     event.preventDefault()
+     if (!open || pending || ownerUnavailable) return
+     setSubmitted(true)
+-    if (badModel || (workspaceOnly && !selectedProfile) || Object.keys(validateKeyRequest(request)).length) return
++    if (badModel) {
++      setModelRefusals((count) => count + 1)
++      return
++    }
++    if ((workspaceOnly && !selectedProfile) || Object.keys(validateKeyRequest(request)).length) return
+     // A preselected user becomes the choice, so a retry goes to the same user.
+     if (!workspaceOnly && mode === 'user') {
+       setDraft((current) => ({ ...current, user_id: userId }))
+@@ -392,20 +417,28 @@
+ 
+   const id = (field: string) => `${formId}-${field}`
+ 
++  function close(next: boolean) {
++    if (!next && workspaceOnly) {
++      setDraft((current) => current.openviking_key ? { ...current, openviking_key: '' } : current)
++    }
++    onOpenChange(next)
++  }
++
+   return (
+     <Dialog
+       open={open}
+       onOpenChange={(next) => {
+-        if (!pending) onOpenChange(next)
++        if (!pending) close(next)
+       }}
++      onOpenChangeComplete={onClosed ? (isOpen) => { if (!isOpen) onClosed() } : undefined}
+     >
+-      <DialogContent showCloseButton={!pending} className="gap-5 sm:max-w-2xl">
++      <DialogContent finalFocus={finalFocus} showCloseButton={!pending} className="gap-5 sm:max-w-2xl">
+         <DialogHeader>
+           <DialogTitle className="text-lg">{t('keys.form.title')}</DialogTitle>
+           <DialogDescription>{t('keys.form.description')}</DialogDescription>
+         </DialogHeader>
+ 
+-        <form
++        {(!workspaceOnly || open) && <form
+           id={id('form')}
+           className="grid min-w-0 gap-5"
+           noValidate
+@@ -685,6 +718,7 @@
+                     key={upstream.id}
+                     upstream={upstream}
+                     checked={draft.upstream_ids.includes(upstream.id)}
++                    edgeModels={workspaceOnly ? edgeKeyModels([upstream], request.upstream_ids, request.models) : undefined}
+                     disabled={pending}
+                     onCheckedChange={(checked) =>
+                       toggleUpstream(upstream.id, checked)
+@@ -725,6 +759,7 @@
+             {errors.upstream_ids ? (
+               <FieldError>{t(errors.upstream_ids)}</FieldError>
+             ) : null}
++            {rejectedModel && !rejectedRestriction ? <FieldError>{t('keys.edge.noRuleModels')}</FieldError> : null}
+           </Field>
+ 
+           <SettingField
+@@ -737,8 +772,10 @@
+               </>
+             }
+             htmlFor={id('models')}
+-            error={modelError}
+-            description={t(workspaceOnly ? 'keys.edge.modelsHelp' : 'keys.form.models.description')}
++            error={modelError ? <span id={id('models-error')}>{modelError}</span> : undefined}
++            description={workspaceOnly
++              ? <span id={id('models-help')}>{t('keys.edge.modelsHelp')}</span>
++              : t('keys.form.models.description')}
+           >
+             <TagInput
+               id={id('models')}
+@@ -746,6 +783,9 @@
+               suggestions={modelSuggestions}
+               placeholder={t('keys.form.models.placeholder')}
+               disabled={pending}
++              inputRef={workspaceOnly ? modelInputRef : undefined}
++              aria-invalid={workspaceOnly ? Boolean(modelError) : undefined}
++              aria-describedby={workspaceOnly ? `${id('models-help')}${modelError ? ` ${id('models-error')}` : ''}` : undefined}
+               onChange={(models) => update({ models })}
+             />
+           </SettingField>
+@@ -762,14 +802,14 @@
+               </AlertDescription>
+             </Alert>
+           ) : null}
+-        </form>
++        </form>}
+ 
+         <DialogFooter>
+           <Button
+             type="button"
+             variant="outline"
+             disabled={pending}
+-            onClick={() => onOpenChange(false)}
++            onClick={() => close(false)}
+           >
+             {t('actions.cancel')}
+           </Button>
+@@ -832,16 +872,18 @@
+ function UpstreamOption({
+   upstream,
+   checked,
++  edgeModels,
+   disabled,
+   onCheckedChange,
+ }: {
+   upstream: Upstream
+   checked: boolean
++  edgeModels?: string[]
+   disabled: boolean
+   onCheckedChange: (checked: boolean) => void
+ }) {
+   const { t } = useTranslation('gateway')
+-  const models = servedModels(upstream)
++  const models = edgeModels ?? servedModels(upstream)
+   const shown = models.slice(0, MODEL_PREVIEW)
+   return (
+     <label
+@@ -870,7 +912,7 @@
+             <ToneBadge tone="neutral">{t('keys.form.upstreams.off')}</ToneBadge>
+           )}
+         </span>
+-        <span
++        {(edgeModels === undefined || checked) && <span
+           className={cn(
+             'truncate text-xs text-muted-foreground',
+             models.length > 0 && 'font-mono',
+@@ -886,8 +928,8 @@
+               ]
+                 .filter(Boolean)
+                 .join(' ')
+-            : t('upstreams.models.any')}
+-        </span>
++            : t(edgeModels === undefined ? 'upstreams.models.any' : 'keys.edge.noRuleModels')}
++        </span>}
+       </span>
+     </label>
+   )
+diff --git a/src/features/admin/gateway/components/keys-page.tsx b/src/features/admin/gateway/components/keys-page.tsx
+--- a/src/features/admin/gateway/components/keys-page.tsx
++++ b/src/features/admin/gateway/components/keys-page.tsx
+@@ -92,8 +92,18 @@
+ 
+ /** Issue and revoke gateway keys. */
+ export function KeysPage() {
++  const gateway = useGateway()
++  const [view, setView] = React.useState({ connection: gateway.connection, epoch: 0 })
++  if (EDGE_STUDIO && view.connection !== gateway.connection) {
++    // Discard both dialogs before the new connection paints, even if the route stays mounted.
++    setView({ connection: gateway.connection, epoch: view.epoch + 1 })
++  }
++  return <KeysView key={view.epoch} gateway={gateway} />
++}
++
++function KeysView({ gateway }: { gateway: ReturnType<typeof useGateway> }) {
+   const { t } = useTranslation('gateway')
+-  const { connection, invalidate, readOnly, canIssueForOthers } = useGateway()
++  const { connection, invalidate, readOnly, canIssueForOthers } = gateway
+   const present = useGatewayPresentation(connection)
+   const keysQuery = useKeys()
+   const profilesQuery = useProfiles()
+@@ -105,6 +115,11 @@
+   const [issueSession, setIssueSession] = React.useState(0)
+   const [issued, setIssued] = React.useState<IssuedKey | null>(null)
+   const [secretOpen, setSecretOpen] = React.useState(false)
++  const viewRef = React.useRef<HTMLDivElement>(null)
++  const opener = React.useRef<HTMLButtonElement>(null)
++  const currentIssueButton = React.useRef<HTMLButtonElement>(null)
++  const refreshButton = React.useRef<HTMLButtonElement>(null)
++  const handoff = React.useRef(false)
+   const [revokeTarget, setRevokeTarget] = React.useState<GatewayKey | null>(
+     null,
+   )
+@@ -167,9 +182,20 @@
+     (key) => key.source !== 'openviking',
+   ).length
+ 
+-  function openIssue() {
++  function openIssue(event: React.MouseEvent<HTMLButtonElement>) {
++    if (EDGE_STUDIO) {
++      opener.current = event.currentTarget
++      handoff.current = false
++    }
+     setIssueSession((session) => session + 1)
+     setIssueOpen(true)
++  }
++
++  function returnToKeys() {
++    const view = viewRef.current
++    if (!present() || !view?.isConnected) return false
++    return [opener.current, currentIssueButton.current, refreshButton.current].find((button) =>
++      button && view.contains(button) && !button.matches(':disabled, [aria-disabled="true"]')) ?? view
+   }
+ 
+   function refresh() {
+@@ -180,6 +206,7 @@
+ 
+   const issueButton = (
+     <IssueButton
++      buttonRef={EDGE_STUDIO ? currentIssueButton : undefined}
+       disabled={!canIssue}
+       reason={missingReason}
+       onClick={openIssue}
+@@ -229,13 +256,15 @@
+   )
+ 
+   return (
+-    <div className="flex w-full min-w-0 flex-col gap-5">
++    <div ref={EDGE_STUDIO ? viewRef : undefined} tabIndex={EDGE_STUDIO ? -1 : undefined}
++      className="flex w-full min-w-0 flex-col gap-5">
+       <SectionHeader
+         description={t('keys.description')}
+         actions={
+           <>
+             <DocsLink section="keys" />
+             <Button
++              ref={EDGE_STUDIO ? refreshButton : undefined}
+               type="button"
+               variant="outline"
+               size="sm"
+@@ -344,14 +373,17 @@
+         </CardContent>
+       </Card>
+ 
+-      {(!EDGE_STUDIO || issueOpen) && <KeysIssueDialog
++      {(!EDGE_STUDIO || issueSession !== 0) && <KeysIssueDialog
+         key={issueSession}
+         workspaceOnly={EDGE_STUDIO}
+         open={issueOpen}
+         onOpenChange={setIssueOpen}
++        finalFocus={EDGE_STUDIO ? () => !issueOpen && !handoff.current && returnToKeys() : undefined}
++        onClosed={EDGE_STUDIO ? () => setIssueSession(0) : undefined}
+         profiles={profiles}
+         upstreams={upstreams}
+         onIssued={(key) => {
++          if (EDGE_STUDIO) handoff.current = true
+           setIssueOpen(false)
+           setIssued(key)
+           setSecretOpen(true)
+@@ -359,6 +391,8 @@
+       />}
+ 
+       <KeysSecretDialog
++        workspaceOnly={EDGE_STUDIO}
++        finalFocus={EDGE_STUDIO ? () => !secretOpen && returnToKeys() : undefined}
+         open={secretOpen}
+         issued={issued}
+         baseUrl={connectionQuery.data?.base_url ?? ''}
+@@ -366,7 +400,10 @@
+           profiles.find((profile) => profile.id === issued?.policy_id)?.name
+         }
+         upstreams={upstreams}
+-        onDone={() => setSecretOpen(false)}
++        onDone={() => {
++          if (EDGE_STUDIO) setIssued(null)
++          setSecretOpen(false)
++        }}
+         onClosed={() => setIssued(null)}
+       />
+ 
+@@ -412,17 +449,20 @@
+ 
+ /** Primary "Issue key"; when disabled, a tooltip says what is missing. */
+ function IssueButton({
++  buttonRef,
+   disabled,
+   reason,
+   onClick,
+ }: {
++  buttonRef?: React.Ref<HTMLButtonElement>
+   disabled: boolean
+   reason?: string
+-  onClick: () => void
++  onClick: (event: React.MouseEvent<HTMLButtonElement>) => void
+ }) {
+   const { t } = useTranslation('gateway')
+   return (
+     <ExplainedButton
++      ref={buttonRef}
+       type="button"
+       size="sm"
+       disabled={disabled}
+diff --git a/src/features/admin/gateway/components/keys-secret-dialog.tsx b/src/features/admin/gateway/components/keys-secret-dialog.tsx
+--- a/src/features/admin/gateway/components/keys-secret-dialog.tsx
++++ b/src/features/admin/gateway/components/keys-secret-dialog.tsx
+@@ -23,7 +23,9 @@
+   clientSnippets,
+   defaultProtocol,
+   servingUpstreams,
++  shellQuote,
+ } from '#/features/admin/gateway/lib/client-guides'
++import { edgeKeyModels } from '#/features/admin/gateway/lib/edge-key-catalog'
+ import { protocolLabel } from '#/features/admin/gateway/lib/localize'
+ import { servedModels } from '#/features/admin/gateway/lib/upstream-schema'
+ 
+@@ -47,9 +49,11 @@
+ }
+ 
+ type KeysSecretDialogProps = {
++  workspaceOnly?: boolean
+   open: boolean
+-  /** Kept while the dialog closes so its content doesn't blank out. */
++  /** Stock keeps this through the transition; Edge drops it when closing starts. */
+   issued: IssuedKey | null
++  finalFocus?: React.ComponentProps<typeof DialogContent>['finalFocus']
+   /** Gateway address clients use. */
+   baseUrl: string
+   /** Name of the key's context profile, when known. */
+@@ -73,7 +77,9 @@
+  */
+ export function KeysSecretDialog({
+   open,
++  workspaceOnly = false,
+   issued,
++  finalFocus,
+   baseUrl,
+   profileName,
+   upstreams,
+@@ -85,9 +91,11 @@
+     ? upstreams.filter((upstream) => issued.upstream_ids.includes(upstream.id))
+     : []
+   const firstUsable =
+-    SECRET_CLIENTS.find(
+-      (client) => servingUpstreams(client, keyUpstreams).length > 0,
+-    ) ?? SECRET_CLIENTS[0]
++    SECRET_CLIENTS.find((client) => {
++      if (!workspaceOnly) return servingUpstreams(client, keyUpstreams).length > 0
++      return issued && edgeKeyModels(keyUpstreams, issued.upstream_ids, issued.models,
++        defaultProtocol(client, keyUpstreams)).length > 0
++    }) ?? SECRET_CLIENTS[0]
+ 
+   return (
+     <Dialog
+@@ -98,7 +106,7 @@
+         if (!isOpen) onClosed?.()
+       }}
+     >
+-      <DialogContent showCloseButton={false} className="gap-5 sm:max-w-2xl">
++      <DialogContent finalFocus={finalFocus} showCloseButton={false} className="gap-5 sm:max-w-2xl">
+         {issued ? (
+           <>
+             <DialogHeader>
+@@ -153,11 +161,14 @@
+                     keyUpstreams,
+                     protocol,
+                   )
+-                  const snippets = clientSnippets(client, {
++                  const model = workspaceOnly
++                    ? edgeKeyModels(reachable, issued.upstream_ids, issued.models, protocol)[0]
++                    : snippetModel(issued.models, reachable)
++                  const snippets = workspaceOnly && (!model || !baseUrl.trim()) ? [] : clientSnippets(client, {
+                     baseUrl,
+                     protocol,
+                     key: issued.key,
+-                    model: snippetModel(issued.models, reachable),
++                    model,
+                   })
+                   return (
+                     <TabsContent
+@@ -168,9 +179,11 @@
+                       <p className="text-sm leading-6 text-muted-foreground">
+                         {t(`keys.secret.clients.${client}.intro`)}
+                       </p>
+-                      {reachable.length === 0 ? (
++                      {(workspaceOnly ? snippets.length === 0 : reachable.length === 0) ? (
+                         <Notice tone="warning">
+-                          {t('keys.secret.noProtocol', {
++                          {t(workspaceOnly
++                            ? model ? 'keys.edge.exampleAddressUnavailable' : 'keys.edge.exampleUnavailable'
++                            : 'keys.secret.noProtocol', {
+                             protocol: protocolLabel(t, protocol),
+                             client: t(`connect.clients.${client}.name`),
+                           })}
+@@ -179,7 +192,9 @@
+                       {snippets.map((snippet) => (
+                         <CodeBlock
+                           key={snippet.id}
+-                          code={snippet.code}
++                          code={workspaceOnly && client === 'claude-code' && snippet.id === 'env' && model
++                            ? `${snippet.code}\nexport ANTHROPIC_MODEL=${shellQuote(model)}`
++                            : snippet.code}
+                           label={
+                             snippet.filename ??
+                             t(`connect.snippets.${snippet.id}`)
+diff --git a/src/features/admin/gateway/components/setting-field.tsx b/src/features/admin/gateway/components/setting-field.tsx
+--- a/src/features/admin/gateway/components/setting-field.tsx
++++ b/src/features/admin/gateway/components/setting-field.tsx
+@@ -21,7 +21,7 @@
+   /** Formatted default, rendered as "Default: …". */
+   defaultValue?: string
+   /** Already-translated validation message. */
+-  error?: string
++  error?: React.ReactNode
+   className?: string
+   /** The control: Input, NumberInput, Select, TagInput… */
+   children: React.ReactNode
+diff --git a/src/features/admin/gateway/components/tag-input.tsx b/src/features/admin/gateway/components/tag-input.tsx
+--- a/src/features/admin/gateway/components/tag-input.tsx
++++ b/src/features/admin/gateway/components/tag-input.tsx
+@@ -16,6 +16,8 @@
+   id?: string
+   'aria-label'?: string
+   'aria-invalid'?: boolean
++  'aria-describedby'?: string
++  inputRef?: React.Ref<HTMLInputElement>
+   disabled?: boolean
+ }
+ 
+@@ -39,6 +41,7 @@
+   suggestions = [],
+   placeholder,
+   id,
++  inputRef,
+   disabled: explicitlyDisabled,
+   ...aria
+ }: TagInputProps) {
+@@ -109,6 +112,7 @@
+           </Badge>
+         ))}
+         <input
++          ref={inputRef}
+           {...PLAIN_INPUT_PROPS}
+           {...aria}
+           id={id}
+diff --git a/src/features/admin/gateway/lib/edge-key-catalog.ts b/src/features/admin/gateway/lib/edge-key-catalog.ts
+new file mode 100644
+--- /dev/null
++++ b/src/features/admin/gateway/lib/edge-key-catalog.ts
+@@ -0,0 +1,15 @@
++import type { Protocol, Upstream } from '#/features/admin/gateway/lib/api'
++import { edgeRoutableModels } from '#/features/admin/gateway/lib/use-gateway'
++
++/** The server's effective catalog, scoped to the actual rules and key. */
++export function edgeKeyModels(
++  upstreams: Upstream[],
++  selected: string[],
++  allowed: string[] = [],
++  protocol?: Protocol,
++): string[] {
++  return [...new Set(upstreams
++    .filter((rule) => selected.includes(rule.id) && (!protocol || rule.protocol === protocol))
++    .flatMap(edgeRoutableModels)
++    .filter((name) => !allowed.length || allowed.includes(name)))].sort()
++}
+diff --git a/src/i18n/locales/en/gateway/keys.ts b/src/i18n/locales/en/gateway/keys.ts
+--- a/src/i18n/locales/en/gateway/keys.ts
++++ b/src/i18n/locales/en/gateway/keys.ts
+@@ -23,8 +23,11 @@
+       both: 'Ask your Workspace admin to configure a context profile and a rule that serves a model on Workers AI.',
+     },
+     prerequisitesFailed: 'Could not check the context profiles or model rules. Refresh the lists to try again.',
+-    modelsHelp: 'Optional. Choose names or aliases served by the selected Workers AI rules. Leaving this empty adds no restriction to those rules.',
+-    modelError: 'A model or alias is not available on the selected rules. Choose a compatible name or remove the unavailable entry.',
++    modelsHelp: 'Optional. Choose a name or alias from the selected Workers AI rules, or type one and press Enter to add it. Leaving this empty adds no model restriction to those rules.',
++    modelError: 'A model or alias is not available on the selected rules. Remove the unavailable entry with its Remove button (or Backspace in the empty input if it is the last entry), then choose a compatible name.',
++    noRuleModels: 'No available model matches this selection. Check the selected rules and model restrictions.',
++    exampleUnavailable: 'No model allowed by this key is available for {{client}} over {{protocol}}. Choose a compatible client or ask your Workspace admin to check the selected rules.',
++    exampleAddressUnavailable: 'The Gateway address could not be confirmed. No client example can be shown.',
+   },
+   description:
+     "Each gateway key (starting with ovgw_) belongs to one OpenViking user and uses one context profile and a set of upstreams. Keys can't be edited — issue a new key and revoke the old one.",
+diff --git a/src/i18n/locales/zh-CN/gateway/keys.ts b/src/i18n/locales/zh-CN/gateway/keys.ts
+--- a/src/i18n/locales/zh-CN/gateway/keys.ts
++++ b/src/i18n/locales/zh-CN/gateway/keys.ts
+@@ -23,8 +23,11 @@
+       both: '请让工作区管理员配置上下文及可通过 Workers AI 提供模型的规则。',
+     },
+     prerequisitesFailed: '无法检查上下文配置或模型规则。请刷新列表后重试。',
+-    modelsHelp: '可选。请选择所选 Workers AI 规则支持的模型名或别名。留空表示不对这些规则增加限制。',
+-    modelError: '所选规则不支持某个模型名或别名。请选择兼容的名称，或移除不可用项。',
++    modelsHelp: '可选。请选择所选 Workers AI 规则支持的模型名或别名，或输入名称后按回车键添加。留空表示不对这些规则增加模型限制。',
++    modelError: '所选规则不支持某个模型名或别名。请用该项的移除按钮删除它；若它是最后一项，也可以在输入框为空时按退格键删除。然后选择兼容的名称。',
++    noRuleModels: '没有可用模型符合当前选择。请检查所选规则和模型限制。',
++    exampleUnavailable: '此密钥允许的模型中，没有可通过 {{protocol}} 协议供 {{client}} 使用的模型。请选择兼容的客户端，或请工作区管理员检查所选规则。',
++    exampleAddressUnavailable: '无法确认网关地址，因此无法显示客户端示例。',
+   },
+   description:
+     '每个网关密钥（以 ovgw_ 开头）属于一个 OpenViking 用户，使用一份上下文配置和一组上游。密钥不能修改，需要调整时请签发新密钥并吊销旧密钥。',

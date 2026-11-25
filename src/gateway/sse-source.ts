@@ -81,7 +81,30 @@ export type Finish = 'stop' | 'length' | 'content_filter' | null
 export type Usage = { inputTokens: number | null; outputTokens: number | null }
 type Piece = { delta: string } | { finish: Finish; usage: Usage; text: string }
 
-export async function* generationPieces(reader: ReadableStreamDefaultReader<Uint8Array>, wait: <T>(task: Promise<T>) => Promise<T>): AsyncGenerator<Piece> {
+/** Reject a literal credential even across adjacent deltas. Buffer only a suffix
+ * matching its prefix (linear-time prefix matcher), not the producer's reply. */
+export function protectStreamText(secret: string) {
+  const prefix = Array<number>(secret.length).fill(0)
+  for (let i = 1, j = 0; i < secret.length; i++) {
+    while (j && secret[i] !== secret[j]) j = prefix[j - 1]
+    if (secret[i] === secret[j]) j++
+    prefix[i] = j
+  }
+  let matched = 0
+  return (delta: string, final = false) => {
+    const text = secret.slice(0, matched) + delta
+    for (let i = 0; i < delta.length; i++) {
+      while (matched && delta[i] !== secret[matched]) matched = prefix[matched - 1]
+      if (delta[i] === secret[matched]) matched++
+      if (matched === secret.length) throw failed()
+    }
+    if (final) matched = 0
+    return text.slice(0, text.length - matched)
+  }
+}
+
+export async function* generationPieces(reader: ReadableStreamDefaultReader<Uint8Array>, wait: <T>(task: Promise<T>) => Promise<T>,
+  external = false, filter?: (delta: string, final?: boolean) => string): AsyncGenerator<Piece> {
   const chunks: string[] = []
   let outputBytes = 0, hasText = false, finish: Finish = null
   const usage: Usage = { inputTokens: null, outputTokens: null }
@@ -92,7 +115,9 @@ export async function* generationPieces(reader: ReadableStreamDefaultReader<Uint
   for await (const frame of parse(read)) {
     if (frame.event === 'error') throw failed()
     if (frame.data.trim() === '[DONE]') {
-      if (!hasText) throw incomplete()
+      if (!hasText || (external && finish === null)) throw incomplete()
+      const tail = filter?.('', true)
+      if (tail) yield { delta: tail }
       yield { finish, usage, text: chunks.join('') }
       return
     }
@@ -106,6 +131,7 @@ export async function* generationPieces(reader: ReadableStreamDefaultReader<Uint
       usage.outputTokens = usageNumber(info.completion_tokens) ?? usage.outputTokens
     }
     const isNative = Object.hasOwn(value, 'response')
+    if (external && (isNative || !Object.hasOwn(value, 'choices'))) throw badFrame()
     let text: unknown = isNative ? value.response : undefined, reason: unknown = value.finish_reason
     if (Object.hasOwn(value, 'choices')) {
       if (isNative || !Array.isArray(value.choices) || value.choices.length > 1) throw badFrame()
@@ -113,7 +139,8 @@ export async function* generationPieces(reader: ReadableStreamDefaultReader<Uint
         const choice: unknown = value.choices[0]
         if (!isRecord(choice) || (choice.index !== undefined && choice.index !== 0) || !isRecord(choice.delta)) throw badFrame()
         const delta = choice.delta
-        if (delta.tool_calls != null || delta.function_call != null || delta.refusal != null ||
+        if ((delta.tool_calls != null && !(external && Array.isArray(delta.tool_calls) && delta.tool_calls.length === 0)) ||
+            delta.function_call != null || delta.refusal != null ||
             (delta.role != null && delta.role !== 'assistant')) throw badFrame()
         text = delta.content
         reason = choice.finish_reason
@@ -131,9 +158,13 @@ export async function* generationPieces(reader: ReadableStreamDefaultReader<Uint
     if (reason != null) {
       const next: Finish = reason === 'stop' || reason === 'eos_token' ? 'stop' :
         reason === 'length' || reason === 'max_tokens' ? 'length' : reason === 'content_filter' ? 'content_filter' : null
+      if (external && next === null) throw badFrame()
       if (finish !== null && next !== finish) throw badFrame()
       finish = next
     }
-    if (typeof text === 'string' && text.length) yield { delta: text }
+    if (typeof text === 'string' && text.length) {
+      const delta = filter ? filter(text) : text
+      if (delta) yield { delta }
+    }
   }
 }

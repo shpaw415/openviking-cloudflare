@@ -28,6 +28,7 @@ async function ranked(ctx: WorkspaceContext, fs: Filesystem, query: string, poli
   guard()
   const hits: Array<{ entry: Entry; category: Bucket | undefined; score: number }> = []
   const withQuotas = Object.keys(policy.quotas).length > 0
+  const threshold = Math.max(policy.score_threshold, ctx.defaultSearchScore ?? policy.score_threshold)
   for (const entry of fs.entries(fs.path('viking://'))) {
     if (entry.is_dir || !entry.dimensions || /\/(?:\.[^/]+|soul\.md|profile\.md)(?:\/|$)/.test(entry.uri)) continue
     const path = fs.path(entry.uri)
@@ -35,7 +36,7 @@ async function ranked(ctx: WorkspaceContext, fs: Filesystem, query: string, poli
     const category = bucket(path.kind, entry.uri)
     if (withQuotas && (!category || !policy.quotas[category])) continue
     const score = cosine(vector, fs.vector(path), entry.dimensions)
-    if (score >= policy.score_threshold) hits.push({ entry, category, score })
+    if (score >= threshold) hits.push({ entry, category, score })
   }
   return hits.sort((a, b) => b.score - a.score || (a.entry.uri > b.entry.uri ? 1 : -1))
 }
@@ -63,6 +64,7 @@ export async function augment(ctx: WorkspaceContext, messages: ModelMessage[], i
   const room = Math.min(remaining, Math.min(policy.max_tokens, policy.session_max_tokens - spent) * 4)
   const latest = messages.at(-1)!
   const query = fit(latest.content.trim(), policy.query_max_chars)
+  const hitLimit = Math.min(maxRecallHits, ctx.defaultSearchLimit ?? maxRecallHits)
   let used = 0
   metrics.recall_reason = 'disabled'
   if (policy.recall && policy.context_types.length && room >= 256 && query.length >= 3) {
@@ -79,7 +81,7 @@ export async function augment(ctx: WorkspaceContext, messages: ModelMessage[], i
         const selected: NonNullable<typeof wire.recall> = []
         const counts = new Map<Bucket, number>()
         for (const { entry, category } of hits) {
-          if (selected.length >= maxRecallHits || used + 64 >= room) break
+          if (selected.length >= hitLimit || used + 64 >= room) break
           if (category && (counts.get(category) ?? 0) >= (policy.quotas[category] ?? maxRecallHits)) continue
           const path = fs.path(entry.uri)
           const excerpt = fit(fs.content(path).body, Math.min(768, room - used - 64)).trim()

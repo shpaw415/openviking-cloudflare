@@ -243,6 +243,36 @@ export function appendRows(sql: SqlStorage, key: SessionKey, input: ReturnType<t
   }) }
 }
 
+export type RecoveredSession = {
+  created_at: string; updated_at: string; last_message_at: string; last_commit_at: string; keep_recent_count: number
+  memory_policy: string | null; tags: string[]; messages: StoredMessage[]; archives: { reset: boolean; messages: StoredMessage[] }[]
+}
+
+/** Called only inside the caller's outer transaction with validated history.
+ * Rebuild counters/indexes. Do not publish jobs, leases or identities. */
+export function restoreSessionHistory(sql: SqlStorage, key: SessionKey, data: RecoveredSession): void {
+  const encode = (message: StoredMessage) => ({ payload: JSON.stringify(message),
+    tokens: estimateText(message.parts.map(part => part.type === 'text' ? part.text : '').join('')) })
+  const groups = data.archives.map(archive => archive.messages.map(encode)), active = data.messages.map(encode)
+  const all = [...groups.flat(), ...active]
+  const bytes = all.reduce((sum, row) => sum + byteLength(row.payload) + 1, 0)
+  insertSession(sql, key, data.created_at, data.memory_policy, { bytes, messages: all.length })
+  let seq = 0
+  const append = (rows: typeof active, archive: number | null) => {
+    for (const { payload, tokens } of rows) sql.exec(`INSERT INTO ov_session_messages
+      (${sessionColumns},seq,archive_no,payload,tokens) VALUES (?,?,?,?,?,?,?,?)`, ...key, ++seq, archive, payload, tokens)
+  }
+  data.archives.forEach(({ reset }, i) => {
+    sql.exec(`INSERT INTO ov_session_archives (${sessionColumns},archive_no,context_reset) VALUES (?,?,?,?,?,?)`, ...key, i + 1, Number(reset))
+    append(groups[i], i + 1)
+  })
+  append(active, null)
+  setSessionTags(sql, key, data.tags)
+  sql.exec(`UPDATE ov_sessions SET updated_at=?,last_message_at=?,last_commit_at=?,keep_recent_count=?,
+    message_count=?,total_message_count=?,commit_count=?,message_bytes=? WHERE ${sessionWhere}`, data.updated_at, data.last_message_at,
+  data.last_commit_at, data.keep_recent_count, active.length, all.length, groups.length, bytes, ...key)
+}
+
 export function deleteSession(ctx: WorkspaceContext, key: SessionKey): void {
   ctx.storage.transactionSync(() => {
     requireSession(ctx.sql, key)

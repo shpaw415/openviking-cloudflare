@@ -3,7 +3,7 @@ import type { Generation, GenerationStream, ModelMessage, WorkspaceContext } fro
 import { ApiError, isRecord } from './http.js'
 import { maxGenerationTokens } from './model-config.js'
 import type { BoundModel, VlmConfig } from './model-config.js'
-import { modelChat, workersChat } from './model-runtime.js'
+import { modelChat, modelChatStream } from './model-runtime.js'
 
 export { generationModel } from './model-config.js'
 const encoder = new TextEncoder()
@@ -32,7 +32,7 @@ function reserve(ctx: WorkspaceContext, units: number): void {
   })
 }
 
-async function authorizeInput(ctx: WorkspaceContext, messages: ModelMessage[], max: number) {
+async function authorizeInput(ctx: WorkspaceContext, messages: ModelMessage[], max: number, signal?: AbortSignal) {
     if (!Array.isArray(messages) || !messages.length || messages.length > 48 || !Number.isSafeInteger(max) || max < 1 || max > maxGenerationTokens) throw bad()
     let bytes = 0
     const input = messages.map(msg => {
@@ -42,6 +42,7 @@ async function authorizeInput(ctx: WorkspaceContext, messages: ModelMessage[], m
       return { role: msg.role, content: msg.content }
     })
     await ctx.reauthorize?.()
+    signal?.throwIfAborted()
     ctx.assertActive?.()
     // Account in input bytes plus a conservative output allowance, not fake provider tokens.
     reserve(ctx, bytes + max * 4)
@@ -58,6 +59,9 @@ export function generation(ctx: WorkspaceContext, binding: BoundModel, config: V
   return async (messages, options = {}) => {
     const max = outputLimit(options.maxTokens, config)
     const input = await authorizeInput(ctx,messages,max)
+    // The async authorizeInput return is itself a yield. This check and the
+    // binding call must stay in the same Workspace turn.
+    ctx.assertActive?.()
     let output: unknown
     try { output = await modelChat(binding, config, input, max) } catch { throw unavailable() }
     if (!isRecord(output) || typeof output.response !== 'string' || !output.response.trim() || encoder.encode(output.response).byteLength > 65_536) throw unavailable()
@@ -67,53 +71,71 @@ export function generation(ctx: WorkspaceContext, binding: BoundModel, config: V
   }
 }
 
-/** Return the real binding byte stream, enforcing resource and authorization bounds. */
-export function streamGeneration(ctx: WorkspaceContext, ai: Ai, config: VlmConfig): GenerationStream {
+/** Return only the binding's SSE bytes; translation and termination belong to the Gateway. */
+export function streamGeneration(ctx: WorkspaceContext, binding: BoundModel, config: VlmConfig): GenerationStream {
   return async (messages, options = {}) => {
     const max = outputLimit(options.maxTokens, config)
-    if(options.signal?.aborted)throw new ApiError(409,'INTERRUPTED','Generation interrupted.')
-    const input = await authorizeInput(ctx,messages,max)
-    let provider:unknown
-    try{provider=await workersChat(ai,config,input,max,true)}catch{throw unavailable()}
-    if(!(provider instanceof ReadableStream))throw unavailable()
-    const reader=provider.getReader(),started=Date.now()
-    let lastCheck=started,bytes=0,terminated=false,timer:ReturnType<typeof setTimeout>|undefined
-    let abortListener: (()=>void)|undefined
-    const close=async(reason?:unknown) => {
-      if(terminated)return
-      terminated=true
-      if(timer!==undefined)clearTimeout(timer)
-      if(abortListener)options.signal?.removeEventListener('abort',abortListener)
-      try {await reader.cancel(reason)}catch{/* The provider may already have closed. */}
-      reader.releaseLock()
+    options.signal?.throwIfAborted()
+    const input = await authorizeInput(ctx, messages, max, options.signal)
+    ctx.assertActive?.()
+    options.signal?.throwIfAborted()
+    const lifecycle = new AbortController(), { signal } = lifecycle
+    const timeout = binding.kind === 'openai' ? Math.ceil((config.timeout ?? 20) * 1000) : 45_000
+    const started = Date.now()
+    const forwardAbort = () => lifecycle.abort(options.signal?.reason)
+    const timer = setTimeout(() => lifecycle.abort(new ApiError(504, 'DEADLINE_EXCEEDED', 'Generation stream expired.')), timeout)
+    options.signal?.addEventListener('abort', forwardAbort, { once: true })
+    const cleanup = () => { clearTimeout(timer); options.signal?.removeEventListener('abort', forwardAbort) }
+    let reader: ReadableStreamDefaultReader<unknown>
+    try {
+      const provider = await modelChatStream(binding, config, input, max, signal)
+      if (!(provider instanceof ReadableStream) || provider.locked) throw unavailable()
+      if (signal.aborted) {
+        void provider.cancel().catch(() => {})
+        throw signal.reason
+      }
+      reader = provider.getReader()
+    } catch {
+      cleanup()
+      if (signal.aborted) throw signal.reason
+      if (binding.kind === 'openai') throw new ApiError(502, 'UPSTREAM_ERROR', 'The configured streaming provider did not open an SSE response.')
+      throw unavailable()
+    }
+    let lastCheck = started, bytes = 0, terminated = false
+    let out: ReadableStreamDefaultController<Uint8Array>
+    const aborted = () => {
+      if (!terminated) { out.error(signal.reason); close() }
+    }
+    function close() {
+      if (terminated) return
+      terminated = true
+      cleanup()
+      signal.removeEventListener('abort', aborted)
+      // Abort the HTTP request and release pending reads without holding the slot.
+      if (binding.kind === 'openai') lifecycle.abort()
+      void reader.cancel().catch(() => {}).finally(() => { try { reader.releaseLock() } catch { /* Already closed. */ } })
     }
     return new ReadableStream<Uint8Array>({
       start(controller) {
-        const interrupt=(error:ApiError)=>{
-          if(terminated)return
-          controller.error(error)
-          void close(error)
-        }
-        timer=setTimeout(()=>interrupt(new ApiError(504,'DEADLINE_EXCEEDED','Generation stream expired.')),45_000)
-        abortListener=()=>interrupt(new ApiError(409,'INTERRUPTED','Generation interrupted.'))
-        options.signal?.addEventListener('abort',abortListener,{once:true})
-        if(options.signal?.aborted)abortListener()
+        out = controller
+        signal.addEventListener('abort', aborted, { once: true })
+        if (signal.aborted) aborted()
       },
-      async pull(controller){
-        if(terminated)return
-        try{
-          const part=await reader.read()
-          if(terminated)return
-          if(part.done){controller.close();await close();return}
-          if(!(part.value instanceof Uint8Array))throw unavailable()
-          bytes+=part.value.byteLength
-          if(bytes>256*1024)throw new ApiError(413,'RESOURCE_EXHAUSTED','Generation stream exceeded its byte limit.')
-          if(Date.now()-lastCheck>=2000){await ctx.reauthorize?.();lastCheck=Date.now()}
+      async pull(controller) {
+        if (terminated) return
+        try {
+          const part = await reader.read()
+          if (terminated) return
+          if (part.done) { controller.close(); close(); return }
+          if (!(part.value instanceof Uint8Array)) throw unavailable()
+          bytes += part.value.byteLength
+          if (bytes > 256 * 1024) throw new ApiError(413, 'RESOURCE_EXHAUSTED', 'Generation stream exceeded its byte limit.')
+          if (Date.now() - lastCheck >= 2000) { await ctx.reauthorize?.(); lastCheck = Date.now() }
           ctx.assertActive?.()
-          if(!terminated)controller.enqueue(part.value)
-        }catch(error){if(!terminated){controller.error(error);await close(error)}}
+          if (!terminated) controller.enqueue(part.value)
+        } catch (error) { if (!terminated) { controller.error(error); close() } }
       },
-      async cancel(){await close()}
-    })
+      cancel() { close() },
+    }, { highWaterMark: 0 })
   }
 }

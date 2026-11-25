@@ -10,7 +10,8 @@ export const bytes = (text: string) => encoder.encode(text).byteLength
 export const protocols = ['chat', 'responses', 'anthropic'] as const
 export type Protocol = typeof protocols[number]
 
-export type Route = { kind: 'admin'; parts: string[] } | { kind: 'model'; endpoint: string } | { kind: 'transfer' }
+export type TransferOperation = 'issue' | 'upload' | 'download'
+export type Route = { kind: 'admin'; parts: string[] } | { kind: 'model'; endpoint: string } | { kind: 'transfer'; operation: TransferOperation }
 const prefix = '/gateway'
 const paths = ['/v1', '/api/v3', '/api/compatible/v1']
 const under = (path: string, base: string) => path === base || path.startsWith(`${base}/`)
@@ -21,7 +22,9 @@ export function gatewayPath(path: string): Route | undefined {
   if (under(rest, '/admin')) return { kind: 'admin', parts: rest.slice('/admin/'.length).replace(/\/$/, '').split('/') }
   const base = paths.find(value => under(rest, value))
   if (base) return { kind: 'model', endpoint: rest.slice(base.length + 1).replace(/\/$/, '') }
-  if (rest === '/uploads' || rest === '/downloads') return { kind: 'transfer' }
+  if (rest === '/uploads') return { kind: 'transfer', operation: 'upload' }
+  if (rest === '/downloads') return { kind: 'transfer', operation: 'download' }
+  if (rest === '/transfers/tickets') return { kind: 'transfer', operation: 'issue' }
   return undefined
 }
 

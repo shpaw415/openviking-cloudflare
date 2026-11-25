@@ -32,6 +32,7 @@ async function embed(ctx: WorkspaceContext, texts: string[]): Promise<Float32Arr
     return Array.from(response, normalize)
   } catch (error) {
     if (error instanceof ApiError && error.status === 429 && error.code === 'RATE_LIMITED') throw error
+    if (ctx.dataAuthority && error instanceof ApiError && ([401, 403, 409].includes(error.status) || error.code === 'AUTH_UNAVAILABLE')) throw error
     throw embeddingUnavailable()
   }
 }

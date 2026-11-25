@@ -5,12 +5,13 @@ import { EXAMPLE_SKILLS, FILE_LIMIT, JSON_LIMIT, ROOT, SHARED_SKILLS, SYSTEM_COM
 import type { FsPath } from './fs/contract.js'
 import { sha256 } from './fs/content.js'
 import { consumeUpload, getUpload, uploadId } from './fs/resources.js'
+import type { MultipartUpload } from './fs/resources.js'
 import { excerpt, rankedHits } from './fs/search.js'
-import { defineSkill, skillNamePattern } from './fs/skill-format.js'
+import { dataOnlySkill, defineSkill, skillNamePattern } from './fs/skill-format.js'
 import type { SkillMetadata } from './fs/skill-format.js'
 import { ownership, skillHistory, skillRow, skillRows, storeSkill } from './fs/skill-store.js'
 import type { ManifestFile, SkillRow } from './fs/skill-store.js'
-import type { Filesystem, Scoped, VectorIndex } from './fs/store.js'
+import { emptyIndex, type Filesystem, type Scoped, type VectorIndex } from './fs/store.js'
 import { documentIndex } from './fs/vectors.js'
 import { exampleSkills } from './fs/compile-catalog.js'
 
@@ -144,6 +145,43 @@ function packageNodes(fs: Filesystem, dir: Scoped, definition: ReturnType<typeof
   return { bytes, nodes: [...nodes.values()].sort((a, b) => compare(a.rel, b.rel)) }
 }
 
+type Definition = ReturnType<typeof defineSkill>
+type SkillTree = ReturnType<typeof packageNodes>
+
+function publishSkill(fs: Filesystem, path: Scoped, before: SkillRow | undefined, definition: Definition, tree: SkillTree,
+  manifest: ManifestFile[], revision: string, source: Record<string, unknown>, indexes?: Map<string, VectorIndex>) {
+  fs.mkdir(path, definition.report.description)
+  for (const node of tree.nodes) {
+    if (node.content === undefined) fs.mkdir(node.path, '')
+    else fs.storeFile(node.path, node.content, textSize(node.content), indexes ? indexes.get(node.rel)! : emptyIndex, [])
+  }
+  const { name, description, tags, allowed_tools, metadata } = definition.report
+  return storeSkill(fs, path, before, { metadata: { name, description, tags, allowed_tools, metadata }, manifest, source, revision })
+}
+
+export function backupSkillTree(fs: Filesystem, uri: string, content: string, files: Record<string, string>) {
+  const root = scope(fs, own), path = fs.path(uri) as Scoped
+  const name = nameOf(path.uri)
+  if (fs.parent(path).uri !== root.uri || path.uri !== uri || !skillNamePattern.test(name)) invalid('Expected a private skill package URI.')
+  const definition = dataOnlySkill(content, name)
+  definition.files = files
+  return { path, definition, tree: packageNodes(fs, path, definition) }
+}
+
+/** Produce the same manifest as the normal Skills façade without provider I/O. */
+export async function prepareBackupSkill(fs: Filesystem, prepared: ReturnType<typeof backupSkillTree>) {
+  const { path, definition, tree } = prepared
+  const manifest = await Promise.all(tree.nodes.map(async node => ({ name: nameOf(node.path.uri), path: node.rel, uri: node.path.uri,
+    kind: node.kind, is_dir: node.content === undefined, ...(node.content !== undefined && {
+      size: textSize(node.content), sha256: await sha256(node.content),
+    }) })))
+  const revision = await sha256(JSON.stringify(manifest.map(item => [item.path, item.is_dir, item.size, item.sha256])))
+  return { tree, path, fs, publish: () => {
+    if (fs.entry(path) || skillRow(fs, path)) conflict('A recovered skill cannot replace another package or its history.')
+    publishSkill(fs, path, undefined, definition, tree, manifest, revision, { tracked: false, type: 'backup' })
+  } }
+}
+
 async function install(fs: Filesystem, request: Request, updating?: string): Promise<Response> {
   const body = await readJson(request, payloadCap)
   onlyKeys(body, `data temp_file_id target_uri source_metadata wait timeout telemetry ${updating ? 'from_source' : 'skills list_only'}`)
@@ -165,10 +203,22 @@ async function install(fs: Filesystem, request: Request, updating?: string): Pro
   const input = staged ? staged.body : body.data
   if (typeof input === 'string' && /^(?:https?:\/\/|git@|ssh:\/\/|git:\/\/)/i.test(input.trim())) unsupported('Remote skill sources are not fetched by Edge.')
   const definition = defineSkill(input)
+  return installDefinition(fs, root, definition, { staged, id, preview, updating, selected, sourceMetadata: body.source_metadata })
+}
+
+type InstallOptions = { staged?: MultipartUpload; id?: string; preview: boolean; updating?: string;
+  selected?: ReturnType<typeof select>; sourceMetadata?: unknown; transfer?: SkillTransfer }
+
+async function installDefinition(fs: Filesystem, root: Scoped, definition: ReturnType<typeof defineSkill>,
+  { staged, id, preview, updating, selected, sourceMetadata, transfer }: InstallOptions): Promise<Response> {
   const name = definition.report.name
   if (!definition.report.valid || !skillNamePattern.test(name)) invalid(definition.report.errors[0]?.message ?? 'Invalid skill name.')
   if (updating && name !== updating) invalid('The new Skill name must match the URL name.')
   const path = selected?.path ?? child(fs, root, [name])
+  if (transfer) {
+    if (path.uri !== transfer.uri) invalid('The skill name must match the ticket.')
+    checkSkillTransfer(fs, transfer)
+  }
   const tree = packageNodes(fs, path, definition)
   if (preview) {
     // This is the stock CLI's source inspection, not a publication or a
@@ -178,13 +228,13 @@ async function install(fs: Filesystem, request: Request, updating?: string): Pro
   const before = selected?.row ?? skillRow(fs, path)
   const dirsBefore = fs.entry(path)
   if (!!before?.current_revision !== !!dirsBefore?.is_dir) conflict('The skill package and metadata do not agree.')
-  const source = { tracked: true, type: 'api', source: id ? 'temp_upload' : 'inline_content',
+  const source = { tracked: true, type: 'api', source: transfer ? 'gateway_upload' : id ? 'temp_upload' : 'inline_content',
     operation: updating || before?.current_revision ? 'update' : 'add', skill_name: name,
     ...(staged && { original_filename: staged.name, upload_mode: 'local' }) }
   // For uploads, provenance comes only from the stored basename. The stock
   // client's source_metadata can contain its local absolute path; discard it.
-  if (!staged && isRecord(body.source_metadata)) for (const key of ['type', 'source'] as const) {
-    if (body.source_metadata[key] != null) source[key] = str(body.source_metadata[key], key, undefined, 256)
+  if (!staged && isRecord(sourceMetadata)) for (const key of ['type', 'source'] as const) {
+    if (sourceMetadata[key] != null) source[key] = str(sourceMetadata[key], key, undefined, 256)
   }
   const oldRows = dirsBefore ? fs.storedEntries(path) : []
   fs.limits(path.space, tree.nodes.length + 1 - oldRows.length, tree.bytes - oldRows.reduce((n, row) => n + row.bytes, 0))
@@ -204,21 +254,54 @@ async function install(fs: Filesystem, request: Request, updating?: string): Pro
   return fs.atomic(() => {
     fs.ctx.assertActive?.()
     manage(fs, root)
+    if (transfer) checkSkillTransfer(fs, transfer)
     if (id) getUpload(fs, id)
     if (skillRow(fs, path)?.stamp !== before?.stamp || fs.entry(path)?.revision !== dirsBefore?.revision) conflict('The skill package changed while indexing.')
     if (dirsBefore) fs.remove(path, true)
-    fs.mkdir(path, definition.report.description)
-    for (const node of tree.nodes) {
-      if (node.content === undefined) fs.mkdir(node.path, '')
-      else fs.storeFile(node.path, node.content, textSize(node.content), indexes.get(node.rel)!, [])
-    }
-    const meta = definition.report
-    const row = storeSkill(fs, path, before, { metadata: { name, description: meta.description, tags: meta.tags,
-      allowed_tools: meta.allowed_tools, metadata: meta.metadata }, manifest, source, revision })
+    const row = publishSkill(fs, path, before, definition, tree, manifest, revision, source, indexes)
     if (id) consumeUpload(fs, id)
     return ok({ status: 'success', uri: path.uri, root_uri: path.uri, name,
       auxiliary_files: manifest.filter(file => file.kind === 'auxiliary').length, ...ownership(row), ...(updating && { action: 'update' }) })
   })
+}
+
+export type SkillTransfer = { uri: string; preview: boolean; stamp: string }
+
+function skillTransferStamp(fs: Filesystem, path: Scoped, preview: boolean): string {
+  const row = skillRow(fs, path), dir = fs.entry(path)
+  if (!preview && (dir || row?.current_revision)) conflict('The signed skill target already exists.')
+  return JSON.stringify([row?.stamp ?? null, dir?.revision ?? null])
+}
+
+export function prepareSkillTransfer(fs: Filesystem, body: Record<string, unknown>): SkillTransfer {
+  onlyKeys(body, 'target_uri skills list_only filename')
+  if (body.filename !== undefined && body.filename !== 'SKILL.md') invalid('A signed skill upload requires SKILL.md.')
+  const target = fs.path(body.target_uri ?? own)
+  const root = scope(fs, target.uri)
+  manage(fs, root)
+  const selected = body.skills
+  if (selected !== undefined && (!Array.isArray(selected) || selected.length !== 1)) invalid('Select exactly one skill name.')
+  const name = target.uri === root.uri ? selected?.[0] : nameOf(target.uri)
+  if (typeof name !== 'string' || !skillNamePattern.test(name) || selected !== undefined && selected[0] !== name) {
+    invalid('Specify one skill name or its exact target_uri.')
+  }
+  const path = child(fs, root, [name])
+  if (target.uri !== root.uri && target.uri !== path.uri) invalid('Expected the skills root or the exact skill package URI.')
+  const preview = bool(body.list_only, 'list_only')
+  return { uri: path.uri, preview, stamp: skillTransferStamp(fs, path, preview) }
+}
+
+export function checkSkillTransfer(fs: Filesystem, transfer: SkillTransfer): void {
+  const path = fs.path(transfer.uri) as Scoped
+  manage(fs, scope(fs, path.uri))
+  if (skillTransferStamp(fs, path, transfer.preview) !== transfer.stamp) conflict('The signed skill target changed. Request a new ticket.')
+}
+
+export async function publishSkillTransfer(fs: Filesystem, transfer: SkillTransfer, upload: MultipartUpload): Promise<Response> {
+  if (upload.name !== 'SKILL.md') invalid('A signed skill upload requires SKILL.md.')
+  await fs.ctx.reauthorize?.()
+  fs.ctx.assertActive?.()
+  return installDefinition(fs, scope(fs, transfer.uri), defineSkill(upload.body), { staged: upload, preview: transfer.preview, transfer })
 }
 
 const method = (request: Request, ...allowed: string[]) => {

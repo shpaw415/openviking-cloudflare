@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { Workspace } from './worker.js'
 import type { JobAccess } from './tasks.js'
+import type { AuthorityRevision, DataAuthority, DataAuthorityGrant } from './data-authority.js'
+import type { UrlSource } from './url-source.js'
 
 export interface Caller {
   accountId: string
@@ -22,7 +24,8 @@ export type Generation = (messages: ModelMessage[], options?: { maxTokens?: numb
   outputTokens: number | null
 }>
 
-export type GenerationStream = (messages: ModelMessage[], options?: { maxTokens?: number; signal?: AbortSignal }) => Promise<ReadableStream<Uint8Array>>
+export type StreamGenerationOptions = { maxTokens?: number; signal?: AbortSignal }
+export type GenerationStream = (messages: ModelMessage[], options?: StreamGenerationOptions) => Promise<ReadableStream<Uint8Array>>
 
 export interface Env {
   ASSETS?: Fetcher
@@ -35,10 +38,15 @@ export interface Env {
   OPENVIKING_EDGE_KEYS?: string
   OPENVIKING_EDGE_GENERATION?: string
   OPENVIKING_EDGE_PROVIDERS?: string
+  OPENVIKING_EDGE_OPERATOR_STREAMING?: string
   OPENVIKING_EDGE_AUDIT?: string
   OPENVIKING_EDGE_TEXT_SOURCES?: string
   OPENVIKING_EDGE_MCP?: string
   OPENVIKING_EDGE_DOCUMENT_CONVERSION?: string
+  OPENVIKING_EDGE_GATEWAY_TRANSFERS?: string
+  OPENVIKING_EDGE_GATEWAY_TRANSFER_SECRET?: string
+  OPENVIKING_EDGE_BACKUP_POLICY?: string
+  OPENVIKING_EDGE_BACKUP_KEY?: string
   /** Optional operator-curated fetcher for admitted document URLs. */
   TEXT_SOURCE?: Fetcher
   AI?: Ai
@@ -57,7 +65,10 @@ export interface WorkspaceContext {
   hasEmbedding?: boolean
   embeddingModel?: string
   defaultSearchLimit?: number
+  defaultSearchScore?: number
+  useSearchSessionContext?: boolean
   remoteText?: { allows: (url: string) => boolean; read: (url: string) => Promise<string> }
+  urlSource?: UrlSource
   registerWatch?: (body: Record<string, unknown>) => Promise<Response | undefined>
   mcpMode?: string
   compileExampleSkills?: readonly { name:string; description:string; content:string; uri?:string }[]
@@ -72,6 +83,9 @@ export interface WorkspaceContext {
   finishJobInTransaction?: (result: unknown) => void
   /** Synchronous persistence fence for a cancellable operation. */
   assertActive?: () => void
+  /** Private binding path for operations requiring a model-independent Data lease. */
+  loadDataAuthority?: (expected?: AuthorityRevision) => Promise<DataAuthorityGrant>
+  dataAuthority?: DataAuthority
   /** Re-check managed credentials across an awaited provider call before publication. */
   reauthorize?: () => Promise<void>
 }

@@ -5,13 +5,13 @@ import { FILE_LIMIT, textFile, textSize } from '../fs/contract.js'
 import { decoder, digest, encoder, internal, invalid, notImplemented, quota } from './common.js'
 import { canonicalParts, inspectZip, memberBytes, storedZip, type Member } from './zip.js'
 
-const KIND = 'openviking.ovpack'
-const MANIFEST = '_ovpack/manifest.json'
-const RECORDS = '_ovpack/index_records.jsonl'
-const METADATA_BYTES = 384 * 1024
+export const KIND = 'openviking.ovpack'
+export const MANIFEST = '_ovpack/manifest.json'
+export const RECORDS = '_ovpack/index_records.jsonl'
+export const METADATA_BYTES = 384 * 1024
 const SHA256 = /^[0-9a-fA-F]{64}$/
 
-type FileDigest = { path: string; sha256: string; size: number }
+export type FileDigest = { path: string; sha256: string; size: number }
 type Root = { name: string; uri: string; scope: 'resources' | 'user'; user_id?: string }
 type Payload = { root: Root; entries: SubtreeEntry[] }
 
@@ -32,7 +32,7 @@ export function sourceRoot(uri: string): Root {
   return invalid('Only shared resources and unmanaged private resources/memories are portable.')
 }
 
-function canonicalDigest(value: unknown): string {
+export function canonicalDigest(value: unknown): string {
   return typeof value === 'string' && SHA256.test(value) ? value.toLowerCase() : invalid('Missing or invalid OVPack SHA-256 digest.')
 }
 
@@ -45,7 +45,7 @@ function codePointOrder(a: string, b: string): number {
   return x.length - y.length
 }
 
-function contentDigest(files: FileDigest[]): Promise<string> {
+export function contentDigest(files: FileDigest[]): Promise<string> {
   // Same JSON field order, separators and Unicode order as Python v3.
   const json = JSON.stringify(files.sort((a, b) => codePointOrder(a.path, b.path)).map(({ path, sha256, size }) => ({ path, sha256, size })))
   return digest(encoder.encode(json))
@@ -55,7 +55,7 @@ function parseJson(bytes: Uint8Array): unknown {
   try { return JSON.parse(decoder.decode(bytes)) } catch { return invalid('Invalid OVPack metadata JSON.') }
 }
 
-function member(members: Map<string, Member>, name: string): Member {
+export function member(members: Map<string, Member>, name: string): Member {
   const result = members.get(name)
   if (!result) return invalid('OVPack ZIP members do not match the manifest.')
   members.delete(name)

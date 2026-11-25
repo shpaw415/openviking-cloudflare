@@ -98,37 +98,28 @@ export function prepareWatchRegistrar(ctx:WorkspaceContext, credential:string): 
     const uri=destination(ctx,body.to_uri??body.uri)
     const fs=new Filesystem(ctx)
     fs.checkWriteParent(uri)
-    const cadence=body.watch_interval==null||body.watch_interval===0?0:interval(body.watch_interval)
+    const cadence=interval(body.watch_interval)
     if (body.summarize===true || body.build_index===false || body.auth_state!=null || body.connector_states!=null) {
       throw new ApiError(501,'NOT_IMPLEMENTED','Remote imports accept indexed, plain text without delegated credentials or generated summaries.')
     }
     const reason=small(body.reason,'reason'), instruction=small(body.instruction,'instruction')
     await ctx.reauthorize?.()
-    if(cadence) {
-      const now=Date.now(), due=now+cadence*period
-      await ensureAlarm(ctx.storage,due)
-      const row=ctx.storage.transactionSync(()=>{
-        const old=rowByUri(ctx,uri)
-        if(old) throw new ApiError(409,'ALREADY_EXISTS','A watch already owns this destination for the caller.')
-        if (ctx.sql.exec<{n:number}>('SELECT COUNT(*) n FROM ov_watches WHERE account=?',ctx.caller.accountId).one().n>=limit ||
-            ctx.sql.exec<{n:number}>('SELECT COUNT(*) n FROM ov_watches WHERE account=? AND user_id=?',ctx.caller.accountId,ctx.caller.userId).one().n>=12) {
-          throw new ApiError(429,'RATE_LIMITED','Too many registered watches.')
-        }
-        const id=crypto.randomUUID()
-        ctx.sql.exec(`INSERT INTO ov_watches(id,account,user_id,agent,role,credential,source,uri,cadence,reason,instruction,active,created,due,rev)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,1,?,?,1)`,id,...ids(ctx.caller),ctx.caller.role,credential,url,uri,cadence,reason,instruction,now,due)
-        return rowById(ctx,id)!
-      })
-      // A watch is a persisted schedule. Do not claim a file was fetched at registration.
-      return ok({...wire(row),watch_task_id:row.id,root_uri:uri,uri,scheduled:true})
-    }
-    if (body.wait===false) {
-      if (!ctx.jobs) throw new ApiError(503,'UNAVAILABLE','The remote import queue is unavailable.')
-      const job=await ctx.jobs.enqueue('add_resource',uri,{source:url,uri})
-      return ok({status:'accepted',task_id:job.task_id,root_uri:uri,uri})
-    }
-    const result=await ingest(ctx,url,uri)
-    return ok(result)
+    const now=Date.now(), due=now+cadence*period
+    await ensureAlarm(ctx.storage,due)
+    const row=ctx.storage.transactionSync(()=>{
+      const old=rowByUri(ctx,uri)
+      if(old) throw new ApiError(409,'ALREADY_EXISTS','A watch already owns this destination for the caller.')
+      if (ctx.sql.exec<{n:number}>('SELECT COUNT(*) n FROM ov_watches WHERE account=?',ctx.caller.accountId).one().n>=limit ||
+          ctx.sql.exec<{n:number}>('SELECT COUNT(*) n FROM ov_watches WHERE account=? AND user_id=?',ctx.caller.accountId,ctx.caller.userId).one().n>=12) {
+        throw new ApiError(429,'RATE_LIMITED','Too many registered watches.')
+      }
+      const id=crypto.randomUUID()
+      ctx.sql.exec(`INSERT INTO ov_watches(id,account,user_id,agent,role,credential,source,uri,cadence,reason,instruction,active,created,due,rev)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,1,?,?,1)`,id,...ids(ctx.caller),ctx.caller.role,credential,url,uri,cadence,reason,instruction,now,due)
+      return rowById(ctx,id)!
+    })
+    // A watch is a persisted schedule. Do not claim a file was fetched at registration.
+    return ok({...wire(row),watch_task_id:row.id,root_uri:uri,uri,scheduled:true})
   }
 }
 
@@ -143,10 +134,6 @@ async function ingest(ctx:WorkspaceContext,source:string,uri:string) {
   if(prior&&!prior.is_dir&&fs.stat(uri).revision===prior.revision&&fs.read(uri)===text) return {uri,root_uri:uri,changed:false}
   await fs.putText(uri,text,{mode:prior?'replace':'create',expectedRevision:prior?.revision??null})
   return {uri,root_uri:uri,changed:true}
-}
-
-export async function runRemoteImport(payload:Record<string,unknown>,ctx:WorkspaceContext):Promise<unknown> {
-  return ingest(ctx,allowedURL(payload.source),destination(ctx,payload.uri))
 }
 
 function get(ctx:WorkspaceContext,url:URL,id?:string) {

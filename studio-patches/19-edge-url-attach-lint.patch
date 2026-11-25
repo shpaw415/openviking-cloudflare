@@ -1,0 +1,66 @@
+diff --git a/src/features/workbench/resources/components/add-resource-page.tsx b/src/features/workbench/resources/components/add-resource-page.tsx
+--- a/src/features/workbench/resources/components/add-resource-page.tsx
++++ b/src/features/workbench/resources/components/add-resource-page.tsx
+@@ -153,10 +153,10 @@ export function AddResourceForm({
+   const remotePhase = remoteState.phase
+   const activeMode = EDGE_STUDIO && !canImportUrl ? 'upload' : mode
+   const edgeUrl = EDGE_STUDIO && activeMode === 'remote'
+-  const attach = approvedUrl?.attach
++  const attach = edgeUrl ? approvedUrl.attach : undefined
+   const completion = useRef(onCompleted)
+   useLayoutEffect(() => { completion.current = onCompleted }, [onCompleted])
+   useLayoutEffect(() => {
+-    if (edgeUrl && edgeDialogOpen) return attach?.(() => completion.current?.())
+-  }, [attach, edgeUrl, edgeDialogOpen])
++    if (edgeDialogOpen) return attach?.(() => completion.current?.())
++  }, [attach, edgeDialogOpen])
+ 
+@@ -426,6 +426,7 @@ export function AddResourceForm({
+             {urlState.phase === 'unknown' && <p className="text-sm" role="alert">{t('studio:edge.urlImportUnknown')}</p>}
+             {urlState.phase === 'failed' && <p className="text-sm" role="alert">{t('studio:edge.urlImportFailed')}</p>}
+             {urlState.phase === 'cancelled' && <p className="text-sm" role="alert">{t('studio:edge.urlImportCancelled')}</p>}
++            {refusal === 'authority' && <p className="text-sm" role="alert">{t('studio:edge.urlImportAuthorityRefused')}</p>}
+             {refusal === 'request' && <p className="text-sm" role="alert">{t('studio:edge.urlImportRefused')}</p>}
+             {(urlState.phase === 'interrupted' || urlState.phase === 'unknown') && (
+               <div className="flex flex-wrap gap-2">
+diff --git a/src/features/workbench/resources/hooks/use-approved-url-import.ts b/src/features/workbench/resources/hooks/use-approved-url-import.ts
+--- a/src/features/workbench/resources/hooks/use-approved-url-import.ts
++++ b/src/features/workbench/resources/hooks/use-approved-url-import.ts
+@@ -5,7 +5,7 @@ import { getOvResult, getTaskByTaskId, normalizeOvClientError } from '#/shared/api/ov-client/index'
+ 
+ export type ApprovedUrlDraft = { url: string; mode: 'parent' | 'to'; destination: string }
+ type Task = { id: string; uri: string }
+-type Refusal = 'source' | 'sourceTimeout' | 'destination' | 'request'
++type Refusal = 'source' | 'sourceTimeout' | 'destination' | 'authority' | 'request'
+ type Interruption = 'unavailable' | 'timeout' | 'paused'
+ type State =
+   | { phase: 'idle' }
+@@ -58,6 +58,8 @@ function acceptedTask(result: Record<string, unknown> | undefined): Task | undefined {
+ 
+ function refusalKind(error: unknown): Refusal | undefined {
+   const { code, statusCode } = normalizeOvClientError(error)
++  // This Worker code means admission failed before creating the task.
++  if (statusCode === 503 && code === 'AUTH_UNAVAILABLE') return 'authority'
+   if (code === 'DEADLINE_EXCEEDED') return 'sourceTimeout'
+   if (code === 'SOURCE_UNAVAILABLE' || code === 'UNSUPPORTED_MEDIA_TYPE') return 'source'
+   if (['INVALID_URI', 'RESOURCE_BUSY', 'ALREADY_EXISTS', 'NOT_FOUND', 'CONFLICT'].includes(code)) return 'destination'
+diff --git a/src/i18n/locales/en/studio.ts b/src/i18n/locales/en/studio.ts
+--- a/src/i18n/locales/en/studio.ts
++++ b/src/i18n/locales/en/studio.ts
+@@ -80,5 +80,6 @@
+     urlImportExactAction: 'Import to exact location',
+     urlImportDone: 'Document imported:',
++    urlImportAuthorityRefused: 'Could not verify your workspace access. No import started. Try again when access is restored.',
+     urlImportRefused: 'The import request was rejected. Check your connection, the approved URL, and write access to the destination before trying again.',
+     urlImportFailed: 'The task reported that the import failed. Check the approved source and destination before starting another import.',
+     urlImportCancelled: 'The task reported that the import was cancelled.',
+diff --git a/src/i18n/locales/zh-CN/studio.ts b/src/i18n/locales/zh-CN/studio.ts
+--- a/src/i18n/locales/zh-CN/studio.ts
++++ b/src/i18n/locales/zh-CN/studio.ts
+@@ -80,5 +80,6 @@
+     urlImportExactAction: '导入到指定位置',
+     urlImportDone: '文档已导入：',
++    urlImportAuthorityRefused: '无法验证您的工作区访问权限，导入尚未开始。请在访问恢复后重试。',
+     urlImportRefused: '导入请求被拒绝。请检查连接、已批准的 URL 和目标位置的写入权限后再试。',
+     urlImportFailed: '任务报告导入失败。请检查已批准的来源和目标位置，再启动新的导入。',
+     urlImportCancelled: '任务报告导入已取消。',

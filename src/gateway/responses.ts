@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { ModelMessage, WorkspaceContext } from '../context.js'
 import { GatewayError, bytes, invalid, maxInputBytes, maxMessages } from './contract.js'
+import type { Profile } from './profiles.js'
 import type { Target } from './providers.js'
 
 const age = 86_400_000
@@ -14,33 +15,57 @@ export function initResponses(sql: SqlStorage): void {
   sql.exec(`CREATE TABLE IF NOT EXISTS ov_gateway_responses (
     account_id TEXT NOT NULL, user_id TEXT NOT NULL, agent_id TEXT NOT NULL,
     id TEXT NOT NULL, created_at INTEGER NOT NULL, route TEXT NOT NULL,
-    history TEXT NOT NULL, response TEXT NOT NULL, bytes INTEGER NOT NULL,
+    history TEXT NOT NULL, response TEXT NOT NULL, bytes INTEGER NOT NULL, provenance TEXT,
     PRIMARY KEY (account_id,user_id,agent_id,id)
   ) WITHOUT ROWID`)
+  // Keep pre-B2 rows and never infer authority for them from their route or owner.
+  if (!sql.exec<{ name: string }>('PRAGMA table_info(ov_gateway_responses)').toArray().some(column => column.name === 'provenance')) {
+    sql.exec('ALTER TABLE ov_gateway_responses ADD COLUMN provenance TEXT')
+  }
   sql.exec('CREATE INDEX IF NOT EXISTS ov_gateway_responses_expiry ON ov_gateway_responses(account_id,created_at)')
 }
 
-type Stored = { id: string; created_at: number; route: string; history: string; response: string }
-function load(ctx: WorkspaceContext, id: string): Stored {
-  const row = ctx.sql.exec<Stored>(`SELECT id,created_at,route,history,response FROM ov_gateway_responses
+export function responseProvenance(id: string, revision: number, effective: Profile, keyId?: string): string {
+  // Canonical effective policy, not the client header; equivalent no-op overrides
+  // do not change the identity. The key identifier is the existing opaque digest.
+  const policy = Object.fromEntries(Object.entries(effective).sort(([a], [b]) => a.localeCompare(b)))
+  return JSON.stringify([keyId === undefined ? 'workspace' : 'dedicated', id, revision, keyId ?? null, policy])
+}
+
+export type ResponseScope = { provenance: string; checkRoute: (name: unknown, route: string) => void }
+type Stored = { id: string; created_at: number; route: string; history: string; response: string; provenance: string | null }
+function authorized(ctx: WorkspaceContext, id: string, dedicated?: ResponseScope): Stored {
+  const row = ctx.sql.exec<Stored>(`SELECT id,created_at,route,history,response,provenance FROM ov_gateway_responses
     WHERE ${scope} AND id=? AND created_at>?`, ...owner(ctx), id, Date.now() - age).toArray()[0]
   if (!row) throw unknownResponse()
+  if (dedicated) {
+    dedicated.checkRoute(JSON.parse(row.response).model, row.route)
+    if (row.provenance !== dedicated.provenance) {
+      throw new GatewayError(403, 'response_scope_disallowed', 'The retained response is outside this key’s current context scope.')
+    }
+  }
   return row
 }
 
-export function inspectResponse(ctx: WorkspaceContext, id: string): unknown { return JSON.parse(load(ctx, id).response) }
+export function inspectResponse(ctx: WorkspaceContext, id: string, dedicated?: ResponseScope): unknown {
+  return JSON.parse(authorized(ctx, id, dedicated).response)
+}
 
-export function forgetResponse(ctx: WorkspaceContext, id: string): { id: string; object: 'response.deleted'; deleted: true } {
-  if (!ctx.sql.exec(`DELETE FROM ov_gateway_responses WHERE ${scope} AND id=? AND created_at>?`, ...owner(ctx), id, Date.now() - age).rowsWritten) {
-    throw unknownResponse()
-  }
+export function forgetResponse(ctx: WorkspaceContext, id: string, dedicated?: ResponseScope): { id: string; object: 'response.deleted'; deleted: true } {
+  ctx.storage.transactionSync(() => {
+    authorized(ctx, id, dedicated)
+    if (!ctx.sql.exec(`DELETE FROM ov_gateway_responses WHERE ${scope} AND id=? AND created_at>?`, ...owner(ctx), id, Date.now() - age).rowsWritten) {
+      throw unknownResponse()
+    }
+  })
   return { id, object: 'response.deleted', deleted: true }
 }
 
-const routeIdentity = (target: Target) => JSON.stringify([target.rule.id, target.rule.binding, target.model])
+export const routeIdentity = (target: Target) => JSON.stringify([target.rule.id, target.rule.binding, target.model,
+  ...(target.responseScope === undefined ? [] : [target.responseScope])])
 
-export function resume(ctx: WorkspaceContext, id: string, target: Target, current: ModelMessage[]) {
-  const previous = load(ctx, id), route = routeIdentity(target)
+export function resume(ctx: WorkspaceContext, id: string, target: Target, current: ModelMessage[], dedicated?: ResponseScope) {
+  const previous = authorized(ctx, id, dedicated), route = routeIdentity(target)
   if (previous.route !== route) throw new GatewayError(403, 'response_upstream_disallowed', 'The previous response belongs to another model route.')
   const history = JSON.parse(previous.history) as ModelMessage[]
   // The previous request's instructions are not inherited by this response.
@@ -68,7 +93,7 @@ export function checkResponseQuota(ctx: WorkspaceContext, addBytes = 0): void {
       user_b + addBytes > 1024 * 1024 || actor_b + addBytes > 512 * 1024 || addBytes > 256 * 1024) throw limited()
 }
 
-export function retainResponse(ctx: WorkspaceContext, target: Target, id: string, messages: ModelMessage[], answer: string, wire: unknown, guard: () => void): void {
+export function retainResponse(ctx: WorkspaceContext, target: Target, provenance: string, id: string, messages: ModelMessage[], answer: string, wire: unknown, guard: () => void): void {
   if (!responseId(id) || !wire || typeof wire !== 'object') throw invalid('Invalid response retention state.')
   const history = JSON.stringify([...messages.filter(message => message.role !== 'system'), { role: 'assistant', content: answer }])
   const response = JSON.stringify(wire)
@@ -78,7 +103,7 @@ export function retainResponse(ctx: WorkspaceContext, target: Target, id: string
     checkResponseQuota(ctx, size)
     const now = Date.now()
     ctx.sql.exec('DELETE FROM ov_gateway_responses WHERE account_id=? AND created_at<=?', ctx.caller.accountId, now - age)
-    ctx.sql.exec('INSERT INTO ov_gateway_responses VALUES (?,?,?,?,?,?,?, ?,?)', ...owner(ctx), id, now,
-      routeIdentity(target), history, response, size)
+    ctx.sql.exec(`INSERT INTO ov_gateway_responses (account_id,user_id,agent_id,id,created_at,route,history,response,bytes,provenance)
+      VALUES (?,?,?,?,?,?,?,?,?,?)`, ...owner(ctx), id, now, routeIdentity(target), history, response, size, provenance)
   })
 }

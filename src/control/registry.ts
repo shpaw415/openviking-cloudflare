@@ -179,7 +179,7 @@ export class Registry {
       VALUES (?, ?, 'managed', ?, 'default', ?)`, account, user, role, digest)
   }
 
-  private rememberDigest(account: string, user: string, digest: string): void {
+  private checkNewDigest(account: string, user: string, digest: string): void {
     const count = this.sql.exec<{ total: number; owner: number }>(`
       SELECT count(*) AS total, COALESCE(sum(user_id = ?), 0) AS owner
       FROM ov_control_key_history WHERE account_id = ?`, user, account).one()
@@ -187,6 +187,10 @@ export class Registry {
     if (this.sql.exec('SELECT 1 FROM ov_control_key_history WHERE digest = ?', digest).toArray().length) {
       throw new ApiError(503, 'KEY_ISSUANCE_UNAVAILABLE', 'A new credential could not be allocated.')
     }
+  }
+
+  private rememberDigest(account: string, user: string, digest: string): void {
+    this.checkNewDigest(account, user, digest)
     this.sql.exec('INSERT INTO ov_control_key_history(digest, account_id, user_id) VALUES (?, ?, ?)', digest, account, user)
   }
 
@@ -229,11 +233,16 @@ export class Registry {
     return row
   }
 
-  rotate(account: string, user: string, digest: string, previous: string | null): void {
+  /** Called in Control's serialized preparation transaction. The account and
+   * the new digest stay reserved in Control until this commit or abandonment. */
+  prepareRotation(account: string, user: string, digest: string, previous: string | null): () => void {
     const row = this.writableUser(account, user)
     if (!row.digest || row.digest !== previous) throw new ApiError(409, 'CONFLICT', 'The credential changed during rotation.')
-    this.rememberDigest(account, user, digest)
-    this.sql.exec('UPDATE ov_control_users SET digest = ? WHERE account_id = ? AND user_id = ?', digest, account, user)
+    this.checkNewDigest(account, user, digest)
+    return () => {
+      this.sql.exec('INSERT INTO ov_control_key_history(digest, account_id, user_id) VALUES (?, ?, ?)', digest, account, user)
+      this.sql.exec('UPDATE ov_control_users SET digest = ? WHERE account_id = ? AND user_id = ?', digest, account, user)
+    }
   }
 
   changeRole(account: string, user: string, role: Caller['role']): void {
@@ -324,23 +333,24 @@ export class Registry {
     return this.memberIds(account, group).filter(user => users.has(user))
   }
 
-  updateMembers(account: string, group: string, users: string[], fixed: readonly Caller[], add: boolean): boolean {
+  prepareMembers(account: string, group: string, users: string[], fixed: readonly Caller[], add: boolean) {
     this.requireGroup(account, group)
     const existing = new Set(this.memberIds(account, group))
-    if (!add) {
-      const remove = users.filter(user => existing.has(user))
-      for (const user of remove) this.sql.exec('DELETE FROM ov_control_memberships WHERE account_id = ? AND group_id = ? AND user_id = ?', account, group, user)
-      return remove.length > 0
+    const changed = users.filter(user => existing.has(user) !== add)
+    if (add) {
+      const registered = new Set(this.directory(account, fixed).map(item => item.user_id))
+      for (const user of users) if (!registered.has(user)) throw absent('User', user)
+      if (changed.length) {
+        const total = this.sql.exec<{ n: number }>('SELECT count(*) AS n FROM ov_control_memberships WHERE account_id = ?', account).one().n
+        if (existing.size + changed.length > LIMIT.members || total + changed.length > LIMIT.memberships) throw exhausted()
+      }
     }
-    const registered = new Set(this.directory(account, fixed).map(item => item.user_id))
-    for (const user of users) if (!registered.has(user)) throw absent('User', user)
-    const pending = users.filter(user => !existing.has(user))
-    if (pending.length) {
-      const total = this.sql.exec<{ n: number }>('SELECT count(*) AS n FROM ov_control_memberships WHERE account_id = ?', account).one().n
-      if (existing.size + pending.length > LIMIT.members || total + pending.length > LIMIT.memberships) throw exhausted()
-      for (const user of pending) this.sql.exec('INSERT INTO ov_control_memberships(account_id, group_id, user_id) VALUES (?, ?, ?)', account, group, user)
-    }
-    return pending.length > 0
+    return { changed, commit: () => {
+      const statement = add ? 'INSERT INTO ov_control_memberships(account_id, group_id, user_id) VALUES (?, ?, ?)' :
+        'DELETE FROM ov_control_memberships WHERE account_id = ? AND group_id = ? AND user_id = ?'
+      for (const user of changed) this.sql.exec(statement, account, group, user)
+      return changed.length > 0
+    } }
   }
 }
 

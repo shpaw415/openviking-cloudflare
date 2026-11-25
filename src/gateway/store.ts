@@ -7,6 +7,7 @@ import type { Profile, SavedProfile } from './profiles.js'
 import { defaults } from './providers.js'
 import type { GatewayContext, SavedUpstream, Upstream } from './providers.js'
 import { initResponses } from './responses.js'
+import { assertKeyObjectUnused, initKeys, revokeUserKeys } from './keys.js'
 
 const account = (ctx: WorkspaceContext) => ctx.caller.accountId
 const owner = (ctx: WorkspaceContext) => [account(ctx), ctx.caller.userId, ctx.caller.agentId] as const
@@ -20,6 +21,7 @@ const second = () => Date.now() / 1000
 
 export function initStore({ sql }: WorkspaceContext): void {
   initResponses(sql)
+  initKeys(sql)
   sql.exec(`CREATE TABLE IF NOT EXISTS ov_gateway_objects (
     account_id TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('policy','upstream')), id TEXT NOT NULL,
     revision INTEGER NOT NULL, payload TEXT NOT NULL,
@@ -55,8 +57,8 @@ export function profileList(ctx: WorkspaceContext): SavedProfile[] {
   return rows(ctx, 'policy').map(({ id, revision, payload }) => ({ ...JSON.parse(payload) as Profile, id, revision }))
 }
 
-export function profileFor(ctx: WorkspaceContext): Profile {
-  return profileList(ctx).find(item => item.id === 'default') ?? defaultProfile
+export function profileFor(ctx: WorkspaceContext): SavedProfile {
+  return profileList(ctx).find(item => item.id === 'default') ?? { ...defaultProfile, id: 'default', revision: 0 }
 }
 
 export function upstreamList(ctx: GatewayContext): SavedUpstream[] {
@@ -90,11 +92,24 @@ export function save<T extends Profile | Upstream>(ctx: WorkspaceContext, kind: 
 
 export function remove(ctx: WorkspaceContext, kind: ObjectKind, id: string): void {
   ctx.storage.transactionSync(() => {
+    assertKeyObjectUnused(ctx, kind, id)
     if (!ctx.sql.exec('DELETE FROM ov_gateway_objects WHERE account_id=? AND kind=? AND id=?', account(ctx), kind, id).rowsWritten) {
       throw missing()
     }
     touchConfig(ctx)
   })
+}
+
+export function resetConversation(ctx: WorkspaceContext, caller: WorkspaceContext['caller'], protocol: Protocol, label: string, hash: string): void {
+  const scoped = { ...ctx, caller }
+  const base = [...owner(scoped), protocol] as const
+  const row = ctx.sql.exec<{ name_hash: string }>(`SELECT name_hash FROM ov_gateway_state
+    WHERE account_id=? AND user_id=? AND agent_id=? AND protocol=? AND (name_hash=? OR conversation=?)`,
+    ...base, hash, label).toArray()[0]
+  if (!row) throw missing()
+  const slot = enter(scoped, `${caller.agentId}:${protocol}:${row.name_hash}`)
+  try { ctx.sql.exec(`UPDATE ov_gateway_state SET session_id=NULL WHERE ${stateKey}`, ...base, row.name_hash) }
+  finally { slot.done() }
 }
 
 export function conversation(ctx: WorkspaceContext, protocol: Protocol, hash: string): State | undefined {
@@ -160,6 +175,7 @@ export function reserve(ctx: WorkspaceContext, units: number): void {
 export type Metrics = {
   request_id: string; received_at: number; method: 'GET' | 'POST' | 'other'; endpoint: 'messages' | 'count_tokens' | 'chat' | 'responses' | 'other';
   kind: 'user' | 'count' | 'passthrough'; status: number; model?: string; protocol?: Protocol; upstream_id?: string;
+  credential_id?: string;
   session?: string; session_source?: 'header' | 'new'; upstream_attempted?: boolean; input_tokens?: number; output_tokens?: number;
   upstream_status?: number; duration_ms?: number; recall_ms?: number; recall_count?: number; recall_reason?: string;
   context_override?: string[]; capture_status?: 'active' | 'failed' | 'disabled'; capture_reason?: string;
@@ -214,6 +230,7 @@ export function overview(ctx: GatewayContext, available: boolean) {
 
 export function deleteUserState(ctx: WorkspaceContext, user: string): void {
   ctx.storage.transactionSync(() => {
+    revokeUserKeys(ctx, user)
     ctx.sql.exec('DELETE FROM ov_gateway_responses WHERE account_id=? AND user_id=?', account(ctx), user)
     ctx.sql.exec('DELETE FROM ov_gateway_state WHERE account_id=? AND user_id=?', account(ctx), user)
     ctx.sql.exec('DELETE FROM ov_gateway_log WHERE account_id=? AND user_id=?', account(ctx), user)

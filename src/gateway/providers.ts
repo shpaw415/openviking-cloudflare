@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import type { Generation, ModelMessage, WorkspaceContext } from '../context.js'
+import type { Generation, GenerationStream, ModelMessage, StreamGenerationOptions, WorkspaceContext } from '../context.js'
+import type { AuthorityRevision } from '../data-authority.js'
+import type { GatewayKeyAdmin, GatewayKeyRow } from './keys.js'
 import { generationModel } from '../generation.js'
 import { ApiError, isRecord } from '../http.js'
 import { GatewayError, bytes, displayName, fields, integer, invalidConfig, maxOutputBytes, modelId, protocols,
@@ -9,11 +11,20 @@ import type { Protocol } from './contract.js'
 // Trusted deployment-side interface. Do not construct it from request data.
 export interface GatewayProvider {
   models: readonly string[]
+  /** Opaque deployment destination identity; kept only in Responses routing state. */
+  responseScope?: string
   generate(model: string, messages: ModelMessage[], options: { maxTokens: number }): ReturnType<Generation>
+  generateStream?(model: string, messages: ModelMessage[], options: StreamGenerationOptions): ReturnType<GenerationStream>
+  streamTextFilter?(): (delta: string, final?: boolean) => string
   countTokens?(model: string, messages: ModelMessage[]): Promise<number>
 }
 
 export interface GatewayContext extends WorkspaceContext {
+  gatewayKeyAdmin?: GatewayKeyAdmin
+  gatewayKey?: GatewayKeyRow
+  gatewayModelRevision?: number
+  gatewayCredentialRevision?: AuthorityRevision
+  assertGatewayMount?: () => void
   gatewayProvider?: GatewayProvider
   workersAIModel?: string
   /** Text generation configured on the operator adapter is not a Workers AI route. */
@@ -109,7 +120,15 @@ export function routedModel(ctx: GatewayContext, rule: Upstream, name: string): 
   return rule.models.includes(target) && manifest(ctx, rule.binding).includes(target) ? target : undefined
 }
 
-export type Target = { rule: SavedUpstream; model: string }
+export type Target = { rule: SavedUpstream; model: string; responseScope?: string }
+
+export function streamSource(ctx: GatewayContext, target: Target): GenerationStream | undefined {
+  if (!isBound(ctx, target.rule.binding) || !target.rule.models.includes(target.model) ||
+      !manifest(ctx, target.rule.binding).includes(target.model)) return
+  if (target.rule.binding === 'workers_ai') return ctx.generateStream
+  const provider = ctx.gatewayKey ? undefined : ctx.gatewayProvider
+  if (provider?.generateStream) return (messages, options = {}) => provider.generateStream!(target.model, messages, options)
+}
 
 export function resolveTarget(ctx: GatewayContext, upstreams: SavedUpstream[], protocol: Protocol, name: string): Target {
   const candidates = upstreams.filter(rule => rule.enabled && rule.protocol === protocol)
@@ -119,7 +138,7 @@ export function resolveTarget(ctx: GatewayContext, upstreams: SavedUpstream[], p
     if (!model) continue
     // No automatic fallback to a different provider if the winning route is down.
     if (!isBound(ctx, rule.binding)) throw unconfigured()
-    return { rule, model }
+    return { rule, model, responseScope: rule.binding === 'operator' ? ctx.gatewayProvider?.responseScope : undefined }
   }
   throw new GatewayError(404, 'no_matching_upstream', 'No enabled route matches this protocol and model.')
 }

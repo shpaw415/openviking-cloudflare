@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { DurableObject } from 'cloudflare:workers'
-import { authenticate, authenticateApiKey, configuredPrincipals, controlFor, federatedAllows, hasCredentials, requireDataGrant, resolveDigest, resolveFederated, sameCaller, stripCredentialHeaders } from './auth.js'
+import { authenticate, authenticateApiKey, configuredPrincipals, controlFor, credentialDigest, dedicatedGatewayCredential, federatedAllows, gatewayCredentialPattern, hasCredentials, requireDataGrant, resolveDigest, resolveFederated, sameCaller, stripCredentialHeaders } from './auth.js'
 import type { AuthGrant } from './auth.js'
 import type { Caller, ControlCaller, Env, WorkspaceContext } from './context.js'
 import { initEmbeddingBudget, reserveEmbeddingBudget } from './embedding-budget.js'
@@ -15,6 +15,8 @@ import { routeBot } from './bot.js'
 import { initBot } from './bot/store.js'
 import { initEvolution, routeEvolution } from './bot/evolution.js'
 import { initArchives, isWebDavPath, routeArchives, WEB_DAV_REQUEST_HEADERS } from './archives.js'
+import { admitPermit, backupResponse, zipBuffer } from './archives/backup-authority.js'
+import { captureBackup, restoreBackup } from './archives/backup-workspace.js'
 import { armCompileSchedule, compileExampleSkills, initCompile, routeCompile, runCompile, runDueCompileSchedule } from './compile.js'
 import { initMcp, isMcpHttpPath, routeMcp } from './mcp.js'
 import { oauthAllows, oauthFor, oauthRoute, oauthTokenDigest } from './oauth.js'
@@ -23,15 +25,28 @@ import { assertJobRunning, claimJob, completeJob, finishJobInTransaction, initTa
 import { converter, initDocuments } from './documents.js'
 import { routeStorageInspection } from './storage-inspection.js'
 import { retrievalContext } from './session-search-context.js'
-import { cancelGatewayStream, initGateway, isGatewayPath, routeGateway } from './gateway.js'
+import { cancelGatewayStream, initGateway, isDedicatedGatewayRoute, isGatewayPath, routeGateway } from './gateway.js'
+import { invalidateGatewayCredentials, invalidateGatewayStreams } from './gateway/stream.js'
+import { protectStreamText } from './gateway/sse-source.js'
 import type { GatewayContext } from './gateway.js'
+import { deleteKeyDigest, disabledKeys, invalidGatewayKey, keyByDigest, keyOwner } from './gateway/keys.js'
+import type { KeyAuthority } from './gateway/keys.js'
+import { GatewayError, digest, gatewayError, gatewayPath, within } from './gateway/contract.js'
+import { assertCredentialRevision, assertModelRevision, credentialChanged, fenceModelRevision,
+  initModelFence, modelAuthorityUnavailable, modelChanged } from './gateway/model-authority.js'
+import { dataAuthorityChanged, dataAuthorityUnavailable, fenceDataAuthority, initDataAuthorityFence, mountDataAuthority, sameAuthority, storedAuthority } from './data-authority.js'
+import type { AuthorityAdvance, AuthorityRevision } from './data-authority.js'
+import { initGatewayTransfers, routeGatewayTransfer, transferTicketHeader } from './gateway/transfers.js'
 import { bindModel, legacyEmbedding, selectedVlm } from './model-config.js'
-import type { EmbeddingConfig } from './model-config.js'
+import type { EmbeddingConfig, ModelSettings } from './model-config.js'
 import type { JobKind } from './tasks.js'
-import { claimWatch, identityForWatch, initWatches, prepareWatchRegistrar, remoteTextSource, revokeWatch, routeWatches, runRemoteImport, runWatch, scheduleWatch } from './watches.js'
+import { claimWatch, identityForWatch, initWatches, prepareWatchRegistrar, remoteTextSource, revokeWatch, routeWatches, runWatch, scheduleWatch } from './watches.js'
+import { boundUrlSource } from './url-source.js'
+import { isOneShotUrlImport } from './fs/url-import.js'
 
 export { Control } from './control.js'
 export { OAuth } from './oauth.js'
+export { BackupOperator } from './archives/backup-operator.js'
 
 const version = '0.1.0-alpha.1'
 const upstream = '000f0765d7ec183886fbabbc22e69bc289cc429d'
@@ -44,10 +59,15 @@ const consumers: ReadonlyMap<JobKind, (payload: Record<string, unknown>, ctx: Wo
 const availableJobs = new Set(consumers.keys())
 
 async function runResourceJob(payload:Record<string, unknown>,ctx:WorkspaceContext) {
-  if(!isRecord(payload.body)) return runRemoteImport(payload,ctx)
+  if (!isRecord(payload.body)) throw new ApiError(409, 'FAILED_PRECONDITION', 'The queued import must be submitted again.')
+  if (isOneShotUrlImport(payload.body)) {
+    const revision = storedAuthority(payload.dataAuthorityRevision)
+    if (!revision) throw dataAuthorityChanged()
+    await mountDataAuthority(ctx, revision)
+  }
   const url=new URL('https://workspace.invalid/api/v1/resources')
   const response=await routeFilesystem(new Request(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({...payload.body,wait:true})}),url,ctx)
-  if(!response?.ok) throw new ApiError(409,'FAILED_PRECONDITION','The staged resource could not be published.')
+  if(!response?.ok) throw new ApiError(409,'FAILED_PRECONDITION','The queued resource could not be published.')
   const value:unknown=await response.json()
   if(!isRecord(value)||value.status!=='ok') throw new ApiError(500,'INTERNAL_ERROR','Resource stage did not return its commit receipt.')
   return value.result
@@ -84,8 +104,40 @@ function finish(request: Request, response: Response, id: string, isAsset = fals
   })
 }
 
-function workspace(env: Env, caller: Caller): DurableObjectStub<Workspace> {
+function workspace(env: Env, caller: Pick<Caller, 'accountId'>): DurableObjectStub<Workspace> {
   return env.WORKSPACES.getByName(`openviking:account:${caller.accountId}`)
+}
+
+async function gatewayGrant(request: Request, path: string, raw: string, env: Env, id: string): Promise<AuthGrant> {
+  if (!isDedicatedGatewayRoute(path, request.method)) {
+    throw new ApiError(401, 'UNAUTHENTICATED', 'A valid API key is required for this route.')
+  }
+  if (!gatewayCredentialPattern.test(raw)) throw invalidGatewayKey()
+  configuredPrincipals(env)
+  const control = controlFor(env)
+  if (!control || !env.AI) throw invalidGatewayKey()
+  const digest = await credentialDigest(raw)
+  let owner: KeyAuthority | null = null
+  try {
+    const accountId = await control.gatewayAccount(digest)
+    if (accountId) owner = await workspace(env, { accountId }).gatewayOwner(accountId, digest)
+  } catch {
+    throw new GatewayError(503, 'authorization_unavailable', 'Could not verify the Gateway credential.', { request_id: id })
+  }
+  if (!owner) throw invalidGatewayKey()
+  return { caller: { ...owner.caller, role: 'user' }, digest: owner.digest, managed: owner.managed, gatewayDigest: digest }
+}
+
+async function verifyKeyAuthority(owner: KeyAuthority, env: Env): Promise<void> {
+  let current: AuthGrant
+  try { current = await resolveDigest(owner.digest, env) }
+  catch (error) {
+    if (!(error instanceof ApiError) || error.status !== 401) throw error
+    throw new GatewayError(401, 'openviking_key_invalid', 'The OpenViking credential behind this key is no longer active.')
+  }
+  if (!sameCaller(owner.caller, current.caller) || current.managed !== owner.managed) {
+    throw new GatewayError(401, 'openviking_key_invalid', 'The OpenViking identity behind this key changed.')
+  }
 }
 
 async function ready(env: Env): Promise<Response> {
@@ -117,18 +169,22 @@ async function ready(env: Env): Promise<Response> {
   }, { status: healthy ? 200 : 503 })
 }
 
-async function capabilities(env: Env, caller: ControlCaller, readOnlyFederation=false): Promise<Response> {
-  const settings = await controlFor(env)?.modelSettings() ?? {}
+async function capabilities(env: Env, grant: AuthGrant): Promise<Response> {
+  const { caller } = grant
+  const control = controlFor(env)
+  const settings = await control?.modelSettings() ?? {}
   const vlm = selectedVlm(env, settings)
-  const generationEnabled = !!vlm && !!bindModel(env, vlm)
+  const boundGeneration = vlm ? bindModel(env, vlm) : undefined
+  const generationEnabled = !!boundGeneration
   const embeddingDefault = settings.embedding?.dense ?? legacyEmbedding
   const { role } = caller
   const embedding = role === 'root' ? embeddingDefault
-    : await workspace(env, { ...caller, role }).embeddingSelection({ ...caller, role }, embeddingDefault)
+    : await workspace(env, caller).embeddingSelection({ ...caller, role }, embeddingDefault)
+  const embeddingMounted = !!bindModel(env, embedding)
   const result={
     runtime: 'cloudflare-workers', upstream_commit: upstream, version, parity: 'partial',
     storage: 'durable-object-sqlite', unsupported_api_status: 501,
-    embedding: { model: embedding.model, provider: embedding.provider, dimension: embedding.dimension, binding_present: !!bindModel(env, embedding), probed: false },
+    embedding: { model: embedding.model, provider: embedding.provider, dimension: embedding.dimension, binding_present: embeddingMounted, probed: false },
     generation: { model: vlm?.model ?? generationModel, configured: generationEnabled, probed: false },
     features: {
       control: !!env.CONTROL && caller.role !== 'user', packImport: caller.role !== 'root', packExport: caller.role !== 'root', searchProvenance: caller.role !== 'root',
@@ -137,14 +193,17 @@ async function capabilities(env: Env, caller: ControlCaller, readOnlyFederation=
       skills: caller.role !== 'root', snapshots: caller.role !== 'root', webdav: caller.role !== 'root',
       oauth: !!env.OAUTH && !!env.CONTROL && !!env.OPENVIKING_OAUTH_ISSUER && !!env.OPENVIKING_OAUTH_CLIENTS,
       watches: caller.role !== 'root' && !!remoteTextSource(env),
+      urlImport: (role === 'user' || role === 'admin') && !grant.oidc && !grant.oauth && !grant.gatewayDigest &&
+        !!control && !!env.WORKSPACES && embeddingMounted && !!boundUrlSource(env),
       privacyConfigs: caller.role !== 'root', tasks: caller.role !== 'root', audit: caller.role !== 'root' && env.OPENVIKING_EDGE_AUDIT !== '0',
       monitoring: role !== 'root' && !!env.WORKSPACES,
       mcp: caller.role !== 'root' && ['read','read-write'].includes(env.OPENVIKING_EDGE_MCP ?? ''),
       documents: caller.role !== 'root' && !!env.AI && env.OPENVIKING_EDGE_DOCUMENT_CONVERSION === '1',
       gateway: caller.role !== 'root' && generationEnabled,
+      gatewayKeys: caller.role !== 'root' && !!env.CONTROL && boundGeneration?.kind === 'workers_ai',
     },
   }
-  if(readOnlyFederation) {
+  if(grant.oidc) {
     // The health API keeps the historical auth_mode, but a restricted data
     // token must not make gated actions appear available in the UI.
     for(const flag of Object.keys(result.features) as (keyof typeof result.features)[]) result.features[flag]=false
@@ -220,15 +279,22 @@ async function route(request: Request, url: URL, env: Env, id: string, execution
   if (!path.startsWith('/api/v1/') && path !== '/metrics' && !isMcpHttpPath(path) && !isGatewayPath(path) && !isWebDavPath(path) && !/^\/bot\/v1(?:\/|$)/.test(path)) {
     throw new ApiError(404, 'NOT_FOUND', 'Route not found.')
   }
-  const token = await oauthTokenDigest(request)
-  const grant = token ? await delegated(request,url,env,token) : await authenticate(request, env)
+  const dedicated = dedicatedGatewayCredential(request)
+  const token = dedicated ? null : await oauthTokenDigest(request)
+  let grant: AuthGrant
+  if (dedicated) {
+    try { grant = await gatewayGrant(request, path, dedicated, env, id) }
+    catch (error) { if (error instanceof GatewayError) return gatewayError(error, id); throw error }
+  } else grant = token ? await delegated(request,url,env,token) : await authenticate(request, env)
   if(grant.oidc&&!federatedAllows(request,path))throw new ApiError(403,'PERMISSION_DENIED','This operation requires an API key.')
-  if (path === '/api/v1/system/edge-capabilities' && isRead(request)) return capabilities(env, grant.caller,!!grant.oidc)
+  if (path === '/api/v1/system/edge-capabilities' && isRead(request)) return capabilities(env, grant)
   const gateway = isGatewayPath(path)
+  const transfer = gateway && gatewayPath(path)?.kind === 'transfer'
   if (gateway && ['x-openviking-upstream-url','x-openviking-upstream-key','x-openviking-gateway-management-key'].some(name => request.headers.has(name))) {
     throw new ApiError(403,'PERMISSION_DENIED','Client-supplied gateway egress settings are not accepted.')
   }
-  const cleanRequest = stripCredentialHeaders(request,gateway ? ['x-openviking-context','x-openviking-session','x-openviking-actor-peer','content-encoding','upgrade']
+  const cleanRequest = stripCredentialHeaders(request,transfer ? ['content-encoding', transferTicketHeader]
+    : gateway ? ['x-openviking-context','x-openviking-session','x-openviking-actor-peer','content-encoding','upgrade']
     : isMcpHttpPath(path) ? ['mcp-protocol-version','mcp-session-id'] : isWebDavPath(path) ? WEB_DAV_REQUEST_HEADERS : [])
   if (path === '/api/v1/admin' || path.startsWith('/api/v1/admin/')) {
     const control = controlFor(env)
@@ -241,7 +307,9 @@ async function route(request: Request, url: URL, env: Env, id: string, execution
   }
   const caller=requireDataGrant(grant)
   const target=workspace(env,caller)
-  if(!gateway) return target.dispatch(cleanRequest,grant,id)
+  if(!gateway || transfer) return target.dispatch(cleanRequest,grant,id)
+  if (!grant.gatewayDigest && !grant.oauth && !grant.oidc && env.CONTROL && env.AI &&
+      (path === '/gateway/admin' || path.startsWith('/gateway/admin/'))) grant.gatewayKeysMounted = true
   // Hold the original event until we can forward a disconnect to the owning DO.
   // waitUntil called only *after* abort is too late if the event is already tearing down.
   let release!:()=>void
@@ -309,6 +377,9 @@ export class Workspace extends DurableObject<Env> {
       initMcp(context)
       initDocuments(context.sql)
       initGateway(context)
+      initGatewayTransfers(context.sql)
+      initModelFence(context.sql)
+      initDataAuthorityFence(context.sql)
     })
     this.initialized = true
   }
@@ -334,18 +405,122 @@ export class Workspace extends DurableObject<Env> {
     return workspaceEmbedding(this.localContext(caller).sql, caller.accountId, configured)
   }
 
-  private async workspaceContext(grant: AuthGrant, taskId?: string, request?: Request): Promise<WorkspaceContext> {
+  /** Called only through the private binding after the public Worker resolves the locator. */
+  gatewayOwner(accountId: string, digest: string): KeyAuthority | null {
+    if (!this.isAccountWorkspace(accountId) || !/^[a-f0-9]{64}$/.test(digest)) return null
+    const ctx = this.localContext({ accountId, userId: '', agentId: '', role: 'user' })
+    const row = keyByDigest(ctx.sql, accountId, digest)
+    return row ? keyOwner(row) : null
+  }
+
+  private isAccountWorkspace(accountId: string): boolean {
+    return /^[A-Za-z0-9_-]{1,48}$/.test(accountId) &&
+      this.ctx.id.toString() === this.env.WORKSPACES.idFromName(`openviking:account:${accountId}`).toString()
+  }
+
+  /** Internal RPC only. Never call from the default HTTP/Data dispatcher. */
+  captureBackup(rawPermit: unknown, options: unknown): Promise<Response> {
+    return backupResponse(async () => {
+      const { scope, permit } = await admitPermit(this.env, account => this.isAccountWorkspace(account), rawPermit, 'capture')
+      return captureBackup(this.ctx.storage, this.env, scope, permit, options)
+    })
+  }
+
+  /** Evaluation and apply use different internal permits. Neither one expands a Data grant. */
+  restoreBackup(rawPermit: unknown, op: 'evaluate' | 'apply', archive: unknown, seal: unknown,
+    options: unknown, approval?: unknown): Promise<Response> {
+    return backupResponse(async () => {
+      if (op !== 'evaluate' && op !== 'apply') throw new ApiError(403, 'PERMISSION_DENIED', 'Invalid backup operation.')
+      const { scope, permit } = await admitPermit(this.env, account => this.isAccountWorkspace(account), rawPermit, op)
+      return restoreBackup(this.ctx.storage, this.env, this.ctx.id.toString(), scope, permit,
+        op === 'evaluate', zipBuffer(archive), seal, options, approval)
+    })
+  }
+
+  /** Private Control → Workspace barrier. No network/provider await precedes
+   * the fence, and SQLite and all productive boundaries share this actor. */
+  async fenceGatewayModel(accountId: string, revision: number): Promise<number> {
+    if (!this.isAccountWorkspace(accountId)) throw modelAuthorityUnavailable()
+    const { sql, storage } = this.localContext({ accountId, userId: '', agentId: '', role: 'user' })
+    storage.transactionSync(() => fenceModelRevision(sql, revision))
+    invalidateGatewayStreams(storage, accountId, revision)
+    await storage.sync()
+    return revision
+  }
+
+  async fenceGatewayCredentials(accountId: string, advance: AuthorityAdvance): Promise<string> {
+    if (!this.isAccountWorkspace(accountId)) throw dataAuthorityUnavailable()
+    const { sql, storage } = this.localContext({ accountId, userId: '', agentId: '', role: 'user' })
+    const receipt = storage.transactionSync(() => fenceDataAuthority(sql, advance))
+    invalidateGatewayCredentials(storage, accountId, advance)
+    await storage.sync()
+    return receipt
+  }
+
+  private async workspaceContext(grant: AuthGrant, taskId?: string, request?: Request): Promise<GatewayContext> {
     const authority = requireDataGrant(grant)
     const caller: Caller = grant.oauth ? { ...authority,role:'user' } : authority
     const context = this.localContext(caller)
     const control = controlFor(this.env)
     const fixed = configuredPrincipals(this.env).filter(p => p.caller.accountId === caller.accountId && p.caller.role !== 'root')
-    const directory = async () => {
-      const [listed, groups] = await Promise.all([control?.principalsFor(caller.accountId, fixed.map(p=>p.caller)), control?.groupsFor(caller)])
+    const gatewayDigest = grant.gatewayDigest
+    const ownedKey = gatewayDigest ? keyByDigest(context.sql, caller.accountId, gatewayDigest) : undefined
+    const owner = ownedKey && keyOwner(ownedKey)
+    const fixedCallers = fixed.map(item => requireDataGrant({ caller: item.caller, digest: '', managed: false }))
+    let mount: { revision: number; credentialRevision: AuthorityRevision; settings: ModelSettings } | undefined
+    const route = request && gatewayPath(new URL(request.url).pathname)
+    const dataMount = !grant.oauth && !grant.oidc && !taskId && (route?.kind === 'model' || (route?.kind === 'admin' &&
+      (route.parts.join('/') === 'access' || /^upstreams\/[A-Za-z0-9_-]{1,64}\/test$/.test(route.parts.join('/')))))
+    const modelOwner = owner ?? (dataMount ? { caller, digest: grant.digest, managed: grant.managed } : undefined)
+    if (gatewayDigest && (!request || taskId || grant.oauth || grant.oidc || !owner || !control ||
+        !isDedicatedGatewayRoute(new URL(request.url).pathname, request.method) ||
+        !sameCaller(caller, { ...owner.caller, role: 'user' }) || owner.digest !== grant.digest || owner.managed !== grant.managed)) {
+      throw invalidGatewayKey()
+    }
+    const directory = async (principal = caller) => {
+      const [listed, groups] = await Promise.all([control?.principalsFor(caller.accountId, fixed.map(p=>p.caller)), control?.groupsFor(principal)])
       context.groups = groups ?? []
       context.aclPrincipals = { users: [...new Set([caller.userId, ...fixed.map(p => p.caller.userId), ...(listed?.users ?? [])])], groups: listed?.groups ?? [] }
     }
+    const keyStillActive = () => {
+      if (gatewayDigest && !keyByDigest(context.sql, caller.accountId, gatewayDigest)) throw invalidGatewayKey()
+    }
+    const stillMounted = () => {
+      keyStillActive()
+      if (!mount) throw modelAuthorityUnavailable()
+      assertCredentialRevision(context.sql, caller.userId, mount.credentialRevision)
+      assertModelRevision(context.sql, mount.revision)
+    }
     context.reauthorize = async () => {
+      if (modelOwner && control) {
+        if (mount) stillMounted()
+        else keyStillActive()
+        let current
+        try {
+          if (!modelOwner.managed) await within(4_000, () => verifyKeyAuthority(modelOwner, this.env), modelAuthorityUnavailable)
+          current = await within(4_000, () => gatewayDigest
+            ? control.gatewayModelGrant(gatewayDigest, modelOwner, fixedCallers, mount?.revision)
+            : control.gatewayDataGrant(modelOwner, fixedCallers, mount?.revision), modelAuthorityUnavailable)
+        }
+        catch (error) {
+          if (ownedKey && error instanceof GatewayError && error.code === 'openviking_key_invalid') deleteKeyDigest(context.sql, caller.accountId, ownedKey.digest)
+          throw error instanceof GatewayError ? error : modelAuthorityUnavailable()
+        }
+        if (current.status === 'expired') {
+          if (ownedKey) deleteKeyDigest(context.sql, caller.accountId, ownedKey.digest)
+          throw credentialChanged()
+        }
+        if (current.status === 'authority_changed') throw credentialChanged()
+        if (current.status !== 'ok' || (mount && current.revision !== mount.revision)) throw modelChanged()
+        assertCredentialRevision(context.sql, caller.userId, current.credentialRevision)
+        if (mount && !sameAuthority(current.credentialRevision, mount.credentialRevision)) throw credentialChanged()
+        assertModelRevision(context.sql, current.revision)
+        keyStillActive()
+        mount ??= current
+        context.aclPrincipals = current.principals
+        context.groups = current.groups
+        return
+      }
       if(grant.oidc) {
         const current=await resolveFederated(grant.oidc,this.env)
         if(!sameCaller(current,authority))throw new ApiError(403,'PERMISSION_DENIED','The federated identity changed.')
@@ -361,60 +536,123 @@ export class Workspace extends DurableObject<Env> {
       await directory()
     }
     await context.reauthorize()
+    if (mount) {
+      stillMounted()
+      context.gatewayModelRevision = mount.revision
+      context.gatewayCredentialRevision = mount.credentialRevision
+      context.assertGatewayMount = stillMounted
+      context.assertActive = stillMounted
+    }
+    if (ownedKey) {
+      context.gatewayKey = ownedKey
+      delete context.remoteText
+    }
     if(grant.oidc)context.assertActive=()=>assertOidcActive(grant.oidc!)
-    if(!grant.oidc&&!grant.oauth)context.sessionSearchContext=id=>retrievalContext(context,id)
+    if(!grant.oidc&&!grant.oauth&&!ownedKey)context.sessionSearchContext=id=>retrievalContext(context,id)
     if (taskId) {
       context.assertActive = () => assertJobRunning(context.sql, taskId)
       context.taskId = taskId
       context.finishJobInTransaction = result => finishJobInTransaction(context.sql,taskId,result)
     }
-    if (!grant.oauth&&!grant.oidc) {
+    if (!grant.oauth&&!grant.oidc&&!ownedKey) {
       context.jobs = jobAccess(context, grant.digest, availableJobs)
       context.registerWatch = prepareWatchRegistrar(context,grant.digest)
+      context.urlSource = boundUrlSource(this.env)
       if (grant.managed) context.compileScheduleCredential = grant.digest
     }
-    const settings = await control?.modelSettings() ?? {}
+    if (control && !grant.oauth && !grant.oidc && !gatewayDigest && this.isAccountWorkspace(caller.accountId)) {
+      const dataOwner = { caller, digest: grant.digest, managed: grant.managed }
+      context.loadDataAuthority = async expected => {
+        try {
+          if (!grant.managed) await within(4_000, () => verifyKeyAuthority(dataOwner, this.env), modelAuthorityUnavailable)
+          return await within(4_000, () => control.dataAuthorityGrant(dataOwner, fixedCallers, expected), modelAuthorityUnavailable)
+        } catch (error) {
+          if (error instanceof ApiError && (error.status === 401 || error.status === 403)) throw dataAuthorityChanged()
+          throw dataAuthorityUnavailable()
+        }
+      }
+    }
+    const settings = mount ? mount.settings : await control?.modelSettings() ?? {}
     const embedding = workspaceEmbedding(context.sql, caller.accountId, settings.embedding?.dense ?? legacyEmbedding)
-    const embeddingBinding = bindModel(this.env, embedding)
+    const configuredEmbeddingBinding = bindModel(this.env, embedding)
+    const embeddingBinding = ownedKey && configuredEmbeddingBinding?.kind !== 'workers_ai' ? undefined : configuredEmbeddingBinding
     context.embeddingModel = embedding.model
     context.hasEmbedding = !!embeddingBinding
     context.defaultSearchLimit = settings.default_search_limit
+    context.defaultSearchScore = settings.default_search_score_threshold
+    context.useSearchSessionContext = settings.retrieval?.enable_intent
     context.embed = async texts => {
       if (embeddingBinding?.kind === 'openai') await context.reauthorize?.()
       context.assertActive?.()
+      let usage: number | undefined
       const vectors = await embed(embeddingBinding, embedding, texts,
-        count => reserveEmbeddingBudget(context.storage, caller.userId, count), count => {
-          try { reportUsage(context, { embedding: count }) }
-          catch { console.error('OpenViking Edge usage accounting unavailable') }
-        })
+        count => reserveEmbeddingBudget(context.storage, caller.userId, count), count => { usage = count })
       await context.reauthorize?.()
       context.assertActive?.()
       pinEmbedding(context.sql, embedding)
+      if (usage !== undefined) {
+        try { reportUsage(context, { embedding: usage }) }
+        catch { console.error('OpenViking Edge usage accounting unavailable') }
+      }
       return vectors
     }
     const vlm = selectedVlm(this.env, settings)
     const binding = vlm ? bindModel(this.env, vlm) : undefined
+    if (ownedKey && binding?.kind !== 'workers_ai') throw disabledKeys()
+    if (grant.gatewayKeysMounted && control && binding?.kind === 'workers_ai' && !grant.oidc && !grant.oauth && !ownedKey) {
+      const env = this.env
+      context.gatewayKeyAdmin = {
+        issuer: { caller, digest: grant.digest, managed: grant.managed },
+        async resolve(raw) {
+          let resolved: AuthGrant
+          try { resolved = await resolveDigest(await credentialDigest(raw), env) }
+          catch (error) {
+            if (error instanceof ApiError && error.status === 401) throw new GatewayError(401, 'openviking_http_401', 'The supplied OpenViking credential was not accepted.')
+            throw error
+          }
+          if (resolved.caller.role === 'root') throw new GatewayError(403, 'root_key_not_allowed', 'Root cannot back a Gateway key.')
+          return { ...resolved, caller: requireDataGrant(resolved) }
+        },
+        verify: owner => verifyKeyAuthority(owner, env),
+        register: async (owner, digest, live) => {
+          const issuer = { caller, digest: grant.digest, managed: grant.managed }
+          if (!await control.registerGatewayDigest(issuer, owner, fixedCallers, digest, live)) {
+            throw new GatewayError(403, 'forbidden', 'Gateway key issuance is no longer authorized.')
+          }
+        },
+      }
+    }
     if (!grant.oauth && !grant.oidc && vlm && binding) {
       const invoke = generation(context, binding, vlm)
       context.generate = async (messages, options) => {
         const result = await invoke(messages, options)
+        if (mount || context.dataAuthority) { await context.reauthorize?.(); context.assertActive?.() }
         try { reportUsage(context, {input:result.inputTokens,output:result.outputTokens}) }
         catch { console.error('OpenViking Edge usage accounting unavailable') }
         return result
       }
       if (binding.kind === 'workers_ai') {
         context.workersAIModel = vlm.model
-        context.generateStream = streamGeneration(context, binding.ai, vlm)
+        context.generateStream = streamGeneration(context, binding, vlm)
       } else {
         context.externalGeneration = true
         const generate = context.generate
-        context.gatewayProvider = { models: [vlm.model], async generate(model, messages, options) {
-          if (model !== vlm.model) throw new ApiError(409, 'CONFLICT', 'The configured generation model changed.')
-          return generate(messages, options)
-        } }
+        const stream = this.env.OPENVIKING_EDGE_OPERATOR_STREAMING === '1' && control && context.assertGatewayMount
+          ? streamGeneration(context, binding, vlm) : undefined
+        const check = (model: string) => { if (model !== vlm.model) throw modelChanged() }
+        context.gatewayProvider = {
+          models: [vlm.model],
+          responseScope: route?.kind === 'model' && (route.endpoint === 'responses' || route.endpoint.startsWith('responses/'))
+            ? await digest(binding.base) : undefined,
+          async generate(model, messages, options) { check(model); return generate(messages, options) },
+          ...(stream && {
+            async generateStream(model, messages, options) { check(model); return stream(messages, options) },
+            streamTextFilter: () => protectStreamText(binding.key),
+          }),
+        }
       }
     }
-    if (!grant.oauth && !grant.oidc && this.env.AI && this.env.OPENVIKING_EDGE_DOCUMENT_CONVERSION === '1') {
+    if (!grant.oauth && !grant.oidc && !ownedKey && this.env.AI && this.env.OPENVIKING_EDGE_DOCUMENT_CONVERSION === '1') {
       context.convertDocument = converter(context,this.env.AI)
     }
     return context
@@ -432,16 +670,31 @@ export class Workspace extends DurableObject<Env> {
   async dispatch(request: Request, grant: AuthGrant, id: string): Promise<Response> {
     const start = Date.now()
     const url = new URL(request.url)
-    let context: WorkspaceContext | undefined
+    let context: GatewayContext | undefined
     let response: Response
     let code: string | undefined
     try {
+      const route = gatewayPath(url.pathname)
+      if (route?.kind === 'transfer' && (grant.gatewayDigest || grant.oauth || grant.oidc)) {
+        throw new ApiError(403, 'PERMISSION_DENIED', 'Transfers require a direct tenant API key.')
+      }
       context = await this.workspaceContext(grant, undefined, request)
-      response = await this.dispatchScoped(request,url,context,id)
+      if (route?.kind === 'transfer') {
+        response = await routeGatewayTransfer(request, url, route.operation, this.env, context, grant)
+      } else if (grant.gatewayDigest) {
+        if (!isDedicatedGatewayRoute(url.pathname, request.method)) throw invalidGatewayKey()
+        context.gatewayRequestId = id
+        response = (await routeGateway(request, url, context)) ?? gatewayError(invalidGatewayKey(), id)
+      } else response = await this.dispatchScoped(request,url,context,id)
+      if (response.ok && (context.assertGatewayMount || context.dataAuthority)) {
+        // Last local boundary before the DO hands the response to the Worker.
+        try { context.assertGatewayMount?.(); context.dataAuthority?.assertCurrent() }
+        catch (error) { void response.body?.cancel().catch(() => {}); throw error }
+      }
     } catch (error) {
       // Return expected API errors across the RPC boundary without losing their typed status.
       code = error instanceof ApiError ? error.code : 'INTERNAL_ERROR'
-      response = apiError(error, id)
+      response = isGatewayPath(url.pathname) && error instanceof GatewayError ? gatewayError(error, id) : apiError(error, id)
     }
     if (context) {
       try { auditRequest(context,request,url.pathname,id,start,response.status,code) }
@@ -509,7 +762,10 @@ export class Workspace extends DurableObject<Env> {
         const context = await this.workspaceContext(grant, job.taskId)
         context.assertActive?.()
         const result = await consumer({...job.payload,taskId:job.taskId,createdAt:job.createdAt},context)
-        completeJob(storage,job.taskId,result,'ok')
+        // One-shot URL imports finalize content, reservation and the success
+        // receipt in the same protected transaction. Never supply a fallback success.
+        if (context.dataAuthority) completeJob(storage,job.taskId,null,'failed')
+        else completeJob(storage,job.taskId,result,'ok')
       } catch { completeJob(storage,job.taskId,null,'failed') }
     } finally { await scheduleNextJob(storage); await scheduleWatch(storage); await armCompileSchedule(storage) }
   }

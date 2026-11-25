@@ -1,0 +1,412 @@
+diff --git a/src/features/connection/hooks/use-edge-features.tsx b/src/features/connection/hooks/use-edge-features.tsx
+index a9dc22c..f3c5afc 100644
+--- a/src/features/connection/hooks/use-edge-features.tsx
++++ b/src/features/connection/hooks/use-edge-features.tsx
+@@ -23,7 +23,9 @@ export function EdgeFeatureProvider({ connection, management, enabled, children
+     if (!ready) return
+     const controller = new AbortController()
+     const commit = (flags: EdgeFeatures) => {
+-      if (!controller.signal.aborted) setResult({ identity, flags })
++      if (controller.signal.aborted) return
++      if (identity.management) delete flags.urlImport
++      setResult({ identity, flags })
+     }
+     void fetchEdgeFeatures(identity.baseUrl, identity.key, controller.signal).then(commit, () => commit({}))
+     return () => controller.abort()
+diff --git a/src/features/workbench/filesystem/page.tsx b/src/features/workbench/filesystem/page.tsx
+index b03821a..271333f 100644
+--- a/src/features/workbench/filesystem/page.tsx
++++ b/src/features/workbench/filesystem/page.tsx
+@@ -104,8 +104,9 @@ const routeApi = getRouteApi('/filesystem')
+ 
+ export function FilesystemRoute() {
+   const { provider } = useStudioService()
++  const { identityScopeKey } = useAppConnection()
+   return (
+-    <ResourceUploadProvider enabled={provider === 'opensource'}>
++    <ResourceUploadProvider key={EDGE_STUDIO ? identityScopeKey : undefined} enabled={provider === 'opensource'}>
+       <FilesystemWorkbench />
+     </ResourceUploadProvider>
+   )
+@@ -880,6 +881,7 @@ function FilesystemWorkbench() {
+               </DialogHeader>
+               <div className="max-h-[calc(min(86vh,760px)-6rem)] overflow-y-auto px-6 py-5">
+                 <AddResourceForm
++                  onCompleted={EDGE_STUDIO ? () => void invalidateList() : undefined}
+                   onSubmitted={() => {
+                     handleUploadDialogOpenChange(false)
+                     void invalidateList()
+diff --git a/src/features/workbench/resources/components/add-resource-page.tsx b/src/features/workbench/resources/components/add-resource-page.tsx
+index 31ecd14..d78ce4c 100644
+--- a/src/features/workbench/resources/components/add-resource-page.tsx
++++ b/src/features/workbench/resources/components/add-resource-page.tsx
+@@ -45,9 +45,20 @@ import { Textarea } from '#/shared/ui/textarea'
+ import { Tooltip, TooltipContent, TooltipTrigger } from '#/shared/ui/tooltip'
+ 
+ import { EDGE_STUDIO } from '#/shared/lib/edge-studio'
++import { useEdgeFeatures } from '#/features/connection/hooks/use-edge-features'
+ 
+ type Mode = 'upload' | 'remote'
+ 
++function isTextDocumentUrl(value: string) {
++  // Presentation only. The Worker verifies exact operator approval independently.
++  try {
++    const url = new URL(value)
++    return value.length <= 1000 && url.href === value && url.protocol === 'https:' &&
++      !url.username && !url.password && !url.port && !/[?#]/.test(value) &&
++      /\.(md|txt|csv|json)$/i.test(url.pathname)
++  } catch { return false }
++}
++
+ const DEFAULT_WEB_OPTIONS: WebResourceOptionsValue = {
+   allowExternalLinks: false,
+   depth: '1',
+@@ -104,6 +115,8 @@ export function AddResourceForm({
+   const { i18n, t } = useTranslation('addResource')
+   const { enqueueUploads, startRemote, resetRemote, remoteState } =
+     useResourceUpload()
++  const { flags, pending } = useEdgeFeatures()
++  const canImportUrl = EDGE_STUDIO && !watchRequired && !pending && flags.urlImport === true
+ 
+   const [mode, setMode] = useState<Mode>(EDGE_STUDIO ? 'upload' : watchRequired ? 'remote' : initialMode)
+   const [remoteUrl, setRemoteUrl] = useState('')
+@@ -111,6 +124,7 @@ export function AddResourceForm({
+     useState<RemoteResourceTypeSelection>('auto')
+   const [selectedFiles, setSelectedFiles] = useState<SelectedUploadFile[]>([])
+   const [targetUri, setTargetUri] = useState(initialTargetUri)
++  const [urlDestination, setUrlDestination] = useState('')
+   const [destinationMode, setDestinationMode] =
+     useState<ResourceDestinationMode>('parent')
+   const [strict, setStrict] = useState(false)
+@@ -136,7 +150,8 @@ export function AddResourceForm({
+   const [dirPickerOpen, setDirPickerOpen] = useState(false)
+ 
+   const remotePhase = remoteState.phase
+-  const activeMode = mode
++  const activeMode = EDGE_STUDIO && !canImportUrl ? 'upload' : mode
++  const edgeUrl = EDGE_STUDIO && activeMode === 'remote'
+   const displayRemoteUrl =
+     remotePhase === 'processing' ? remoteState.remoteUrl : remoteUrl
+   const skippedFiles = remoteState.skippedFiles
+@@ -146,7 +161,7 @@ export function AddResourceForm({
+       ? detectedRemoteResourceKind
+       : remoteResourceType
+   const sourceCapabilities = getRemoteResourceCapabilities(
+-    activeMode === 'remote' ? remoteResourceKind : 'unknown',
++    activeMode === 'remote' && !edgeUrl ? remoteResourceKind : 'unknown',
+   )
+   const gitSupportsHttpAuth = remoteUrl
+     .trim()
+@@ -225,7 +240,7 @@ export function AddResourceForm({
+     })
+ 
+   const handleSubmit = () => {
+-    if (mode === 'upload') {
++    if (activeMode === 'upload') {
+       if (selectedFiles.length === 0) return
+       enqueueUploads({
+         files: selectedFiles.map(({ file, fileType }) => ({ file, fileType })),
+@@ -236,9 +251,24 @@ export function AddResourceForm({
+       return
+     }
+ 
+-    if (EDGE_STUDIO) return
+     const url = remoteUrl.trim()
+     if (!url) return
++    if (EDGE_STUDIO) {
++      if (!canImportUrl || !isTextDocumentUrl(url) || remotePhase === 'processing') return
++      const destination = urlDestination.trim()
++      startRemote({
++        url,
++        commonBody: {
++          ...(!destination ? { parent: 'viking://~/resources' } : { [destinationMode]: destination }),
++          wait: false,
++          processing_mode: 'vectors_only',
++        },
++        onAccepted,
++        onCompleted,
++        onFailed,
++      })
++      return
++    }
+     startRemote({
+       url,
+       commonBody: buildCommonBody(),
+@@ -276,15 +306,21 @@ export function AddResourceForm({
+     watchRequirementMet &&
+     (activeMode === 'upload'
+       ? selectedFiles.length > 0
+-      : !!remoteUrl.trim() && hasWatchInterval)
++      : edgeUrl ? isTextDocumentUrl(remoteUrl.trim()) : !!remoteUrl.trim() && hasWatchInterval)
+ 
+   return (
+     <div className="flex flex-col gap-6">
+       <div className="space-y-5">
+-        {EDGE_STUDIO ? <p className="text-sm text-foreground">{t('studio:edge.textUploadOnly')}</p> : !watchRequired ? (
++        {EDGE_STUDIO && !canImportUrl ? (
++          <p className="text-sm text-foreground" role="status">
++            {t(pending ? 'studio:edge.urlImportChecking' : 'studio:edge.textUploadOnly')}
++          </p>
++        ) : !watchRequired ? (
+           <div className="flex gap-1 rounded-lg bg-muted p-1">
+             <button
+               type="button"
++              aria-pressed={activeMode === 'upload'}
++              disabled={edgeUrl && remotePhase === 'processing'}
+               className={`flex flex-1 items-center justify-center gap-2 rounded-md px-3 py-2 text-sm font-medium transition-colors ${
+                 activeMode === 'upload'
+                   ? 'bg-background text-foreground shadow-sm'
+@@ -297,6 +333,7 @@ export function AddResourceForm({
+             </button>
+             <button
+               type="button"
++              aria-pressed={activeMode === 'remote'}
+               className={`flex flex-1 items-center justify-center gap-2 rounded-md px-3 py-2 text-sm font-medium transition-colors ${
+                 activeMode === 'remote'
+                   ? 'bg-background text-foreground shadow-sm'
+@@ -318,6 +355,7 @@ export function AddResourceForm({
+           />
+         ) : (
+           <RemoteResourceFields
++            approvedTextOnly={edgeUrl}
+             disabled={remotePhase === 'processing'}
+             onResourceTypeChange={handleRemoteResourceTypeChange}
+             onUrlChange={handleRemoteUrlChange}
+@@ -368,19 +406,19 @@ export function AddResourceForm({
+           <div className="space-y-2 rounded-lg border border-border/50 bg-muted/10 p-4">
+             <div className="flex items-center gap-2">
+               <Loader2Icon className="size-4 animate-spin text-muted-foreground" />
+-              <p className="text-sm text-muted-foreground">
+-                {t('upload.processing')}
++              <p className="text-sm text-muted-foreground" role={edgeUrl ? 'status' : undefined}>
++                {t(edgeUrl ? 'studio:edge.urlImportProcessing' : 'upload.processing')}
+               </p>
+             </div>
+-            <Button variant="outline" size="sm" onClick={handleReset}>
++            {!edgeUrl && <Button variant="outline" size="sm" onClick={handleReset}>
+               {t('cancelUpload')}
+-            </Button>
++            </Button>}
+           </div>
+         ) : null}
+ 
+         {activeMode === 'remote' && remotePhase === 'done' ? (
+           <div className="space-y-3 rounded-lg border border-border/50 bg-muted/10 p-4">
+-            <div className="flex items-center gap-2 text-sm font-medium text-green-600 dark:text-green-400">
++            <div role={edgeUrl ? 'status' : undefined} className="flex items-center gap-2 text-sm font-medium text-green-600 dark:text-green-400">
+               <CheckCircle2 className="size-4" />
+               {t('result.success')}
+             </div>
+@@ -406,18 +444,23 @@ export function AddResourceForm({
+           </div>
+         ) : null}
+ 
++        {edgeUrl && remoteState.error ? (
++          <p className="break-words text-sm text-destructive" role="alert">{remoteState.error}</p>
++        ) : null}
++
+         <ResourceDestinationFields
+           disabled={remotePhase === 'processing'}
+           exactOnly={sourceCapabilities.exactDestination}
++          approvedTextOnly={edgeUrl}
+           mode={effectiveDestinationMode}
+           onBrowse={() => setDirPickerOpen(true)}
+           onModeChange={setDestinationMode}
+-          onUriChange={setTargetUri}
++          onUriChange={edgeUrl ? setUrlDestination : setTargetUri}
+           t={t}
+-          uri={targetUri}
++          uri={edgeUrl ? urlDestination : targetUri}
+         />
+ 
+-        <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
++        {!edgeUrl && <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
+           <CollapsibleTrigger className="flex items-center gap-1 text-sm font-medium text-muted-foreground hover:text-foreground">
+             <ChevronRight
+               className={`size-4 transition-transform ${advancedOpen ? 'rotate-90' : ''}`}
+@@ -558,7 +601,7 @@ export function AddResourceForm({
+               ) : null}
+             </div>
+           </CollapsibleContent>
+-        </Collapsible>
++        </Collapsible>}
+ 
+         <Button
+           onClick={handleSubmit}
+@@ -576,8 +619,8 @@ export function AddResourceForm({
+       <DirectoryPickerDialog
+         open={dirPickerOpen}
+         onOpenChange={setDirPickerOpen}
+-        value={targetUri}
+-        onSelect={setTargetUri}
++        value={edgeUrl ? urlDestination || 'viking://~/resources' : targetUri}
++        onSelect={edgeUrl ? setUrlDestination : setTargetUri}
+       />
+     </div>
+   )
+diff --git a/src/features/workbench/resources/components/remote-resource-fields.tsx b/src/features/workbench/resources/components/remote-resource-fields.tsx
+index bc184a8..94fb6d5 100644
+--- a/src/features/workbench/resources/components/remote-resource-fields.tsx
++++ b/src/features/workbench/resources/components/remote-resource-fields.tsx
+@@ -13,6 +13,7 @@ import { Label } from '#/shared/ui/label'
+ import { Switch } from '#/shared/ui/switch'
+ 
+ type RemoteResourceFieldsProps = {
++  approvedTextOnly?: boolean
+   children?: ReactNode
+   disabled: boolean
+   onUrlChange: (value: string) => void
+@@ -38,6 +39,7 @@ function getRemoteUrlPlaceholder(
+ }
+ 
+ export function RemoteResourceFields({
++  approvedTextOnly = false,
+   children,
+   disabled,
+   onUrlChange,
+@@ -57,38 +59,39 @@ export function RemoteResourceFields({
+ 
+   return (
+     <div className="space-y-4">
+-      <RemoteResourceTypePicker
++      {!approvedTextOnly && <RemoteResourceTypePicker
+         disabled={disabled}
+         onChange={onResourceTypeChange}
+         t={t}
+         value={resourceType}
+         watchRequired={watchRequired}
+-      />
++      />}
+ 
+       <div className="space-y-2">
+         <div className="flex items-center justify-between gap-3">
+           <Label htmlFor="add-resource-remote-url">{t('remoteUrl')}</Label>
+-          {resourceKind !== 'unknown' ? (
++          {!approvedTextOnly && resourceKind !== 'unknown' ? (
+             <Badge variant="secondary">{t(`sourceKind.${resourceKind}`)}</Badge>
+           ) : null}
+         </div>
+         <Input
+           id="add-resource-remote-url"
+-          placeholder={remoteUrlPlaceholder}
++          aria-describedby={approvedTextOnly ? 'add-resource-remote-policy' : undefined}
++          placeholder={approvedTextOnly ? undefined : remoteUrlPlaceholder}
+           value={url}
+           onChange={(event) => onUrlChange(event.target.value)}
+           disabled={disabled || (watchRequired && !watchSupported)}
+         />
+-        <p className="text-xs text-muted-foreground">
+-          {resourceKind === 'unknown'
++        <p id={approvedTextOnly ? 'add-resource-remote-policy' : undefined} className="text-xs text-muted-foreground">
++          {approvedTextOnly ? t('studio:edge.urlImportHint') : resourceKind === 'unknown'
+             ? t('remoteUrl.hint')
+             : t(`sourceKind.${resourceKind}Hint`)}
+         </p>
+       </div>
+ 
+-      {children}
++      {!approvedTextOnly && children}
+ 
+-      <div className="rounded-lg border border-border/60 bg-muted/10 p-4">
++      {!approvedTextOnly && <div className="rounded-lg border border-border/60 bg-muted/10 p-4">
+         <div className="flex items-start justify-between gap-4">
+           <div className="grid gap-1">
+             <Label htmlFor="add-resource-watch-enabled">
+@@ -129,7 +132,7 @@ export function RemoteResourceFields({
+             </p>
+           </div>
+         ) : null}
+-      </div>
++      </div>}
+     </div>
+   )
+ }
+diff --git a/src/features/workbench/resources/components/resource-destination-fields.tsx b/src/features/workbench/resources/components/resource-destination-fields.tsx
+index 4d88cc3..237298d 100644
+--- a/src/features/workbench/resources/components/resource-destination-fields.tsx
++++ b/src/features/workbench/resources/components/resource-destination-fields.tsx
+@@ -17,6 +17,7 @@ type ResourceDestinationFieldsProps = {
+   t: TFunction<'addResource'>
+   uri: string
+   exactOnly?: boolean
++  approvedTextOnly?: boolean
+ }
+ 
+ export function ResourceDestinationFields({
+@@ -28,6 +29,7 @@ export function ResourceDestinationFields({
+   t,
+   uri,
+   exactOnly = false,
++  approvedTextOnly = false,
+ }: ResourceDestinationFieldsProps) {
+   return (
+     <div className="space-y-2">
+@@ -54,6 +56,7 @@ export function ResourceDestinationFields({
+       <div className="flex gap-2">
+         <Input
+           id="add-resource-target"
++          aria-describedby={approvedTextOnly ? 'add-resource-target-policy' : undefined}
+           placeholder={t('targetUri.placeholder')}
+           value={uri}
+           disabled={disabled}
+@@ -72,8 +75,8 @@ export function ResourceDestinationFields({
+           {t('targetUri.browse')}
+         </Button>
+       </div>
+-      <p className="text-xs text-muted-foreground">
+-        {exactOnly
++      <p id={approvedTextOnly ? 'add-resource-target-policy' : undefined} className="text-xs text-muted-foreground">
++        {approvedTextOnly ? t('studio:edge.urlImportDestination') : exactOnly
+           ? t('destination.tosHint')
+           : mode === 'parent'
+             ? t('destination.parentHint')
+diff --git a/src/i18n/locales/en/studio.ts b/src/i18n/locales/en/studio.ts
+index 5a3575d..4117c1c 100644
+--- a/src/i18n/locales/en/studio.ts
++++ b/src/i18n/locales/en/studio.ts
+@@ -9,9 +9,13 @@ const studio = {
+     keyRejected: 'This server rejected the API key. Check the key and try again.',
+     unsupportedTitle: 'Not available on this server',
+     unsupportedDescription: 'This Studio page needs an API that is not available on this deployment.',
+-    limitedNotice: 'VikingBot and other optional features require server support. Remote URL imports are not available on this deployment.',
++    limitedNotice: 'VikingBot, URL import and other optional features require server support.',
+     workspaceRequired: 'Use a separate User API key to open the workspace.',
+     textUploadOnly: 'Choose local UTF-8 text files. Remote URLs and folder imports are not available here.',
++    urlImportChecking: 'Checking URL import availability… You can still choose local files.',
++    urlImportProcessing: 'Importing and indexing the document…',
++    urlImportHint: 'Use an exact HTTPS URL approved by your operator (.md, .txt, .csv or .json). No sign-in, query or fragment.',
++    urlImportDestination: 'Leave blank to use your private resources. Otherwise choose an existing resources folder or enter an exact file URI.',
+     dataProfile: 'Workspace',
+     controlProfile: 'Administration',
+     controlKey: 'Root or account Admin API key',
+diff --git a/src/i18n/locales/zh-CN/studio.ts b/src/i18n/locales/zh-CN/studio.ts
+index b1fc9b0..69738a6 100644
+--- a/src/i18n/locales/zh-CN/studio.ts
++++ b/src/i18n/locales/zh-CN/studio.ts
+@@ -9,9 +9,13 @@ const studio = {
+     keyRejected: '服务器拒绝了此 API 密钥。请检查密钥后重试。',
+     unsupportedTitle: '此服务器不支持',
+     unsupportedDescription: '此 Studio 页面需要当前部署未提供的 API。',
+-    limitedNotice: 'VikingBot 等可选功能须由服务器提供。此部署不支持远程 URL 导入。',
++    limitedNotice: 'VikingBot、URL 导入及其他可选功能须由服务器提供。',
+     workspaceRequired: '使用单独的用户 API 密钥打开工作区。',
+     textUploadOnly: '请选择本地 UTF-8 文本文件。此处不支持远程 URL 或文件夹导入。',
++    urlImportChecking: '正在检查是否支持 URL 导入…仍可选择本地文件。',
++    urlImportProcessing: '正在导入文档并建立索引…',
++    urlImportHint: '请输入由管理员预先批准的完整 HTTPS 文档 URL（.md、.txt、.csv 或 .json）。不支持登录凭据、查询参数或片段。',
++    urlImportDestination: '留空将导入到您的私有资源。也可选择已有的资源目录，或输入完整的目标文件 URI。',
+     dataProfile: '工作区',
+     controlProfile: '管理',
+     controlKey: 'Root 或账号管理员 API 密钥',
+diff --git a/src/shared/lib/edge-capabilities.ts b/src/shared/lib/edge-capabilities.ts
+index 7233b51..113d9b2 100644
+--- a/src/shared/lib/edge-capabilities.ts
++++ b/src/shared/lib/edge-capabilities.ts
+@@ -1,6 +1,6 @@
+ import { allowsStudioApiBase, EDGE_STUDIO } from './edge-studio'
+ 
+-const keys = ['control', 'packImport', 'packExport', 'searchProvenance', 'bot', 'compile', 'skills', 'snapshots', 'webdav', 'oauth', 'watches', 'monitoring', 'gatewayKeys'] as const
++const keys = ['control', 'packImport', 'packExport', 'searchProvenance', 'bot', 'compile', 'skills', 'snapshots', 'webdav', 'oauth', 'watches', 'monitoring', 'gatewayKeys', 'urlImport'] as const
+ export type EdgeFeatures = Partial<Record<(typeof keys)[number], true>>
+ export const gatewayKeysPath = '/admin/gateway/keys'
+ export function isEdgeGatewayKeysPath(path: string): boolean {

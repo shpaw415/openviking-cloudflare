@@ -6,11 +6,15 @@ export const embeddingModel = '@cf/baai/bge-base-en-v1.5'
 export const embeddingDimensions = 768
 export const configFileLimit = 16 * 1024
 export const maxGenerationTokens = 2048
+export const edgeSearchDefaults = { limit: 10, score: 0.1, sessionContext: true } as const
+const reasoningEfforts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'] as const
+type ReasoningEffort = typeof reasoningEfforts[number]
 
 type Selection = { provider: 'workers_ai'; model: string } | { provider: 'openai'; model: string; api_base: string }
-export type VlmConfig = Selection & { temperature?: number; max_tokens?: number; timeout?: number }
+export type VlmConfig = Selection & { temperature?: number; max_tokens?: number; timeout?: number; reasoning_effort?: ReasoningEffort }
 export type EmbeddingConfig = Selection & { dimension: number; input: 'text' }
-export type ModelSettings = { vlm?: VlmConfig; embedding?: { dense: EmbeddingConfig }; default_search_limit?: number }
+export type ModelSettings = { vlm?: VlmConfig; embedding?: { dense: EmbeddingConfig }; default_search_limit?: number;
+  default_search_score_threshold?: number; retrieval?: { enable_intent: false } }
 export type ModelEnv = { AI?: Ai; OPENVIKING_EDGE_GENERATION?: string; OPENVIKING_EDGE_PROVIDERS?: string }
 export type BoundModel = { kind: 'workers_ai'; ai: Ai } | { kind: 'openai'; base: string; key: string }
 
@@ -88,18 +92,24 @@ function bounded(value: unknown, min: number, max: number, name: string, integer
 }
 
 export function patchModels(current: ModelSettings, body: Record<string, unknown>, env: ModelEnv): ModelSettings {
-  object(body, ['vlm', 'embedding', 'default_search_limit'], 'the configuration file')
+  object(body, ['vlm', 'embedding', 'default_search_limit', 'default_search_score_threshold', 'retrieval'], 'the configuration file')
   if (!Object.keys(body).length) throw bad('The configuration file is empty.')
   const result = { ...current }
   if (body.vlm === null) delete result.vlm
   else if (body.vlm !== undefined) {
-    const value = object(body.vlm, ['provider', 'model', 'api_base', 'temperature', 'max_tokens', 'timeout'], 'vlm')
-    const model: VlmConfig = selection(value, env)
-    if (value.temperature !== undefined) model.temperature = bounded(value.temperature, 0, 2, 'vlm.temperature', false)
-    if (value.max_tokens !== undefined) model.max_tokens = bounded(value.max_tokens, 1, maxGenerationTokens, 'vlm.max_tokens', true)
+    const value = object(body.vlm, ['provider', 'backend', 'model', 'api_base', 'temperature', 'max_tokens', 'timeout', 'reasoning_effort'], 'vlm')
+    if (value.backend !== undefined && value.provider !== undefined && value.backend !== value.provider) throw bad('vlm.backend and vlm.provider must match.')
+    const model: VlmConfig = selection({ ...value, provider: value.provider ?? value.backend }, env)
+    if (value.temperature != null) model.temperature = bounded(value.temperature, 0, 2, 'vlm.temperature', false)
+    if (value.max_tokens != null) model.max_tokens = bounded(value.max_tokens, 1, maxGenerationTokens, 'vlm.max_tokens', true)
     if (value.timeout !== undefined) {
       if (model.provider !== 'openai') throw unsupported('vlm.timeout is only configurable for OpenAI-compatible HTTP providers.')
       model.timeout = bounded(value.timeout, 1, 25, 'vlm.timeout', false)
+    }
+    if (value.reasoning_effort != null) {
+      if (model.provider !== 'openai') throw unsupported('vlm.reasoning_effort requires a compatible HTTP chat model.')
+      if (!reasoningEfforts.includes(value.reasoning_effort as ReasoningEffort)) throw bad('Unsupported vlm.reasoning_effort value.')
+      model.reasoning_effort = value.reasoning_effort as ReasoningEffort
     }
     result.vlm = model
   }
@@ -118,5 +128,16 @@ export function patchModels(current: ModelSettings, body: Record<string, unknown
   }
   if (body.default_search_limit === null) delete result.default_search_limit
   else if (body.default_search_limit !== undefined) result.default_search_limit = bounded(body.default_search_limit, 1, 50, 'default_search_limit', true)
+  if (body.default_search_score_threshold === null) delete result.default_search_score_threshold
+  else if (body.default_search_score_threshold !== undefined) {
+    result.default_search_score_threshold = bounded(body.default_search_score_threshold, 0, 1, 'default_search_score_threshold', false)
+  }
+  if (body.retrieval === null) delete result.retrieval
+  else if (body.retrieval !== undefined) {
+    const value = object(body.retrieval, ['enable_intent'], 'retrieval')
+    if (typeof value.enable_intent !== 'boolean') throw bad('retrieval.enable_intent must be a boolean.')
+    if (value.enable_intent) throw unsupported('Edge does not run the upstream LLM intent planner. Use false or reset retrieval to null for local session context.')
+    result.retrieval = { enable_intent: false }
+  }
   return result
 }

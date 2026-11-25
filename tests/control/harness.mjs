@@ -58,7 +58,7 @@ export async function harness(t, fixed = [], { production = false, filesystem = 
     absWorkingDir: project, entryPoints: [production ? 'src/worker.ts' : filesystem ? 'tests/control/filesystem-worker.ts' : 'tests/control/worker.ts'],
     bundle: true, external: ['cloudflare:workers'], format: 'esm', platform: 'browser', write: false,
   })
-  const dir = await mkdtemp('/tmp/opencode/ov-control-')
+  const dir = await mkdtemp(process.env.OV_TEST_DIR ? resolve(process.env.OV_TEST_DIR, 'ov-control-') : '/tmp/opencode/ov-control-')
   const socketPath = resolve(dir, 'api.sock')
   const root = randomBytes(32).toString('hex')
   let child, exited

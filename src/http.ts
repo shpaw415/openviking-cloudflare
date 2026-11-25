@@ -21,27 +21,32 @@ export function apiError(error: unknown, requestId: string): Response {
   return Response.json({ status: 'error', error: { code, message } }, { status, headers })
 }
 
-export async function readBytes(request: Request | Response, maxBytes: number): Promise<Uint8Array<ArrayBuffer>> {
+export async function readBytes(request: Request | Response, maxBytes: number, signal?: AbortSignal): Promise<Uint8Array<ArrayBuffer>> {
+  signal?.throwIfAborted()
   const taggedLength = request.headers.get('content-length')
   if (taggedLength !== null && (!/^\d+$/.test(taggedLength) || Number(taggedLength) > maxBytes)) {
     throw new ApiError(413, 'RESOURCE_EXHAUSTED', `Request body exceeds ${maxBytes} bytes.`)
   }
   if (!request.body) return new Uint8Array(0)
   const reader = request.body.getReader()
+  const cancel = () => { void reader.cancel().catch(() => {}) }
+  signal?.addEventListener('abort', cancel, { once: true })
   const chunks: Uint8Array[] = []
   let size = 0
   try {
     for (;;) {
       const { done, value } = await reader.read()
+      signal?.throwIfAborted()
       if (done) break
       size += value.byteLength
       if (size > maxBytes) {
-        void reader.cancel().catch(() => {})
+        cancel()
         throw new ApiError(413, 'RESOURCE_EXHAUSTED', `Request body exceeds ${maxBytes} bytes.`)
       }
       chunks.push(value)
     }
   } finally {
+    signal?.removeEventListener('abort', cancel)
     reader.releaseLock()
   }
   const data = new Uint8Array(size)
@@ -57,12 +62,12 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
-export async function readJson(request: Request | Response, maxBytes = 512 * 1024): Promise<Record<string, unknown>> {
+export async function readJson(request: Request | Response, maxBytes = 512 * 1024, signal?: AbortSignal): Promise<Record<string, unknown>> {
   const type = request.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase()
   if (type !== 'application/json') {
     throw new ApiError(415, 'INVALID_ARGUMENT', 'Expected an application/json body.')
   }
-  const raw = await readBytes(request, maxBytes)
+  const raw = await readBytes(request, maxBytes, signal)
   let parsed: unknown
   try {
     parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(raw))

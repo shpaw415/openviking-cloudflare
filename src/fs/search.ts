@@ -14,6 +14,7 @@ import { admitsFileLevels, readFileLevels } from './file-levels.js'
 import type { FileLevel } from './file-levels.js'
 import { portableFilter, timeBound } from './filters.js'
 import type { SearchRecord } from './filters.js'
+import { edgeSearchDefaults } from '../model-config.js'
 
 const contextTypes = ['resource', 'memory', 'skill'] as const
 const maxHits = 50
@@ -67,9 +68,9 @@ export async function rankedHits(fs: Filesystem, body: Record<string, unknown>, 
     .flatMap(item => str(item, 'context_type', undefined, 128).split(',').map(part => part.trim().toLowerCase()).filter(Boolean))
   if (selected.some(type => !contextTypes.includes(type as ContextKind))) invalid('Unknown context_type.')
   const requested = levels(body.level)
-  const fallback = int(body.limit, 'limit', fs.ctx.defaultSearchLimit ?? 10, 1, maxHits)
+  const fallback = int(body.limit, 'limit', fs.ctx.defaultSearchLimit ?? edgeSearchDefaults.limit, 1, maxHits)
   const limit = int(body.node_limit ?? undefined, 'node_limit', fallback, 1, maxHits)
-  const threshold = body.score_threshold ?? 0.1
+  const threshold = body.score_threshold ?? fs.ctx.defaultSearchScore ?? edgeSearchDefaults.score
   if (typeof threshold !== 'number' || !Number.isFinite(threshold) || threshold < -1 || threshold > 1) invalid('score_threshold must be between -1 and 1.')
   const min: number = threshold
   const timeField = choice(body.time_field ?? undefined, 'time_field', ['created_at', 'updated_at'] as const, 'updated_at')
@@ -82,8 +83,9 @@ export async function rankedHits(fs: Filesystem, body: Record<string, unknown>, 
   if (!query && !filter && !wanted.length && !selected.length && since === undefined && until === undefined) invalid('A nonempty query or metadata filter is required.')
   bool(body.include_provenance, 'include_provenance')
   const readContent = bool(body.read_content, 'read_content')
-  const session = str(body.session_id ?? undefined, 'session_id', '', 128)
-  if (session && !query) invalid('A text query is required when using session context.')
+  const requestedSession = str(body.session_id ?? undefined, 'session_id', '', 128)
+  if (requestedSession && !query) invalid('A text query is required when using session context.')
+  const session = fs.ctx.useSearchSessionContext === false ? '' : requestedSession
   const sessionContext = () => {
     if (!fs.ctx.sessionSearchContext) unsupported('Session context is unavailable for this identity.')
     const result = fs.ctx.sessionSearchContext(session)

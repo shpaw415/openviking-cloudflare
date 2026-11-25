@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import type { Caller, ModelMessage, WorkspaceContext } from '../context.js'
+import type { Caller, GenerationStream, ModelMessage, WorkspaceContext } from '../context.js'
+import type { AuthorityAdvance, AuthorityRevision } from '../data-authority.js'
 import { GatewayError, encoder, safeError, within } from './contract.js'
 import type { Protocol } from './contract.js'
+import { credentialChanged, modelChanged } from './model-authority.js'
 import type { Metrics } from './store.js'
 import { generationPieces, streamTimeout, translateStreamFailure } from './sse-source.js'
 import type { Finish, Usage } from './sse-source.js'
@@ -19,14 +21,14 @@ const actorKey = (actor: GatewayStreamActor) => `${userKey(actor)}/${actor.agent
 const cancellationKey = (id: string, actor: GatewayStreamActor) => `${actorKey(actor)}/${id}`
 
 export class StreamRegistry {
-  readonly #active = new Map<string, { actor: string; notify: () => void; until: number }>()
+  readonly #active = new Map<string, { actor: string; account: string; user: string; notify: (cause: GatewayError) => void; until: number; revision?: number; credentialRevision?: AuthorityRevision }>()
   readonly #cancelled = new Map<string, { user: string; until: number }>()
 
   constructor(private readonly limits = { tombstones: 256, perUser: 16, ttlMs: 60_000 }) {}
 
   #expire(now: number) {
     for (const [key, item] of this.#cancelled) if (item.until <= now) this.#cancelled.delete(key)
-    for (const [id, item] of this.#active) if (item.until <= now) { this.#active.delete(id); item.notify() }
+    for (const [id, item] of this.#active) if (item.until <= now) { this.#active.delete(id); item.notify(clientGone()) }
   }
 
   cancel(id: string, actor: GatewayStreamActor, now = Date.now()): void {
@@ -35,7 +37,7 @@ export class StreamRegistry {
     this.#expire(now)
     const current = this.#active.get(id)
     if (current) {
-      if (current.actor === actorKey(actor)) current.notify()
+      if (current.actor === actorKey(actor)) current.notify(clientGone())
       return
     }
 
@@ -67,11 +69,31 @@ export class StreamRegistry {
     }
   }
 
-  register(id: string, actor: GatewayStreamActor, notify: () => void, until: number, now = Date.now()): () => void {
+  register(id: string, actor: GatewayStreamActor, notify: (cause: GatewayError) => void, until: number, now = Date.now(), revision?: number,
+    credentialRevision?: AuthorityRevision): () => void {
     this.admit(id, actor, now)
-    const item = { actor: actorKey(actor), notify, until }
+    const item = { actor: actorKey(actor), account: actor.accountId, user: actor.userId, notify, until, revision, credentialRevision }
     this.#active.set(id, item)
     return () => { if (this.#active.get(id) === item) this.#active.delete(id) }
+  }
+
+  invalidateModel(account: string, revision: number): void {
+    for (const item of this.#active.values()) {
+      if (item.account === account && item.revision !== undefined && item.revision < revision) item.notify(modelChanged())
+    }
+  }
+
+  invalidateCredentials(account: string, advance: AuthorityAdvance): void {
+    const members = advance.scope === 'members' ? new Map(advance.floors) : undefined
+    for (const item of this.#active.values()) if (item.account === account && item.credentialRevision) {
+      const retired = advance.scope === 'account' ? item.credentialRevision.account < advance.revision :
+        item.credentialRevision.member < (members!.get(item.user) ?? 0)
+      if (retired) item.notify(credentialChanged())
+    }
+  }
+
+  invalidateRouting(account: string): void {
+    for (const item of this.#active.values()) if (item.account === account) item.notify(modelChanged())
   }
 }
 
@@ -92,10 +114,28 @@ export function checkStreamAdmission(storage: DurableObjectStorage, requestId: s
   registry(storage).admit(requestId, actor)
 }
 
+export function invalidateGatewayStreams(storage: DurableObjectStorage, account: string, revision: number): void {
+  // Wake a blocked reader for prompt cancellation. Ordering still relies on
+  // the durable Workspace fence, not on when this notification is delivered.
+  registries.get(storage)?.invalidateModel(account, revision)
+}
+
+export function invalidateGatewayCredentials(storage: DurableObjectStorage, account: string, advance: AuthorityAdvance): void {
+  registries.get(storage)?.invalidateCredentials(account, advance)
+}
+
+export function invalidateGatewayRouting(storage: DurableObjectStorage, account: string): void {
+  registries.get(storage)?.invalidateRouting(account)
+}
+
 type StreamOptions = {
   request: Request; ctx: WorkspaceContext; messages: ModelMessage[]; maxTokens: number
   protocol: Protocol; model: string; note: string; includeUsage: boolean; metrics: Metrics
+  source: GenerationStream; external: boolean
+  textFilter?: (delta: string, final?: boolean) => string
   response?: ResponseMeta
+  modelRevision?: number
+  credentialRevision?: AuthorityRevision
   guard: () => void
   publish: (text: string, guard: () => void, snapshot?: unknown) => Promise<unknown>
   release: () => void
@@ -109,13 +149,13 @@ export async function streamTurn(options: StreamOptions): Promise<Response> {
   let output: ReadableStreamDefaultController<Uint8Array> | undefined
   let finished = false, readerCancelled = false, lastCheck = 0, returned = false
   const requestSignal = request.signal
-  const wire = sseWire(options.protocol, options.model, metrics.request_id, options.note, options.includeUsage, options.response)
+  const wire = sseWire(options.protocol, options.model, metrics.request_id, options.note, options.includeUsage, options.response, options.external)
   // Resume cleanup in the originating RPC's I/O context, not in the separate
   // notification RPC that observes the HTTP disconnect.
   let resolveDisconnect!: (cause?: GatewayError) => void
   const disconnect = new Promise<GatewayError | undefined>(resolve => { resolveDisconnect = resolve })
   const unregister = registry(ctx.storage).register(metrics.request_id, ctx.caller,
-    () => resolveDisconnect(clientGone()), started + maxLifetime + 1000)
+    resolveDisconnect, started + maxLifetime + 1000, started, options.modelRevision, options.credentialRevision)
   void disconnect.then(cause => { if (cause) fail(cause) })
   const since = () => Date.now() - started
   const fence = () => {
@@ -196,7 +236,7 @@ export async function streamTurn(options: StreamOptions): Promise<Response> {
     await reauthorize(true)
     let source: ReadableStream<Uint8Array>
     try {
-      source = await within(12_000, () => wait(ctx.generateStream!(options.messages, { maxTokens: options.maxTokens, signal }).then(stream => {
+      source = await within(12_000, () => wait(options.source(options.messages, { maxTokens: options.maxTokens, signal }).then(stream => {
         // A late opening after client cancellation/timeout must not leave a live provider body.
         if (signal.aborted) { if (stream instanceof ReadableStream) void stream.cancel().catch(() => {}); throw signal.reason }
         return stream
@@ -204,7 +244,7 @@ export async function streamTurn(options: StreamOptions): Promise<Response> {
     } catch (error) { throw translateStreamFailure(error) }
     if (!(source instanceof ReadableStream) || source.locked) throw new GatewayError(503, 'generation_unavailable', 'The generation binding did not supply a readable stream.')
     reader = source.getReader()
-    const pieces = generationPieces(reader, wait)
+    const pieces = generationPieces(reader, wait, options.external, options.textFilter)
     const first = await pieces.next()
     if (first.done || !('delta' in first.value)) throw new GatewayError(502, 'stream_incomplete', 'The generation stream supplied no text delta.')
     await reauthorize(true)
@@ -218,6 +258,7 @@ export async function streamTurn(options: StreamOptions): Promise<Response> {
           if (opening) {
             opening = false
             await reauthorize()
+            fence()
             out.enqueue(encoder.encode(wire.opening() + wire.delta(initial)))
             metrics.first_chunk_ms = since()
             return
@@ -227,6 +268,7 @@ export async function streamTurn(options: StreamOptions): Promise<Response> {
           if (current.done) throw new GatewayError(502, 'stream_incomplete', 'The generation stream ended unexpectedly.')
           if ('delta' in current.value) {
             await reauthorize()
+            fence()
             out.enqueue(encoder.encode(wire.delta(current.value.delta)))
             return
           }
@@ -243,6 +285,7 @@ export async function streamTurn(options: StreamOptions): Promise<Response> {
             metrics.capture_status = 'disabled'
             metrics.capture_reason = 'provider_incomplete'
           }
+          fence()
           emitSuccess(out, text, reason, usage)
         } catch (error) { fail(safeError(error)) }
       },

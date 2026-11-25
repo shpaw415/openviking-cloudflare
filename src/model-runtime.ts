@@ -5,15 +5,17 @@ import { openAIBase } from './model-config.js'
 import type { BoundModel, EmbeddingConfig, VlmConfig } from './model-config.js'
 
 type OpenAI = Extract<BoundModel, { kind: 'openai' }>
+const httpOptions = (binding: OpenAI, body: object, signal: AbortSignal, accept: string): RequestInit => ({
+  method: 'POST', redirect: 'manual', signal,
+  headers: { accept, 'content-type': 'application/json', authorization: `Bearer ${binding.key}` },
+  body: JSON.stringify(body),
+})
 const invoke = (ai: Ai, model: string, input: unknown) =>
   (ai as unknown as { run(model: string, input: unknown): Promise<unknown> }).run(model, input)
 
 async function post(binding: OpenAI, operation: 'chat/completions' | 'embeddings', body: object, timeout: number, limit: number) {
-  const response = await fetch(`${binding.base}/${operation}`, {
-    method: 'POST', redirect: 'manual', signal: AbortSignal.timeout(Math.ceil(timeout * 1000)),
-    headers: { accept: 'application/json', 'content-type': 'application/json', authorization: `Bearer ${binding.key}` },
-    body: JSON.stringify(body),
-  })
+  const response = await fetch(`${binding.base}/${operation}`,
+    httpOptions(binding, body, AbortSignal.timeout(Math.ceil(timeout * 1000)), 'application/json'))
   try {
     if (response.status !== 200) throw new Error('Model request failed.')
     return await readJson(response, limit)
@@ -28,13 +30,32 @@ export function workersChat(ai: Ai, config: VlmConfig, messages: ModelMessage[],
     ...(config.temperature === undefined ? {} : { temperature: config.temperature }) })
 }
 
-export async function modelChat(binding: BoundModel, config: VlmConfig, messages: ModelMessage[], max: number): Promise<unknown> {
-  if (binding.kind === 'workers_ai') return workersChat(binding.ai, config, messages, max, false)
-  const data = await post(binding, 'chat/completions', {
-    model: config.model, messages, stream: false,
+function httpChatBody(binding: OpenAI, config: VlmConfig, messages: ModelMessage[], max: number, stream: boolean) {
+  return {
+    model: config.model, messages, stream,
     ...(binding.base === openAIBase ? { max_completion_tokens: max } : { max_tokens: max }),
     ...(config.temperature === undefined ? {} : { temperature: config.temperature }),
-  }, config.timeout ?? 20, 256 * 1024)
+    ...(config.reasoning_effort === undefined ? {} : { reasoning_effort: config.reasoning_effort }),
+    // Only the official endpoint is known to support this option. Other
+    // compatible providers may send usage themselves; never retry without it.
+    ...(stream && binding.base === openAIBase && { stream_options: { include_usage: true } }),
+  }
+}
+
+export async function modelChatStream(binding: BoundModel, config: VlmConfig, messages: ModelMessage[], max: number, signal: AbortSignal): Promise<unknown> {
+  if (binding.kind === 'workers_ai') return workersChat(binding.ai, config, messages, max, true)
+  const response = await fetch(`${binding.base}/chat/completions`,
+    httpOptions(binding, httpChatBody(binding, config, messages, max, true), signal, 'text/event-stream'))
+  if (response.status !== 200 || !response.body || response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase() !== 'text/event-stream') {
+    void response.body?.cancel().catch(() => {})
+    throw new Error('The provider did not return an SSE body.')
+  }
+  return response.body
+}
+
+export async function modelChat(binding: BoundModel, config: VlmConfig, messages: ModelMessage[], max: number): Promise<unknown> {
+  if (binding.kind === 'workers_ai') return workersChat(binding.ai, config, messages, max, false)
+  const data = await post(binding, 'chat/completions', httpChatBody(binding, config, messages, max, false), config.timeout ?? 20, 256 * 1024)
   const choice: unknown = Array.isArray(data.choices) && data.choices.length === 1 ? data.choices[0] : undefined
   if (!isRecord(choice) || !isRecord(choice.message) || choice.message.role !== 'assistant' || choice.message.function_call != null ||
       (choice.message.tool_calls != null && !(Array.isArray(choice.message.tool_calls) && choice.message.tool_calls.length === 0)) ||

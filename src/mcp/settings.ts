@@ -19,6 +19,21 @@ export function addLocations({ caller, sql }: WorkspaceContext): Settings {
     caller.accountId, caller.userId).toArray()[0] ?? { resource_uri: null, skill_uri: null }
 }
 
+/** A validated write in the caller's existing transaction. */
+export function writeAddLocations(ctx: WorkspaceContext, before: Settings, { resource_uri, skill_uri }: Settings): void {
+  const { accountId, userId } = ctx.caller
+  if (resource_uri === null && skill_uri === null) {
+    ctx.sql.exec('DELETE FROM ov_edge_user_add_settings WHERE account_id=? AND user_id=?', accountId, userId)
+    return
+  }
+  if (before.resource_uri === null && before.skill_uri === null &&
+      ctx.sql.exec<{ n: number }>('SELECT count(*) AS n FROM ov_edge_user_add_settings WHERE account_id=?', accountId).one().n >= 1024) {
+    quota('User add location quota reached for this account.')
+  }
+  ctx.sql.exec(`INSERT INTO ov_edge_user_add_settings(account_id,user_id,resource_uri,skill_uri) VALUES (?,?,?,?)
+    ON CONFLICT(account_id,user_id) DO UPDATE SET resource_uri=excluded.resource_uri,skill_uri=excluded.skill_uri`, accountId, userId, resource_uri, skill_uri)
+}
+
 export function skillTarget(ctx: WorkspaceContext, raw: unknown): string {
   const { caller } = ctx
   const path = pathFor(raw, caller)
@@ -33,7 +48,6 @@ export function skillTarget(ctx: WorkspaceContext, raw: unknown): string {
 
 export async function routeAddLocations(request: Request, url: URL, ctx: WorkspaceContext): Promise<Response | undefined> {
   if (url.pathname !== route) return
-  const { accountId, userId } = ctx.caller
   const respond = () => {
     const { resource_uri, skill_uri } = addLocations(ctx)
     const value = { ...(resource_uri !== null && { resource_uri }), ...(skill_uri !== null && { skill_uri }) }
@@ -61,16 +75,7 @@ export async function routeAddLocations(request: Request, url: URL, ctx: Workspa
     }
     const skill = patch.skill_uri === undefined ? before.skill_uri : patch.skill_uri === null ? null :
       skillTarget(ctx, str(patch.skill_uri, 'skill_uri').trim())
-    if (resource === null && skill === null) {
-      ctx.sql.exec('DELETE FROM ov_edge_user_add_settings WHERE account_id=? AND user_id=?', accountId, userId)
-      return
-    }
-    if (before.resource_uri === null && before.skill_uri === null &&
-        ctx.sql.exec<{ n: number }>('SELECT count(*) AS n FROM ov_edge_user_add_settings WHERE account_id=?', accountId).one().n >= 1024) {
-      quota('User add location quota reached for this account.')
-    }
-    ctx.sql.exec(`INSERT INTO ov_edge_user_add_settings(account_id,user_id,resource_uri,skill_uri) VALUES (?,?,?,?)
-      ON CONFLICT(account_id,user_id) DO UPDATE SET resource_uri=excluded.resource_uri,skill_uri=excluded.skill_uri`, accountId, userId, resource, skill)
+    writeAddLocations(ctx, before, { resource_uri: resource, skill_uri: skill })
   })
   return respond()
 }

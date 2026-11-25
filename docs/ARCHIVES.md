@@ -95,24 +95,108 @@ Les ACL, identités du serveur et vecteurs ne sont jamais importés depuis le JS
 
 `auto` et `recompute` recalculent l’index via la façade; les scalaires de l’archive
 ne sont pas restaurés. `include_vectors=true`, un paquet à vecteurs denses et
-`vector_mode=require` sont refusés (`501`). `/backup`, `/restore` de compte et
-le remplacement de la monte partagée entière via `/import` sont non portés :
-ils ne doivent pas ouvrir l’accès aux autres montes, comptes ou sessions ou
-simuler une sauvegarde intégrale.
+`vector_mode=require` sont refusés (`501`). Le remplacement de la monte
+partagée entière via `/import` est toujours refusé. Les routes publiques
+`/backup` et `/restore` conservent le refus `403`/`501`, même pour un compte
+ayant explicitement adhéré au canal opérateur privé ci-dessous. Les clés
+ROOT restent interdites sur Data. Un admin ordinaire ne voit toujours pas le
+privé d’autrui.
 
-**Sauvegarde globale : contrat non réalisable avec la façade actuelle.** Dans
-l’amont épinglé, le type `backup` a `root.uri = "viking://"`, des entrées
-`resources` et `user`, et restaure ces montes d’origine (fusion en mode
-`overwrite`, pas remplacement de leur racine). La façade Worker lie au
-contraire un accès à un compte et à ses montes autorisées : même un admin ne
-voit pas les fichiers privés d’un autre utilisateur et la capture transactionnelle
-ne parcourt qu’une monte, hors espaces gérés. Les sessions et les réglages
-privés ont en plus des propriétaires de stockage distincts. Il faut une
-autorité de sauvegarde explicite et revue, des interfaces d’export/restauration
-par domaine et une preuve d’interopérabilité du type `backup` complet avant
-d’activer ces routes. Un simple ZIP `resources` ne remplace pas cette fonction.
-Le test `tests/archives/backup-scope.test.mjs` maintient le refus `403`/`501`
-et vérifie la conservation de la ressource privée; aucun succès de façade.
+## Sauvegarde de compte — canal opérateur privé, inactif par défaut
+
+**Autorité.** `BackupOperator` est un *named entrypoint* RPC sans `fetch`; seul
+un consommateur serveur disposant du binding explicite peut l’invoquer. Une
+seconde condition est l’opt-in nominatif dans `OPENVIKING_EDGE_BACKUP_POLICY`
+(liste d’objets `account_id`, `scope_id`, au plus 32 règlements, `scope_id`
+aléatoire unique de 128 bits en hex), à renseigner côté exploitation avec
+l’accord du compte. Pas de champ d’auto-attribution ni de route d’administration
+du binding. `OPENVIKING_EDGE_BACKUP_KEY` est un secret HMAC aléatoire distinct
+de 256 bits en hex, jamais une clé Data. Rien n’est monté ou renseigné dans
+`wrangler.jsonc`. Le Workspace vérifie le permis interne, sa fonction, son
+échéance (30 s) et son propre ID physique `openviking:account:<compte>` ; le
+registre Control vérifie en lecture seule que le compte et tous ses membres
+fixes sont déjà provisionnés. Registres mixtes, gérés, retirés ou réglages
+utilisateur maintenus par Control sont refusés. Ne pas réutiliser la même
+époque `scope_id` pour une identité recyclée ; garder le déploiement et la
+configuration Control stables pendant l’opération. La coupure atomique porte
+sur SQLite Workspace, pas sur tous les Durable Objects d’un déploiement.
+
+**Deux formats explicites, sans substitution.**
+
+- `profile: 'ovpack-v3'` (défaut RPC) : vrai `openviking-backup.ovpack`, OVPack
+  v3 de type `backup`, `root.uri = "viking://"`, `scopes = ["resources", "user"]`.
+  Fichiers UTF‑8 et dossiers de `resources`, `user/{id}/resources` et
+  `user/{id}/memories` de tous les propriétaires provisionnés. Sidecars
+  rédigés et descriptions/tags portables compris. Le JSONL n’admet pas les
+  scalaires non pris en charge ni les vecteurs. S’il existe des sessions,
+  skills privés ou réglages d’ajout, ce profil refuse l’archive **et** la
+  topologie vivante; la restauration stock arbitraire n’est pas promise.
+- `profile: 'edge-v1'` : `openviking-edge-backup.zip`, format **Edge distinct**,
+  pas un OVPack stock. Le manifeste `openviking.edge-backup`, version 1,
+  décrit exactement `content.ovpack` (projection des fichiers ci-dessus) et
+  `domains.json` (sessions, skills, settings) avec longueur et SHA‑256. Il prend
+  en charge l’historique textuel `user`/`assistant` d’un propriétaire disposant
+  de son agent `default`, messages actifs et archivés, frontières de reset,
+  politique mémoire de session et tags d’événements. Les Skills privés sont
+  portés via le validateur et la publication locale de Skills : définition
+  Markdown (`name`, `description`, `tags` uniquement), annexes `.md`/`.txt`,
+  inventaire contrôlé, résumés déterministes et métadonnées de destination
+  régénérés. Aucune exécution, déclaration d’outil ni appel au modèle. Réglages
+  autorisés : `add_targets` via la façade `user-settings/add-locations` du
+  Workspace, uniquement une collection de ressources **du propriétaire** et
+  sa racine privée de skills. Les destinations doivent exister dans la portée
+  sauvegardée. Aucun rétablissement de préférences appartenant à Control.
+
+**Écarts au pin.** `storage/ovpack/operations.py` énumère `resources` et `user`
+avec les fichiers cachés, excepte `.relations.json` et le contrôle des watches.
+Il couvre aussi `user/{id}/sessions` (`messages.jsonl`, `.meta.json`,
+`history` et sidecars), `skills`, `peers`, `privacy` et les fichiers
+`settings/user_config.json` et `.backup.json` lorsqu’ils existent. Ces URI ne
+sont pas un dump du registre. Les sessions Edge sont clés par compte/owner/agent
+avec états de travail indépendants ; le format stock ne porte pas cette frontière
+agent. Les skills et settings ont également des consommateurs différents. Il
+n’y a donc pas de conversion stock générale : l’archive native contenant un
+domaine non porté est refusée. Le profil Edge refuse notamment pairs gérés,
+configurations privées, outils, code, skills à capacités, sessions à parties
+non textuelles, sessions d’un autre agent, opérations et archives sémantiques, et
+auto-commit actif. Vecteurs et niveaux dérivés, historiques d’administration,
+uploads, jobs, leases, usage, files de contrôle, clés, grants OAuth,
+fournisseurs et montes `agent`/`system` ne sont pas des données portables de
+ce contrat et ne sont jamais copiés. L’archive contient les octets des textes
+admis : elle n’est ni chiffrée ni un filtre à secrets intégrés à du texte libre.
+
+**Contrat RPC.** `capture(account, { profile?, include_vectors?: false })`
+renvoie le ZIP, `x-ovpack-sha256` et le sceau détaché `x-ovpack-seal` ; garder
+ensemble ces octets et leur sceau sans les publier. Le HMAC d’archive lie
+octets, compte et époque d’opt-in. Une archive étrangère n’est pas admissible
+avec un simple changement de cible, même si les utilisateurs ont les mêmes
+noms. Un ZIP stock externe dépourvu de sceau n’est pas admis à la restauration
+Edge. `evaluate(account, ArrayBuffer, seal, options)` ne lance aucun job et
+n’écrit ni reçu, ni staging, ni schéma applicatif ; renvoie un plan borné avec
+compteurs, `dry_run: true` et approbation temporaire (5 min). `apply(account,
+ArrayBuffer, seal, options, approval)` revalide paquet, compte, permis,
+propriétaires, restrictions, quotas et état de la cible avant un **seul**
+`transactionSync` publiant tous les domaines. Le succès ne devance pas la
+durabilité SQLite. `overwrite` fusionne sans effacer les données absentes du
+paquet ; les changements de type et les sessions/skills divergents ou
+réutilisations d’un historique de skill sont des conflits. Comme les racines
+existent virtuellement, `fail` (défaut) donne `409` et `skip` valide les données
+puis donne explicitement `outcome: skipped`, zéro publication. Les nouveaux
+chemins partagés sont en quarantaine admin ; les ACL existantes ne changent
+pas. Le sceau `acl2` authentifie, pour chaque entrée partagée, un plafond
+`read` / `write` / `manage` pour le compte et ses membres provisionnés, sans
+exporter de grants ni les appartenances aux groupes. Le plan et l’application
+refusent un remplacement ou une réécriture de métadonnées qui dépasserait ce
+plafond (`409 BACKUP_ACL_CONFLICT`) ; les droits de groupe à destination ne
+sont acceptés que si le plafond commun les couvre. Les anciens sceaux à
+plafond booléen ne sont pas admissibles (`403 BACKUP_SEAL_INVALID`) : refaire
+une capture autorisée. Les formats ZIP OVPack et Edge-v1 ne changent pas.
+`vector_mode` accepte seulement `deferred` : index des fichiers réécrits et
+skills importés différé, aucun envoi à un fournisseur. Limites : ZIP total
+1 500 000 octets ; projection OVPack 256 entrées, 64 Kio/fichier, 2 Mio
+développés ; domaines Edge ≤ 384 Kio JSON, 32 sessions / 256 messages, 16
+skills, 32 réglages ; quotas SQLite ordinaires également appliqués. Aucun
+chemin OS, ni dépendance nouvelle.
 
 ## WebDAV — `/webdav/resources`
 

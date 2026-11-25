@@ -82,6 +82,18 @@ function stringList(input: unknown, tools: boolean): string[] {
   return [...new Set(list.map(item => str(item, 'skill metadata item', undefined, 256).trim()).filter(Boolean))]
 }
 
+/** Archive admission for inert authored skills only. Never copy declarations
+ * for tools, arbitrary metadata, or environment/runtime capabilities. */
+export function dataOnlySkill(content: string, name: string) {
+  const { values } = frontmatter(content)
+  if (Object.keys(values).some(key => !['name', 'description', 'tags'].includes(key))) {
+    throw new ApiError(501, 'BACKUP_TOPOLOGY_UNSUPPORTED', 'Skill frontmatter is outside the data-only backup profile.')
+  }
+  const skill = defineSkill(content, true, name)
+  if (!skill.report.valid || skill.report.name !== name) invalid('Invalid data-only skill definition.')
+  return skill
+}
+
 type Issue = { rule: string; message: string; field?: string }
 
 export function defineSkill(input: unknown, strict = false, directory?: string, sourcePath?: string) {

@@ -26,6 +26,7 @@ export function initObservability(sql: SqlStorage): void {
 }
 
 function label(path: string, method: string): [string, string] {
+  if (['/gateway/transfers/tickets', '/gateway/uploads', '/gateway/downloads'].includes(path)) return [path, 'other']
   if (/^\/api\/v1\/search\/(find|search|grep|glob)$/u.test(path)) return [path, path.split('/').at(-1)!]
   if (path === '/api/v1/resources' && method === 'POST') return [path,'add_resource']
   if (path === '/api/v1/skills' && method === 'POST') return [path,'add_skill']

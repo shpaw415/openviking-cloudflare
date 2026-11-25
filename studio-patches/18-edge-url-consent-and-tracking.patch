@@ -1,0 +1,841 @@
+diff --git a/src/features/workbench/filesystem/page.tsx b/src/features/workbench/filesystem/page.tsx
+index 271333f..5d4a350 100644
+--- a/src/features/workbench/filesystem/page.tsx
++++ b/src/features/workbench/filesystem/page.tsx
+@@ -881,6 +881,11 @@ function FilesystemWorkbench() {
+               </DialogHeader>
+               <div className="max-h-[calc(min(86vh,760px)-6rem)] overflow-y-auto px-6 py-5">
+                 <AddResourceForm
++                  edgeDialogOpen={uploadDialogOpen}
++                  onShowTasks={EDGE_STUDIO ? () => {
++                    setUploadDialogOpen(false)
++                    void navigate({ to: '/tasks' })
++                  } : undefined}
+                   onCompleted={EDGE_STUDIO ? () => void invalidateList() : undefined}
+                   onSubmitted={() => {
+                     handleUploadDialogOpenChange(false)
+diff --git a/src/features/workbench/resources/components/add-resource-page.tsx b/src/features/workbench/resources/components/add-resource-page.tsx
+index d78ce4c..357cfbe 100644
+--- a/src/features/workbench/resources/components/add-resource-page.tsx
++++ b/src/features/workbench/resources/components/add-resource-page.tsx
+@@ -7,7 +7,7 @@ import {
+   Loader2Icon,
+   Upload,
+ } from 'lucide-react'
+-import { useCallback, useState } from 'react'
++import { useCallback, useLayoutEffect, useRef, useState } from 'react'
+ import { useTranslation } from 'react-i18next'
+ 
+ import type { AdditionalResourceOptionsValue } from '#/features/workbench/resources/components/additional-resource-options'
+@@ -27,6 +27,8 @@ import type { WebResourceOptionsValue } from '#/features/workbench/resources/com
+ import { WebResourceOptions } from '#/features/workbench/resources/components/web-resource-options'
+ import type { RemoteStartResult } from '#/features/workbench/resources/hooks/use-resource-upload'
+ import { useResourceUpload } from '#/features/workbench/resources/hooks/use-resource-upload'
++import type { ApprovedUrlDraft } from '#/features/workbench/resources/hooks/use-approved-url-import'
++import { isApprovedDestinationShape, isApprovedUrlShape } from '#/features/workbench/resources/hooks/use-approved-url-import'
+ import { buildResourceImportCommonBody } from '#/features/workbench/resources/lib/resource-import-request'
+ import type { RemoteResourceTypeSelection } from '#/features/workbench/resources/lib/resource-source'
+ import { detectRemoteResourceKind } from '#/features/workbench/resources/lib/resource-source'
+@@ -49,16 +51,6 @@ import { useEdgeFeatures } from '#/features/connection/hooks/use-edge-features'
+ 
+ type Mode = 'upload' | 'remote'
+ 
+-function isTextDocumentUrl(value: string) {
+-  // Presentation only. The Worker verifies exact operator approval independently.
+-  try {
+-    const url = new URL(value)
+-    return value.length <= 1000 && url.href === value && url.protocol === 'https:' &&
+-      !url.username && !url.password && !url.port && !/[?#]/.test(value) &&
+-      /\.(md|txt|csv|json)$/i.test(url.pathname)
+-  } catch { return false }
+-}
+-
+ const DEFAULT_WEB_OPTIONS: WebResourceOptionsValue = {
+   allowExternalLinks: false,
+   depth: '1',
+@@ -94,6 +86,7 @@ const DEFAULT_ADDITIONAL_OPTIONS: AdditionalResourceOptionsValue = {
+ }
+ 
+ export function AddResourceForm({
++  edgeDialogOpen = true,
+   initialMode = 'upload',
+   initialTargetUri = 'viking://resources/',
+   initialWatchEnabled = false,
+@@ -101,8 +94,10 @@ export function AddResourceForm({
+   onCompleted,
+   onFailed,
+   onSubmitted,
++  onShowTasks,
+   watchRequired = false,
+ }: {
++  edgeDialogOpen?: boolean
+   initialMode?: Mode
+   initialTargetUri?: string
+   initialWatchEnabled?: boolean
+@@ -110,21 +105,27 @@ export function AddResourceForm({
+   onCompleted?: () => void
+   onFailed?: () => void
+   onSubmitted?: () => void
++  onShowTasks?: () => void
+   watchRequired?: boolean
+ } = {}) {
+   const { i18n, t } = useTranslation('addResource')
+-  const { enqueueUploads, startRemote, resetRemote, remoteState } =
++  const { enqueueUploads, startRemote, resetRemote, remoteState, approvedUrl } =
+     useResourceUpload()
+   const { flags, pending } = useEdgeFeatures()
+   const canImportUrl = EDGE_STUDIO && !watchRequired && !pending && flags.urlImport === true
+-
+-  const [mode, setMode] = useState<Mode>(EDGE_STUDIO ? 'upload' : watchRequired ? 'remote' : initialMode)
++  const urlState = EDGE_STUDIO ? approvedUrl.state : { phase: 'idle' } as const
++  const [mode, setMode] = useState<Mode>(EDGE_STUDIO ? urlState.phase === 'idle' ? 'upload' : 'remote' : watchRequired ? 'remote' : initialMode)
+   const [remoteUrl, setRemoteUrl] = useState('')
+   const [remoteResourceType, setRemoteResourceType] =
+     useState<RemoteResourceTypeSelection>('auto')
+   const [selectedFiles, setSelectedFiles] = useState<SelectedUploadFile[]>([])
+   const [targetUri, setTargetUri] = useState(initialTargetUri)
+-  const [urlDestination, setUrlDestination] = useState('')
++  const [urlDraft, setUrlDraft] = useState<ApprovedUrlDraft>(() => 'draft' in urlState ? urlState.draft : { url: '', mode: 'parent', destination: '' })
++  const [allowReplacement, setAllowReplacement] = useState(false)
++  const [urlIssue, setUrlIssue] = useState<'empty' | 'url' | 'destination' | 'consent'>()
++  const urlInput = useRef<HTMLInputElement>(null)
++  const destinationInput = useRef<HTMLInputElement>(null)
++  const consentInput = useRef<HTMLInputElement>(null)
+   const [destinationMode, setDestinationMode] =
+     useState<ResourceDestinationMode>('parent')
+   const [strict, setStrict] = useState(false)
+@@ -152,6 +153,36 @@ export function AddResourceForm({
+   const remotePhase = remoteState.phase
+   const activeMode = EDGE_STUDIO && !canImportUrl ? 'upload' : mode
+   const edgeUrl = EDGE_STUDIO && activeMode === 'remote'
++  const attach = approvedUrl?.attach
++  const completion = useRef(onCompleted)
++  useLayoutEffect(() => { completion.current = onCompleted }, [onCompleted])
++  useLayoutEffect(() => {
++    if (edgeUrl && edgeDialogOpen) return attach?.(() => completion.current?.())
++  }, [attach, edgeUrl, edgeDialogOpen])
++
++  const refusal = urlState.phase === 'rejected' ? urlState.refusal : undefined
++  const urlError = urlIssue === 'empty' ? t('studio:edge.urlImportRequired')
++    : urlIssue === 'url' ? t('studio:edge.urlImportInvalid')
++    : refusal === 'source' ? t('studio:edge.urlImportSource')
++    : refusal === 'sourceTimeout' ? t('studio:edge.urlImportSourceTimeout') : undefined
++  const destinationError = urlIssue === 'destination'
++    ? t(urlDraft.mode === 'to' ? 'studio:edge.urlImportExactInvalid' : 'studio:edge.urlImportParentInvalid')
++    : refusal === 'destination' ? t('studio:edge.urlImportDestinationRefused') : undefined
++  const waiting = urlState.phase === 'submitting' || urlState.phase === 'tracking'
++  const urlLocked = waiting || urlState.phase === 'interrupted' || urlState.phase === 'unknown'
++  const updateUrlDraft = (changed: Partial<ApprovedUrlDraft>) => {
++    if (urlLocked) return
++    setUrlDraft(draft => ({ ...draft, ...changed }))
++    setAllowReplacement(false)
++    setUrlIssue(undefined)
++    approvedUrl.clearTerminal()
++  }
++  useLayoutEffect(() => {
++    if (!edgeUrl || !edgeDialogOpen) return
++    if (urlError) urlInput.current?.focus()
++    else if (destinationError) destinationInput.current?.focus()
++    else if (urlIssue === 'consent') consentInput.current?.focus()
++  }, [edgeUrl, edgeDialogOpen, urlError, destinationError, urlIssue])
+   const displayRemoteUrl =
+     remotePhase === 'processing' ? remoteState.remoteUrl : remoteUrl
+   const skippedFiles = remoteState.skippedFiles
+@@ -229,7 +260,7 @@ export function AddResourceForm({
+       ignoreDirs,
+       include,
+       instruction,
+-      mode,
++      mode: activeMode,
+       reason,
+       remoteResourceKind,
+       sourceOptionState,
+@@ -251,24 +282,30 @@ export function AddResourceForm({
+       return
+     }
+ 
+-    const url = remoteUrl.trim()
+-    if (!url) return
+-    if (EDGE_STUDIO) {
+-      if (!canImportUrl || !isTextDocumentUrl(url) || remotePhase === 'processing') return
+-      const destination = urlDestination.trim()
+-      startRemote({
+-        url,
+-        commonBody: {
+-          ...(!destination ? { parent: 'viking://~/resources' } : { [destinationMode]: destination }),
+-          wait: false,
+-          processing_mode: 'vectors_only',
+-        },
+-        onAccepted,
+-        onCompleted,
+-        onFailed,
+-      })
++    if (edgeUrl) {
++      if (!canImportUrl || !edgeDialogOpen || urlLocked) return
++      if (!isApprovedUrlShape(urlDraft.url)) {
++        setUrlIssue(urlDraft.url ? 'url' : 'empty')
++        urlInput.current?.focus()
++        return
++      }
++      if (!isApprovedDestinationShape(urlDraft)) {
++        setUrlIssue('destination')
++        destinationInput.current?.focus()
++        return
++      }
++      if (urlDraft.mode === 'to' && !allowReplacement) {
++        setUrlIssue('consent')
++        consentInput.current?.focus()
++        return
++      }
++      setUrlIssue(undefined)
++      setAllowReplacement(false)
++      approvedUrl.start(urlDraft)
+       return
+     }
++    const url = remoteUrl.trim()
++    if (!url) return
+     startRemote({
+       url,
+       commonBody: buildCommonBody(),
+@@ -306,7 +343,7 @@ export function AddResourceForm({
+     watchRequirementMet &&
+     (activeMode === 'upload'
+       ? selectedFiles.length > 0
+-      : edgeUrl ? isTextDocumentUrl(remoteUrl.trim()) : !!remoteUrl.trim() && hasWatchInterval)
++      : !!remoteUrl.trim() && hasWatchInterval)
+ 
+   return (
+     <div className="flex flex-col gap-6">
+@@ -320,13 +357,12 @@ export function AddResourceForm({
+             <button
+               type="button"
+               aria-pressed={activeMode === 'upload'}
+-              disabled={edgeUrl && remotePhase === 'processing'}
+               className={`flex flex-1 items-center justify-center gap-2 rounded-md px-3 py-2 text-sm font-medium transition-colors ${
+                 activeMode === 'upload'
+                   ? 'bg-background text-foreground shadow-sm'
+                   : 'text-muted-foreground hover:text-foreground'
+               }`}
+-              onClick={() => setMode('upload')}
++              onClick={() => { setAllowReplacement(false); setMode('upload') }}
+             >
+               <Upload className="size-4" />
+               {t('mode.upload')}
+@@ -356,15 +392,18 @@ export function AddResourceForm({
+         ) : (
+           <RemoteResourceFields
+             approvedTextOnly={edgeUrl}
+-            disabled={remotePhase === 'processing'}
++            inputRef={edgeUrl ? urlInput : undefined}
++            urlError={edgeUrl ? urlError : undefined}
++            onUrlEnter={edgeUrl ? handleSubmit : undefined}
++            disabled={edgeUrl ? urlLocked : remotePhase === 'processing'}
+             onResourceTypeChange={handleRemoteResourceTypeChange}
+-            onUrlChange={handleRemoteUrlChange}
++            onUrlChange={edgeUrl ? (url) => updateUrlDraft({ url }) : handleRemoteUrlChange}
+             onWatchEnabledChange={setWatchEnabled}
+             onWatchIntervalChange={setWatchInterval}
+             resourceKind={remoteResourceKind}
+             resourceType={remoteResourceType}
+             t={t}
+-            url={displayRemoteUrl}
++            url={edgeUrl ? urlDraft.url : displayRemoteUrl}
+             watchEnabled={effectiveWatchEnabled}
+             watchInterval={watchInterval}
+             watchRequired={watchRequired}
+@@ -402,23 +441,23 @@ export function AddResourceForm({
+           </RemoteResourceFields>
+         )}
+ 
+-        {activeMode === 'remote' && remotePhase === 'processing' ? (
++        {!edgeUrl && activeMode === 'remote' && remotePhase === 'processing' ? (
+           <div className="space-y-2 rounded-lg border border-border/50 bg-muted/10 p-4">
+             <div className="flex items-center gap-2">
+               <Loader2Icon className="size-4 animate-spin text-muted-foreground" />
+-              <p className="text-sm text-muted-foreground" role={edgeUrl ? 'status' : undefined}>
+-                {t(edgeUrl ? 'studio:edge.urlImportProcessing' : 'upload.processing')}
++              <p className="text-sm text-muted-foreground">
++                {t('upload.processing')}
+               </p>
+             </div>
+-            {!edgeUrl && <Button variant="outline" size="sm" onClick={handleReset}>
++            <Button variant="outline" size="sm" onClick={handleReset}>
+               {t('cancelUpload')}
+-            </Button>}
++            </Button>
+           </div>
+         ) : null}
+ 
+-        {activeMode === 'remote' && remotePhase === 'done' ? (
++        {!edgeUrl && activeMode === 'remote' && remotePhase === 'done' ? (
+           <div className="space-y-3 rounded-lg border border-border/50 bg-muted/10 p-4">
+-            <div role={edgeUrl ? 'status' : undefined} className="flex items-center gap-2 text-sm font-medium text-green-600 dark:text-green-400">
++            <div className="flex items-center gap-2 text-sm font-medium text-green-600 dark:text-green-400">
+               <CheckCircle2 className="size-4" />
+               {t('result.success')}
+             </div>
+@@ -444,22 +483,68 @@ export function AddResourceForm({
+           </div>
+         ) : null}
+ 
+-        {edgeUrl && remoteState.error ? (
+-          <p className="break-words text-sm text-destructive" role="alert">{remoteState.error}</p>
+-        ) : null}
+-
+         <ResourceDestinationFields
+-          disabled={remotePhase === 'processing'}
++          disabled={edgeUrl ? urlLocked : remotePhase === 'processing'}
+           exactOnly={sourceCapabilities.exactDestination}
+           approvedTextOnly={edgeUrl}
+-          mode={effectiveDestinationMode}
++          inputRef={edgeUrl ? destinationInput : undefined}
++          destinationError={edgeUrl ? destinationError : undefined}
++          mode={edgeUrl ? urlDraft.mode : effectiveDestinationMode}
+           onBrowse={() => setDirPickerOpen(true)}
+-          onModeChange={setDestinationMode}
+-          onUriChange={edgeUrl ? setUrlDestination : setTargetUri}
++          onModeChange={edgeUrl ? (nextMode) => updateUrlDraft({ mode: nextMode }) : setDestinationMode}
++          onUriChange={edgeUrl ? (destination) => updateUrlDraft({ destination }) : setTargetUri}
+           t={t}
+-          uri={edgeUrl ? urlDestination : targetUri}
++          uri={edgeUrl ? urlDraft.destination : targetUri}
+         />
+ 
++        {edgeUrl && urlDraft.mode === 'to' && isApprovedDestinationShape(urlDraft) && !urlLocked && (
++          <label className="flex items-start gap-2 text-sm" htmlFor="add-resource-allow-replacement">
++            <input
++              id="add-resource-allow-replacement"
++              ref={consentInput}
++              type="checkbox"
++              aria-describedby={`add-resource-target-policy${urlIssue === 'consent' ? ' add-resource-consent-error' : ''}`}
++              aria-invalid={urlIssue === 'consent' ? true : undefined}
++              checked={allowReplacement}
++              onChange={event => { setAllowReplacement(event.target.checked); setUrlIssue(undefined) }}
++            />
++            <span className="min-w-0 break-words">
++              {t('studio:edge.urlImportExactConsent')} <code>{urlDraft.destination}</code>
++            </span>
++          </label>
++        )}
++        {edgeUrl && urlIssue === 'consent' && (
++          <p id="add-resource-consent-error" className="text-sm text-destructive" role="alert">{t('studio:edge.urlImportConsentRequired')}</p>
++        )}
++        {edgeUrl && (
++          <div className="space-y-2">
++            <div role="status" className="break-words text-sm">
++              {urlState.phase === 'submitting' ? t('studio:edge.urlImportSubmitting') : null}
++              {urlState.phase === 'tracking' ? t('studio:edge.urlImportProcessing') : null}
++              {urlState.phase === 'done' ? <>{t('studio:edge.urlImportDone')} <code>{urlState.task.uri}</code></> : null}
++            </div>
++            {urlState.phase === 'interrupted' && (
++              <p className="text-sm" role="alert">
++                {urlState.reason === 'timeout' ? t('studio:edge.urlImportFollowTimeout')
++                  : urlState.reason === 'paused' ? t('studio:edge.urlImportFollowPaused')
++                  : t('studio:edge.urlImportFollowUnavailable')}
++              </p>
++            )}
++            {urlState.phase === 'unknown' && <p className="text-sm" role="alert">{t('studio:edge.urlImportUnknown')}</p>}
++            {urlState.phase === 'failed' && <p className="text-sm" role="alert">{t('studio:edge.urlImportFailed')}</p>}
++            {urlState.phase === 'cancelled' && <p className="text-sm" role="alert">{t('studio:edge.urlImportCancelled')}</p>}
++            {refusal === 'request' && <p className="text-sm" role="alert">{t('studio:edge.urlImportRefused')}</p>}
++            {(urlState.phase === 'interrupted' || urlState.phase === 'unknown') && (
++              <div className="flex flex-wrap gap-2">
++                {urlState.phase === 'interrupted' && (
++                  <Button type="button" onClick={approvedUrl.resume}>{t('studio:edge.urlImportVerify')}</Button>
++                )}
++                {onShowTasks && <Button type="button" variant="outline" onClick={onShowTasks}>{t('studio:edge.urlImportShowTasks')}</Button>}
++              </div>
++            )}
++          </div>
++        )}
++
+         {!edgeUrl && <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
+           <CollapsibleTrigger className="flex items-center gap-1 text-sm font-medium text-muted-foreground hover:text-foreground">
+             <ChevronRight
+@@ -603,7 +688,9 @@ export function AddResourceForm({
+           </CollapsibleContent>
+         </Collapsible>}
+ 
+-        <Button
++        {edgeUrl ? !urlLocked && <Button type="button" onClick={handleSubmit}>
++          {t(urlDraft.mode === 'to' ? 'studio:edge.urlImportExactAction' : 'studio:edge.urlImportAction')}
++        </Button> : <Button
+           onClick={handleSubmit}
+           disabled={
+             !canSubmit ||
+@@ -613,14 +700,14 @@ export function AddResourceForm({
+           {activeMode === 'remote' && remotePhase === 'processing'
+             ? t('uploading')
+             : t('startProcessing')}
+-        </Button>
++        </Button>}
+       </div>
+ 
+       <DirectoryPickerDialog
+         open={dirPickerOpen}
+         onOpenChange={setDirPickerOpen}
+-        value={edgeUrl ? urlDestination || 'viking://~/resources' : targetUri}
+-        onSelect={edgeUrl ? setUrlDestination : setTargetUri}
++        value={edgeUrl ? urlDraft.destination || 'viking://~/resources' : targetUri}
++        onSelect={edgeUrl ? (destination) => updateUrlDraft({ destination }) : setTargetUri}
+       />
+     </div>
+   )
+diff --git a/src/features/workbench/resources/components/remote-resource-fields.tsx b/src/features/workbench/resources/components/remote-resource-fields.tsx
+index 94fb6d5..427cc79 100644
+--- a/src/features/workbench/resources/components/remote-resource-fields.tsx
++++ b/src/features/workbench/resources/components/remote-resource-fields.tsx
+@@ -1,5 +1,5 @@
+ import type { TFunction } from 'i18next'
+-import type { ReactNode } from 'react'
++import type { ReactNode, Ref } from 'react'
+ 
+ import { getRemoteResourceDescriptor } from '#/features/workbench/resources/components/remote-resource-descriptors'
+ import { RemoteResourceTypePicker } from '#/features/workbench/resources/components/remote-resource-type-picker'
+@@ -14,6 +14,9 @@ import { Switch } from '#/shared/ui/switch'
+ 
+ type RemoteResourceFieldsProps = {
+   approvedTextOnly?: boolean
++  inputRef?: Ref<HTMLInputElement>
++  urlError?: string
++  onUrlEnter?: () => void
+   children?: ReactNode
+   disabled: boolean
+   onUrlChange: (value: string) => void
+@@ -40,6 +43,9 @@ function getRemoteUrlPlaceholder(
+ 
+ export function RemoteResourceFields({
+   approvedTextOnly = false,
++  inputRef,
++  urlError,
++  onUrlEnter,
+   children,
+   disabled,
+   onUrlChange,
+@@ -75,11 +81,22 @@ export function RemoteResourceFields({
+           ) : null}
+         </div>
+         <Input
++          ref={inputRef}
+           id="add-resource-remote-url"
+-          aria-describedby={approvedTextOnly ? 'add-resource-remote-policy' : undefined}
++          aria-describedby={approvedTextOnly ? `add-resource-remote-policy${urlError ? ' add-resource-remote-error' : ''}` : undefined}
++          aria-invalid={urlError ? true : undefined}
++          inputMode={approvedTextOnly ? 'url' : undefined}
++          autoCapitalize={approvedTextOnly ? 'none' : undefined}
++          spellCheck={approvedTextOnly ? false : undefined}
+           placeholder={approvedTextOnly ? undefined : remoteUrlPlaceholder}
+           value={url}
+           onChange={(event) => onUrlChange(event.target.value)}
++          onKeyDown={onUrlEnter ? (event) => {
++            if (event.key === 'Enter' && !event.nativeEvent.isComposing) {
++              event.preventDefault()
++              onUrlEnter()
++            }
++          } : undefined}
+           disabled={disabled || (watchRequired && !watchSupported)}
+         />
+         <p id={approvedTextOnly ? 'add-resource-remote-policy' : undefined} className="text-xs text-muted-foreground">
+@@ -87,6 +104,7 @@ export function RemoteResourceFields({
+             ? t('remoteUrl.hint')
+             : t(`sourceKind.${resourceKind}Hint`)}
+         </p>
++        {urlError && <p id="add-resource-remote-error" className="break-words text-sm text-destructive" role="alert">{urlError}</p>}
+       </div>
+ 
+       {!approvedTextOnly && children}
+diff --git a/src/features/workbench/resources/components/resource-destination-fields.tsx b/src/features/workbench/resources/components/resource-destination-fields.tsx
+index 237298d..30ab82c 100644
+--- a/src/features/workbench/resources/components/resource-destination-fields.tsx
++++ b/src/features/workbench/resources/components/resource-destination-fields.tsx
+@@ -1,5 +1,6 @@
+ import type { TFunction } from 'i18next'
+ import { FolderOpen } from 'lucide-react'
++import type { Ref } from 'react'
+ 
+ import { Button } from '#/shared/ui/button'
+ import { Input } from '#/shared/ui/input'
+@@ -18,6 +19,8 @@ type ResourceDestinationFieldsProps = {
+   uri: string
+   exactOnly?: boolean
+   approvedTextOnly?: boolean
++  inputRef?: Ref<HTMLInputElement>
++  destinationError?: string
+ }
+ 
+ export function ResourceDestinationFields({
+@@ -30,6 +33,8 @@ export function ResourceDestinationFields({
+   uri,
+   exactOnly = false,
+   approvedTextOnly = false,
++  inputRef,
++  destinationError,
+ }: ResourceDestinationFieldsProps) {
+   return (
+     <div className="space-y-2">
+@@ -55,15 +60,17 @@ export function ResourceDestinationFields({
+       </div>
+       <div className="flex gap-2">
+         <Input
++          ref={inputRef}
+           id="add-resource-target"
+-          aria-describedby={approvedTextOnly ? 'add-resource-target-policy' : undefined}
+-          placeholder={t('targetUri.placeholder')}
++          aria-describedby={approvedTextOnly ? `add-resource-target-policy${destinationError ? ' add-resource-target-error' : ''}` : undefined}
++          aria-invalid={destinationError ? true : undefined}
++          placeholder={approvedTextOnly ? undefined : t('targetUri.placeholder')}
+           value={uri}
+           disabled={disabled}
+           onChange={(event) => onUriChange(event.target.value)}
+           className="flex-1"
+         />
+-        <Button
++        {(!approvedTextOnly || mode === 'parent') && <Button
+           type="button"
+           variant="outline"
+           size="sm"
+@@ -73,15 +80,16 @@ export function ResourceDestinationFields({
+         >
+           <FolderOpen className="mr-1.5 size-4" />
+           {t('targetUri.browse')}
+-        </Button>
++        </Button>}
+       </div>
+       <p id={approvedTextOnly ? 'add-resource-target-policy' : undefined} className="text-xs text-muted-foreground">
+-        {approvedTextOnly ? t('studio:edge.urlImportDestination') : exactOnly
++        {approvedTextOnly ? t(mode === 'parent' ? 'studio:edge.urlImportDestination' : 'studio:edge.urlImportExactHint') : exactOnly
+           ? t('destination.tosHint')
+           : mode === 'parent'
+             ? t('destination.parentHint')
+             : t('destination.exactHint')}
+       </p>
++      {destinationError && <p id="add-resource-target-error" className="break-words text-sm text-destructive" role="alert">{destinationError}</p>}
+     </div>
+   )
+ }
+diff --git a/src/features/workbench/resources/hooks/use-approved-url-import.ts b/src/features/workbench/resources/hooks/use-approved-url-import.ts
+new file mode 100644
+index 0000000..261e92c
+--- /dev/null
++++ b/src/features/workbench/resources/hooks/use-approved-url-import.ts
+@@ -0,0 +1,196 @@
++import { useCallback, useLayoutEffect, useRef, useState } from 'react'
++import { postResourceImport } from '#/features/workbench/resources/lib/resource-import-api'
++import type { OvClientAdapter } from '#/shared/api/ov-client/index'
++import { getOvResult, getTaskByTaskId, normalizeOvClientError } from '#/shared/api/ov-client/index'
++
++export type ApprovedUrlDraft = { url: string; mode: 'parent' | 'to'; destination: string }
++type Task = { id: string; uri: string }
++type Refusal = 'source' | 'sourceTimeout' | 'destination' | 'request'
++type Interruption = 'unavailable' | 'timeout' | 'paused'
++type State =
++  | { phase: 'idle' }
++  | { phase: 'submitting' | 'unknown'; draft: ApprovedUrlDraft }
++  | { phase: 'rejected'; draft: ApprovedUrlDraft; refusal: Refusal }
++  | { phase: 'interrupted'; draft: ApprovedUrlDraft; task: Task; reason: Interruption }
++  | { phase: 'tracking' | 'done' | 'failed' | 'cancelled'; draft: ApprovedUrlDraft; task: Task }
++
++const SOURCE_SUFFIX = /\.(md|txt|csv|json)$/i
++const RESOURCE_ROOT = /^viking:\/\/(?:resources|~\/resources|user\/[\w-]+\/resources)(?:\/|$)/
++const TRACK_FOR = 30_000
++const SUBMIT_FOR = 15_000
++const POLL_EVERY = 2_000
++
++export function isApprovedUrlShape(value: string) {
++  // This is a field check, not authorization. Never submit a normalized href in place of the draft.
++  try {
++    const url = new URL(value)
++    return value.length <= 1000 && url.href === value && url.protocol === 'https:' &&
++      !url.username && !url.password && !url.port && !/[?#]/.test(value) &&
++      url.hostname.length <= 253 &&
++      /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}$/.test(url.hostname) &&
++      !/(?:^|\.)(?:localhost|internal|local|lan|home|arpa)(?:\.|$)/.test(url.hostname) &&
++      url.pathname.slice(1).split('/').every(part => /^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,159}$/.test(part)) &&
++      SOURCE_SUFFIX.test(url.pathname)
++  } catch { return false }
++}
++
++export function isApprovedDestinationShape({ mode, destination }: ApprovedUrlDraft) {
++  if (mode === 'parent' && destination === '') return true
++  if (!RESOURCE_ROOT.test(destination) || destination !== destination.trim()) return false
++  return mode === 'parent' || SOURCE_SUFFIX.test(destination) && !destination.split('/').at(-1)?.startsWith('.')
++}
++
++function record(value: unknown): Record<string, unknown> | undefined {
++  return value !== null && typeof value === 'object' && !Array.isArray(value)
++    ? value as Record<string, unknown> : undefined
++}
++
++function acceptedTask(result: Record<string, unknown> | undefined): Task | undefined {
++  if ((result?.status === 'accepted' || result?.status === 'success') &&
++      typeof result.task_id === 'string' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(result.task_id) &&
++      typeof result.root_uri === 'string' && RESOURCE_ROOT.test(result.root_uri) && SOURCE_SUFFIX.test(result.root_uri)) {
++    return { id: result.task_id, uri: result.root_uri }
++  }
++}
++
++function refusalKind(error: unknown): Refusal | undefined {
++  const { code, statusCode } = normalizeOvClientError(error)
++  if (code === 'DEADLINE_EXCEEDED') return 'sourceTimeout'
++  if (code === 'SOURCE_UNAVAILABLE' || code === 'UNSUPPORTED_MEDIA_TYPE') return 'source'
++  if (['INVALID_URI', 'RESOURCE_BUSY', 'ALREADY_EXISTS', 'NOT_FOUND', 'CONFLICT'].includes(code)) return 'destination'
++  if (statusCode && statusCode >= 400 && statusCode < 500 || code === 'NOT_IMPLEMENTED' || code === 'EMBEDDING_UNAVAILABLE') return 'request'
++  // No authoritative rejection: even a dropped POST response may hide a committed admission.
++}
++
++type Operation = { abort: AbortController; clock?: number; next?: number }
++type Viewer = { onCompleted: () => void }
++
++/** One pending import scoped to the existing Workspace provider, never to a global task list. */
++export function useApprovedUrlImport(client: OvClientAdapter['client'], isCurrent: () => boolean) {
++  const [state, setState] = useState<State>({ phase: 'idle' })
++  const latest = useRef<State>({ phase: 'idle' })
++  const operation = useRef<Operation | null>(null)
++  const viewer = useRef<Viewer | null>(null)
++
++  const publish = useCallback((value: State) => {
++    latest.current = value
++    setState(value)
++  }, [])
++
++  const stop = useCallback(() => {
++    const active = operation.current
++    operation.current = null
++    if (!active) return
++    window.clearTimeout(active.next)
++    window.clearTimeout(active.clock)
++    active.abort.abort()
++  }, [])
++
++  useLayoutEffect(() => stop, [stop])
++
++  const follow = useCallback((draft: ApprovedUrlDraft, task: Task) => {
++    if (!isCurrent() || !viewer.current || operation.current) return
++    const active: Operation = { abort: new AbortController() }
++    const current = () => operation.current === active && isCurrent() && viewer.current !== null
++    operation.current = active
++    publish({ phase: 'tracking', draft, task })
++    const interrupt = (reason: Interruption) => {
++      if (!current()) return
++      stop()
++      publish({ phase: 'interrupted', draft, task, reason })
++    }
++    active.clock = window.setTimeout(() => interrupt('timeout'), TRACK_FOR)
++    const read = async () => {
++      if (!current()) return
++      try {
++        const status = record(await getOvResult(getTaskByTaskId({
++          client, signal: active.abort.signal, path: { task_id: task.id },
++        })))
++        if (!current()) return
++        if (!status || status.task_id !== task.id || status.task_type !== 'add_resource' || status.resource_id !== task.uri) {
++          interrupt('unavailable')
++          return
++        }
++        if (status.status === 'pending' || status.status === 'running' || status.status === 'cancelling') {
++          active.next = window.setTimeout(() => void read(), POLL_EVERY)
++          return
++        }
++        if (status.status === 'failed' || status.status === 'cancelled') {
++          stop()
++          publish({ phase: status.status, draft, task })
++          return
++        }
++        const result = record(status.result)
++        if (status.status === 'completed' && result?.status === 'success' && result.root_uri === task.uri) {
++          stop()
++          publish({ phase: 'done', draft, task })
++          viewer.current?.onCompleted()
++          return
++        }
++        interrupt('unavailable')
++      } catch { interrupt('unavailable') }
++    }
++    void read()
++  }, [client, isCurrent, publish, stop])
++
++  const attach = useCallback((onCompleted: () => void) => {
++    const current = { onCompleted }
++    viewer.current = current
++    return () => {
++      if (viewer.current !== current) return
++      viewer.current = null
++      const value = latest.current
++      if (value.phase !== 'tracking') return
++      stop()
++      if (isCurrent()) publish({ ...value, phase: 'interrupted', reason: 'paused' })
++      // An in-flight POST may already have been admitted. Leave its bounded receipt
++      // reader alive under this Workspace only, so reopening can recover its task ID.
++    }
++  }, [isCurrent, publish, stop])
++
++  const start = useCallback((draft: ApprovedUrlDraft) => {
++    if (!isCurrent() || !viewer.current || operation.current ||
++        !['idle', 'rejected', 'done', 'failed', 'cancelled'].includes(latest.current.phase)) return
++    const active: Operation = { abort: new AbortController() }
++    const current = () => operation.current === active && isCurrent()
++    operation.current = active
++    publish({ phase: 'submitting', draft })
++    active.clock = window.setTimeout(() => {
++      if (!current()) return
++      stop()
++      publish({ phase: 'unknown', draft })
++    }, SUBMIT_FOR)
++    void (async () => {
++      try {
++        const result = await getOvResult(postResourceImport({
++          path: draft.url, [draft.mode]: draft.destination || 'viking://~/resources',
++          wait: false, processing_mode: 'vectors_only',
++        }, { client, signal: active.abort.signal }))
++        if (!current()) return
++        stop()
++        const task = acceptedTask(record(result))
++        if (!task) publish({ phase: 'unknown', draft })
++        else if (viewer.current) follow(draft, task)
++        else publish({ phase: 'interrupted', draft, task, reason: 'paused' })
++      } catch (error) {
++        if (!current()) return
++        stop()
++        const refusal = refusalKind(error)
++        publish(refusal ? { phase: 'rejected', draft, refusal } : { phase: 'unknown', draft })
++      }
++    })()
++  }, [client, isCurrent, publish, follow, stop])
++
++  const resume = useCallback(() => {
++    const value = latest.current
++    if (value.phase === 'interrupted') follow(value.draft, value.task)
++  }, [follow])
++
++  const clearTerminal = useCallback(() => {
++    if (isCurrent() && ['rejected', 'done', 'failed', 'cancelled'].includes(latest.current.phase)) {
++      publish({ phase: 'idle' })
++    }
++  }, [isCurrent, publish])
++
++  return { state, attach, start, resume, clearTerminal }
++}
+diff --git a/src/features/workbench/resources/hooks/use-resource-upload.tsx b/src/features/workbench/resources/hooks/use-resource-upload.tsx
+index 2f1c793..2afa439 100644
+--- a/src/features/workbench/resources/hooks/use-resource-upload.tsx
++++ b/src/features/workbench/resources/hooks/use-resource-upload.tsx
+@@ -3,6 +3,7 @@ import * as React from 'react'
+ import { useTranslation } from 'react-i18next'
+ import { toast } from 'sonner'
+ 
++import { useApprovedUrlImport } from '#/features/workbench/resources/hooks/use-approved-url-import'
+ import { postResourceImport } from '#/features/workbench/resources/lib/resource-import-api'
+ import {
+   buildRemoteResourceRequest,
+@@ -90,6 +91,7 @@ export type RemoteStartParams = {
+ }
+ 
+ type ResourceUploadContextValue = {
++  approvedUrl: ReturnType<typeof useApprovedUrlImport>
+   tasks: ResourceUploadTask[]
+   remoteState: RemoteUploadState
+   enqueueUploads: (params: UploadBatchParams) => void
+@@ -232,6 +234,7 @@ export function ResourceUploadProvider({
+     () => mountedRef.current && source.isCurrent(),
+     [source],
+   )
++  const approvedUrl = useApprovedUrlImport(source.client, isSourceCurrent)
+ 
+   const beginOperation = React.useCallback(() => {
+     if (!isSourceCurrent()) return null
+@@ -785,6 +788,7 @@ export function ResourceUploadProvider({
+ 
+   const value = React.useMemo<ResourceUploadContextValue>(
+     () => ({
++      approvedUrl,
+       tasks,
+       remoteState,
+       enqueueUploads,
+@@ -796,6 +800,7 @@ export function ResourceUploadProvider({
+       activeTaskCount,
+     }),
+     [
++      approvedUrl,
+       tasks,
+       remoteState,
+       enqueueUploads,
+diff --git a/src/i18n/locales/en/studio.ts b/src/i18n/locales/en/studio.ts
+index 4117c1c..bc8d039 100644
+--- a/src/i18n/locales/en/studio.ts
++++ b/src/i18n/locales/en/studio.ts
+@@ -13,9 +13,32 @@ const studio = {
+     workspaceRequired: 'Use a separate User API key to open the workspace.',
+     textUploadOnly: 'Choose local UTF-8 text files. Remote URLs and folder imports are not available here.',
+     urlImportChecking: 'Checking URL import availability… You can still choose local files.',
+-    urlImportProcessing: 'Importing and indexing the document…',
+-    urlImportHint: 'Use an exact HTTPS URL approved by your operator (.md, .txt, .csv or .json). No sign-in, query or fragment.',
+-    urlImportDestination: 'Leave blank to use your private resources. Otherwise choose an existing resources folder or enter an exact file URI.',
++    urlImportSubmitting: 'Submitting the import…',
++    urlImportProcessing: 'Import accepted. Checking its progress…',
++    urlImportHint: 'Paste the exact HTTPS URL approved by your operator. Use a lowercase host and a .md, .txt, .csv or .json document. No sign-in, port, query or fragment.',
++    urlImportRequired: 'Enter the exact approved HTTPS URL.',
++    urlImportInvalid: 'This URL is not in the required format. Copy the exact approved HTTPS document address without spaces or other changes.',
++    urlImportSource: 'The source was not approved, is unavailable, or is not an accepted text document. Check the exact approved URL with your operator. If it is correct, try again later.',
++    urlImportSourceTimeout: 'The source did not reply in time. Check the approved URL and try again later.',
++    urlImportDestination: 'Leave blank to use your private resources, or choose an existing resources folder.',
++    urlImportParentInvalid: 'Choose an existing resources folder, or leave the destination blank to use your private resources.',
++    urlImportExactHint: 'Enter an exact resources file URI. If a file already exists there, this import can replace it.',
++    urlImportExactInvalid: 'Enter an exact resources file URI ending in .md, .txt, .csv or .json, or choose an existing folder instead.',
++    urlImportExactConsent: 'Allow this import to replace the file at this location if it exists:',
++    urlImportConsentRequired: 'Confirm replacement for this path, or choose a folder to add without replacing a file.',
++    urlImportDestinationRefused: 'The destination was not accepted. Check the path and choose a writable resources location.',
++    urlImportAction: 'Import document',
++    urlImportExactAction: 'Import to exact location',
++    urlImportDone: 'Document imported:',
++    urlImportRefused: 'The import request was rejected. Check your connection, the approved URL, and write access to the destination before trying again.',
++    urlImportFailed: 'The task reported that the import failed. Check the approved source and destination before starting another import.',
++    urlImportCancelled: 'The task reported that the import was cancelled.',
++    urlImportFollowUnavailable: 'The task status is unavailable. The import may still be running. Check the same task again without resubmitting.',
++    urlImportFollowTimeout: 'Status checking timed out. The import may still be running. Check the same task again without resubmitting.',
++    urlImportFollowPaused: 'Status checking was paused. The import was not cancelled.',
++    urlImportUnknown: 'The server did not confirm whether it accepted the request. Check Processing Tasks before submitting another import.',
++    urlImportVerify: 'Check task status',
++    urlImportShowTasks: 'Open Processing Tasks',
+     dataProfile: 'Workspace',
+     controlProfile: 'Administration',
+     controlKey: 'Root or account Admin API key',
+diff --git a/src/i18n/locales/zh-CN/studio.ts b/src/i18n/locales/zh-CN/studio.ts
+index 69738a6..c0e74c6 100644
+--- a/src/i18n/locales/zh-CN/studio.ts
++++ b/src/i18n/locales/zh-CN/studio.ts
+@@ -13,9 +13,32 @@ const studio = {
+     workspaceRequired: '使用单独的用户 API 密钥打开工作区。',
+     textUploadOnly: '请选择本地 UTF-8 文本文件。此处不支持远程 URL 或文件夹导入。',
+     urlImportChecking: '正在检查是否支持 URL 导入…仍可选择本地文件。',
+-    urlImportProcessing: '正在导入文档并建立索引…',
+-    urlImportHint: '请输入由管理员预先批准的完整 HTTPS 文档 URL（.md、.txt、.csv 或 .json）。不支持登录凭据、查询参数或片段。',
+-    urlImportDestination: '留空将导入到您的私有资源。也可选择已有的资源目录，或输入完整的目标文件 URI。',
++    urlImportSubmitting: '正在提交导入请求…',
++    urlImportProcessing: '导入请求已受理，正在查询进度…',
++    urlImportHint: '请粘贴管理员预先批准的完整 HTTPS URL。主机名须为小写，文档须以 .md、.txt、.csv 或 .json 结尾。不支持登录凭据、端口、查询参数或片段。',
++    urlImportRequired: '请输入已批准的完整 HTTPS URL。',
++    urlImportInvalid: 'URL 格式不符合要求。请原样复制已批准的 HTTPS 文档地址，不要添加空格或改动地址。',
++    urlImportSource: '来源未获批准、暂时不可用，或不是支持的文本文档。请向管理员核对已批准的完整 URL；若地址正确，请稍后重试。',
++    urlImportSourceTimeout: '来源未及时响应。请核对已批准的 URL，稍后重试。',
++    urlImportDestination: '留空将导入到您的私有资源，也可选择已有的资源目录。',
++    urlImportParentInvalid: '请选择已有的资源目录，或留空以使用您的私有资源。',
++    urlImportExactHint: '请输入资源文件的完整 URI。如果该位置已有文件，本次导入可能会替换它。',
++    urlImportExactInvalid: '请输入以 .md、.txt、.csv 或 .json 结尾的完整资源文件 URI，或改选已有的资源目录。',
++    urlImportExactConsent: '如果此位置已有文件，允许本次导入替换该文件：',
++    urlImportConsentRequired: '请确认允许替换此路径下的文件，或改选资源目录以添加文件而不替换。',
++    urlImportDestinationRefused: '目标未获接受。请检查路径，并选择可写入的资源位置。',
++    urlImportAction: '导入文档',
++    urlImportExactAction: '导入到指定位置',
++    urlImportDone: '文档已导入：',
++    urlImportRefused: '导入请求被拒绝。请检查连接、已批准的 URL 和目标位置的写入权限后再试。',
++    urlImportFailed: '任务报告导入失败。请检查已批准的来源和目标位置，再启动新的导入。',
++    urlImportCancelled: '任务报告导入已取消。',
++    urlImportFollowUnavailable: '暂时无法读取任务状态。导入可能仍在进行，可重新查询同一任务，无需再次提交。',
++    urlImportFollowTimeout: '查询任务状态超时。导入可能仍在进行，可重新查询同一任务，无需再次提交。',
++    urlImportFollowPaused: '已暂停查询任务状态，未取消导入。',
++    urlImportUnknown: '服务器未确认是否受理该请求。请先查看处理任务，再决定是否重新导入。',
++    urlImportVerify: '查询任务状态',
++    urlImportShowTasks: '打开处理任务',
+     dataProfile: '工作区',
+     controlProfile: '管理',
+     controlKey: 'Root 或账号管理员 API 密钥',

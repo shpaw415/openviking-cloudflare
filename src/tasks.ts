@@ -149,6 +149,9 @@ export function jobAccess(ctx: WorkspaceContext, credential: string, enabled: Re
       await ensureAlarm(ctx.storage, due)
       await ctx.reauthorize?.()
       const row = ctx.storage.transactionSync(() => {
+        // URL imports enter with a durable Data lease. Validate it in the
+        // transaction that owns both the job and its destination reservation.
+        ctx.dataAuthority?.assertCurrent()
         const sql = ctx.sql
         const now = Date.now()
         sql.exec(`DELETE FROM ov_jobs WHERE status IN ${terminal} AND updated<?`, now - retentionMs)

@@ -1,0 +1,648 @@
+diff --git a/src/features/admin/gateway/components/gateway-layout.tsx b/src/features/admin/gateway/components/gateway-layout.tsx
+--- a/src/features/admin/gateway/components/gateway-layout.tsx
++++ b/src/features/admin/gateway/components/gateway-layout.tsx
+@@ -1,5 +1,5 @@
+ import { useAppConnection } from '#/features/connection/hooks/use-app-connection'
+-import { Outlet, useNavigate, useRouterState } from '@tanstack/react-router'
++import { Link, Outlet, useNavigate, useRouterState } from '@tanstack/react-router'
+ import {
+   ActivityIcon,
+   KeyRoundIcon,
+@@ -28,6 +28,7 @@
+ import { ToneBadge } from '#/features/admin/gateway/components/status-badges'
+ import { lockManagementKey } from '#/features/admin/gateway/lib/management-key'
+ import {
++  edgeKeyAccessReason,
+   useConnectionInfo,
+   useGateway,
+ } from '#/features/admin/gateway/lib/use-gateway'
+@@ -136,9 +137,9 @@
+  * availability gates, line tabs, and the active page.
+  */
+ export function GatewayLayout() {
+-  const { t } = useTranslation('gateway')
++  const { t } = useTranslation(['gateway', 'studio'])
+   const navigate = useNavigate()
+-  const { isGatewayHost } = useAppConnection()
++  const { isGatewayHost, connection: studioConnection } = useAppConnection()
+   const pathname = useRouterState({
+     select: (state) => state.location.pathname,
+   })
+@@ -150,16 +151,34 @@
+     managementKey,
+     connection,
+   } = useGateway()
+-  const edgeKeys = accessQuery.isSuccess && access?.edge?.dedicated_gateway_keys === true &&
+-    access.account_id === connection.accountId && access.user_id === connection.userId &&
+-    (access.role === 'admin' || access.role === 'user')
+-  const probe = useConnectionInfo({ enabled: EDGE_STUDIO ? edgeKeys : Boolean(access) })
++  const edgeRefusal = !EDGE_STUDIO ? undefined :
++    !allowed || !studioConnection.apiKey || (accessQuery.isError && [401, 403].includes(accessQuery.error.status))
++      ? 'connection'
++      : !accessQuery.isSuccess ? 'unconfirmed' : edgeKeyAccessReason(access, connection)
++  const probe = useConnectionInfo({ enabled: EDGE_STUDIO ? !edgeRefusal : Boolean(access) })
+ 
+   React.useEffect(() => {
+     if (isGatewayHost && !allowed && !isRoleLoading)
+       void navigate({ to: '/admin/settings' })
+   }, [isGatewayHost, allowed, isRoleLoading, navigate])
+-  if (isRoleLoading) return <LoadingState />
++  if (isRoleLoading || (EDGE_STUDIO && allowed && (accessQuery.isPending || (edgeRefusal && accessQuery.isFetching)))) return <LoadingState />
++  if (EDGE_STUDIO && edgeRefusal) {
++    return (
++      <section className="mx-auto grid w-full max-w-xl gap-4 rounded-xl border bg-card p-5" aria-live="polite">
++        <h1 className="text-lg font-medium">{t('studio:edge.unsupportedTitle')}</h1>
++        <p className="text-sm text-foreground">{t(`keys.edge.access.${edgeRefusal}`)}</p>
++        <div className="flex flex-wrap gap-2">
++          {edgeRefusal === 'unconfirmed' ? (
++            <Button type="button" onClick={() => void accessQuery.refetch()}>{t('keys.edge.verify')}</Button>
++          ) : edgeRefusal === 'unmounted' ? (
++            <Button nativeButton={false} render={<Link to="/filesystem" />}>{t('studio:edge.explorer')}</Button>
++          ) : (
++            <Button nativeButton={false} render={<Link to="/connections/new" />}>{t('studio:edge.useAnotherProfile')}</Button>
++          )}
++        </div>
++      </section>
++    )
++  }
+   if (!allowed) return <GatewayConnect />
+   if (accessQuery.isError)
+     return (
+@@ -171,8 +190,6 @@
+       />
+     )
+   if (!access) return <LoadingState />
+-  if (EDGE_STUDIO && !edgeKeys)
+-    return <p role="status">{t('appShell:edge.unsupportedTitle')}</p>
+   const activeTab = gatewayTabFor(pathname)
+ 
+   return (
+diff --git a/src/features/admin/gateway/components/keys-issue-dialog.tsx b/src/features/admin/gateway/components/keys-issue-dialog.tsx
+--- a/src/features/admin/gateway/components/keys-issue-dialog.tsx
++++ b/src/features/admin/gateway/components/keys-issue-dialog.tsx
+@@ -55,6 +55,8 @@
+ import { NEW_ID } from '#/features/admin/gateway/lib/search'
+ import { servedModels } from '#/features/admin/gateway/lib/upstream-schema'
+ import {
++  edgeRoutableModels,
++  useGatewayPresentation,
+   keyOwnerPermission,
+   useGateway,
+   useKeyUsers,
+@@ -149,6 +151,7 @@
+ }
+ 
+ type KeysIssueDialogProps = {
++  workspaceOnly?: boolean
+   open: boolean
+   onOpenChange: (open: boolean) => void
+   profiles: Profile[]
+@@ -172,6 +175,7 @@
+   upstreams,
+   onIssued,
+   defaults,
++  workspaceOnly = false,
+ }: KeysIssueDialogProps) {
+   const { t } = useTranslation('gateway')
+   const {
+@@ -186,12 +190,14 @@
+   const selfId = access?.user_id ?? connection.userId
+   const permission =
+     allowed && accessQuery.isSuccess ? keyOwnerPermission(access) : undefined
+-  const canPickUser = permission === true
+-  const usersQuery = useKeyUsers(open, accessQuery)
++  const canPickUser = permission === true && (!workspaceOnly || access?.role === 'admin')
++  const [forOther, setForOther] = React.useState(false)
++  const [confirmedUser, setConfirmedUser] = React.useState('')
++  const usersQuery = useKeyUsers(open && (!workspaceOnly || (canPickUser && forOther)), accessQuery, workspaceOnly)
+   const checkingOwner =
+-    allowed && (accessQuery.isPending || (canPickUser && usersQuery.isPending))
++    allowed && (accessQuery.isPending || (!workspaceOnly && canPickUser && usersQuery.isPending))
+   const cannotCheckOwner = !checkingOwner && !canPickUser && permission !== false
+-  const ownerUnavailable = checkingOwner || cannotCheckOwner
++  const present = useGatewayPresentation(connection)
+   const formId = React.useId()
+   const userTriggerRef = React.useRef<HTMLButtonElement>(null)
+   const keyInputRef = React.useRef<HTMLInputElement>(null)
+@@ -210,12 +216,21 @@
+ 
+   const issue = useMutation({
+     ...(EDGE_STUDIO ? { gcTime: 0 } : {}),
+-    mutationFn: (request: KeyRequest) => issueKey(connection, request),
+-    onSuccess: async (issued) => {
++    mutationFn: async (input: { request: KeyRequest; current: () => boolean }) => {
++      try {
++        const issued = await issueKey(connection, input.request)
++        return input.current() ? issued : null
++      } finally {
++        if (workspaceOnly && input.request.openviking_key !== undefined) input.request.openviking_key = ''
++      }
++    },
++    onSuccess: async (issued, { current }) => {
++      if (!issued || !current()) return
+       onIssued(issued)
+       await invalidate('keys', 'overview', 'tools')
+     },
+-    onError: (error) => {
++    onError: (error, { current }) => {
++      if (!current()) return
+       // A user, profile or upstream changed meanwhile; show the current lists.
+       const { status, reason } = toGatewayError(error)
+       if (reason === 'user_key_unreadable') setChosenMode('key')
+@@ -267,8 +282,23 @@
+     selectedUser?.api_key_available === false &&
+     (userId !== selfId || access?.role === 'root')
+ 
+-  const owner: KeyOwner =
+-    mode === 'self'
++  const recipients = users.filter((user) => user.user_id !== selfId && ['user', 'admin'].includes(user.role))
++  const directoryReady = usersQuery.isSuccess && !usersQuery.isFetching && !usersQuery.isPlaceholderData
++  const recipient = directoryReady && recipients.find((user) => user.user_id === draft.user_id)
++  const recipientConfirmed = !!recipient && confirmedUser === recipient.user_id
++  const ownerUnavailable = checkingOwner || cannotCheckOwner ||
++    (workspaceOnly && forOther && (!canPickUser || !recipientConfirmed))
++
++  React.useEffect(() => {
++    if (workspaceOnly && forOther && !recipient) {
++      setConfirmedUser('')
++      setDraft((current) => current.openviking_key ? { ...current, openviking_key: '' } : current)
++    }
++  }, [forOther, recipient])
++
++  const owner: KeyOwner = workspaceOnly
++    ? forOther ? { user_id: recipient ? recipient.user_id : '', openviking_key: draft.openviking_key.trim() } : {}
++    : mode === 'self'
+       ? {}
+       : mode === 'user' && !pasteForUser
+         ? { user_id: userId }
+@@ -303,9 +333,17 @@
+     ...new Set(
+       upstreams
+         .filter((upstream) => draft.upstream_ids.includes(upstream.id))
+-        .flatMap(servedModels),
++        .flatMap(workspaceOnly ? edgeRoutableModels : servedModels),
+     ),
+   ].sort()
++  const badModel = workspaceOnly && request.models.some((model) => !modelSuggestions.includes(model))
++  const rejectedModel = workspaceOnly && issue.isError && toGatewayError(issue.error).reason === 'model_not_allowed'
++  const modelError = (submitted && badModel) || rejectedModel ? t('keys.edge.modelError') : undefined
++
++  function pickRecipient(user_id: string) {
++    setConfirmedUser('')
++    update({ user_id, openviking_key: '' })
++  }
+ 
+   function update(patch: Partial<KeyDraft>) {
+     setDraft((current) => ({ ...current, ...patch }))
+@@ -314,7 +352,7 @@
+ 
+   // A field that appears (a mode switch, a user whose key must be pasted)
+   // takes focus; the switch button goes away with the previous field.
+-  const focusField = mode === 'key' || pasteForUser ? 'key' : mode
++  const focusField = workspaceOnly ? (forOther && recipientConfirmed ? 'key' : 'self') : mode === 'key' || pasteForUser ? 'key' : mode
+   const focusedField = React.useRef(focusField)
+   React.useEffect(() => {
+     const previous = focusedField.current
+@@ -343,12 +381,13 @@
+     event.preventDefault()
+     if (!open || pending || ownerUnavailable) return
+     setSubmitted(true)
+-    if (Object.keys(validateKeyRequest(request)).length) return
++    if (badModel || (workspaceOnly && !selectedProfile) || Object.keys(validateKeyRequest(request)).length) return
+     // A preselected user becomes the choice, so a retry goes to the same user.
+-    if (mode === 'user') {
++    if (!workspaceOnly && mode === 'user') {
+       setDraft((current) => ({ ...current, user_id: userId }))
+     }
+-    issue.mutate(request)
++    issue.mutate({ request, current: present })
++    if (workspaceOnly && forOther) setDraft((current) => ({ ...current, openviking_key: '' }))
+   }
+ 
+   const id = (field: string) => `${formId}-${field}`
+@@ -396,7 +435,53 @@
+                 ? t('keys.form.user.ready')
+                 : ''}
+           </p>
+-          {mode === 'blocked' ? (
++          {workspaceOnly && !checkingOwner && !cannotCheckOwner ? (
++            <div className="grid min-w-0 gap-3">
++              {canPickUser ? (
++                <fieldset className="flex min-w-0 flex-wrap gap-x-4 gap-y-2" disabled={pending}>
++                  <legend className="mb-2 text-sm font-medium">{t('keys.form.user.label')}</legend>
++                  <label className="inline-flex items-center gap-2 text-sm">
++                    <input type="radio" name={id('recipient')} checked={!forOther} onChange={() => { setForOther(false); pickRecipient('') }} />
++                    {t('keys.edge.forSelf')}
++                  </label>
++                  <label className="inline-flex items-center gap-2 text-sm">
++                    <input type="radio" name={id('recipient')} checked={forOther} onChange={() => { setForOther(true); pickRecipient('') }} />
++                    {t('keys.edge.forOther')}
++                  </label>
++                </fieldset>
++              ) : null}
++              {!forOther ? (
++                <p className="text-sm text-muted-foreground break-all">{t('keys.form.user.self', { user: selfId })}</p>
++              ) : <>
++                <SettingField label={t('keys.edge.recipient')} htmlFor={id('recipient-select')}>
++                  <select id={id('recipient-select')} value={recipient ? recipient.user_id : ''}
++                    className="h-10 w-full min-w-0 rounded-md border border-input bg-background px-2 text-base focus-visible:ring-2 focus-visible:ring-ring"
++                    disabled={pending || !directoryReady || !recipients.length}
++                    onChange={(event) => pickRecipient(event.target.value)}>
++                    <option value="">{t('keys.form.user.placeholder')}</option>
++                    {directoryReady ? recipients.map(({ user_id }) => <option key={user_id} value={user_id}>{user_id}</option>) : null}
++                  </select>
++                </SettingField>
++                {usersQuery.isFetching || usersQuery.isPending ? <p role="status" className="text-sm">{t('keys.form.user.loading')}</p> :
++                  !directoryReady || !recipients.length ? (
++                    <div className="grid justify-items-start gap-2">
++                      <p role="status" className="text-sm">{t(usersQuery.isError ? 'keys.edge.directoryFailed' : 'keys.edge.directoryEmpty')}</p>
++                      <Button type="button" size="sm" variant="outline" onClick={() => void usersQuery.refetch()}>{t('keys.edge.retryDirectory')}</Button>
++                    </div>
++                  ) : null}
++                {recipient ? (
++                  <label className="flex min-w-0 items-start gap-2 text-sm font-medium">
++                    <input type="checkbox" className="mt-0.5 size-4 shrink-0" checked={recipientConfirmed} disabled={pending}
++                      onChange={(event) => {
++                        setConfirmedUser(event.target.checked ? recipient.user_id : '')
++                        update({ openviking_key: '' })
++                      }} />
++                    <span className="min-w-0 break-all">{t('keys.edge.confirm', { user: recipient.user_id, account: connection.accountId })}</span>
++                  </label>
++                ) : null}
++              </>}
++            </div>
++          ) : mode === 'blocked' ? (
+             <SettingField label={t('keys.form.user.label')}>
+               <p role="alert" className="text-sm text-destructive">
+                 {t('keys.form.user.accessUnavailable')}
+@@ -468,17 +553,17 @@
+               </Select>
+             </SettingField>
+           ) : null}
+-          {mode === 'key' || pasteForUser ? (
++          {(workspaceOnly ? forOther && recipientConfirmed : mode === 'key' || pasteForUser) ? (
+             <SettingField
+               label={t(
+-                userId
++                workspaceOnly ? 'keys.edge.proofLabel' : userId
+                   ? 'keys.form.openvikingKey.forUser'
+                   : 'keys.form.openvikingKey.label',
+-                { user: userId },
++                { user: workspaceOnly && recipient ? recipient.user_id : userId },
+               )}
+               htmlFor={id('openviking-key')}
+               description={
+-                fallback ? (
++                workspaceOnly ? <span id={id('proof-help')}>{t('keys.edge.proofHelp')}</span> : fallback ? (
+                   <>
+                     <span className="block text-foreground">
+                       {t(`keys.form.user.${fallback}`)}
+@@ -506,6 +591,7 @@
+                 ref={keyInputRef}
+                 id={id('openviking-key')}
+                 type="password"
++                aria-describedby={workspaceOnly ? id('proof-help') : undefined}
+                 autoComplete="new-password"
+                 className="font-mono"
+                 value={draft.openviking_key}
+@@ -524,7 +610,7 @@
+             description={
+               profiles.length ? (
+                 t('keys.form.profile.description')
+-              ) : (
++              ) : workspaceOnly ? t('keys.edge.prerequisites.profile') : (
+                 <>
+                   {t(
+                     readOnly
+@@ -610,7 +696,7 @@
+             <FieldDescription className="text-xs">
+               {upstreams.length ? (
+                 t('keys.form.upstreams.description')
+-              ) : (
++              ) : workspaceOnly ? t('keys.edge.prerequisites.upstream') : (
+                 <>
+                   {t(
+                     readOnly
+@@ -651,7 +737,8 @@
+               </>
+             }
+             htmlFor={id('models')}
+-            description={t('keys.form.models.description')}
++            error={modelError}
++            description={t(workspaceOnly ? 'keys.edge.modelsHelp' : 'keys.form.models.description')}
+           >
+             <TagInput
+               id={id('models')}
+@@ -663,7 +750,7 @@
+             />
+           </SettingField>
+ 
+-          {problem && !problem.keyField ? (
++          {problem && !problem.keyField && !rejectedModel ? (
+             <Alert variant="destructive">
+               <CircleAlertIcon />
+               <AlertTitle>{t('keys.errors.title')}</AlertTitle>
+diff --git a/src/features/admin/gateway/components/keys-page.tsx b/src/features/admin/gateway/components/keys-page.tsx
+--- a/src/features/admin/gateway/components/keys-page.tsx
++++ b/src/features/admin/gateway/components/keys-page.tsx
+@@ -71,6 +71,8 @@
+ import {
+   useConnectionInfo,
+   useGateway,
++  edgeRoutableModels,
++  useGatewayPresentation,
+   useKeys,
+   useProfiles,
+   useUpstreams,
+@@ -92,6 +94,7 @@
+ export function KeysPage() {
+   const { t } = useTranslation('gateway')
+   const { connection, invalidate, readOnly, canIssueForOthers } = useGateway()
++  const present = useGatewayPresentation(connection)
+   const keysQuery = useKeys()
+   const profilesQuery = useProfiles()
+   const upstreamsQuery = useUpstreams()
+@@ -109,20 +112,22 @@
+   const [userTarget, setUserTarget] = React.useState<string | null>(null)
+ 
+   const revoke = useMutation({
+-    mutationFn: (key: GatewayKey) => revokeKey(connection, key.id),
+-    onSuccess: async (_result, key) => {
++    mutationFn: ({ key }: { key: GatewayKey; current: () => boolean }) => revokeKey(connection, key.id),
++    onSuccess: async (_result, { key, current }) => {
++      if (!current()) return
+       toast.success(t('keys.revoke.done', { name: key.name }))
+       await invalidate('keys', 'overview', 'tools')
+     },
+-    onError: (error) => toast.error(gatewayErrorMessage(t, error)),
++    onError: (error, { current }) => { if (current()) toast.error(gatewayErrorMessage(t, error)) },
+   })
+   const deleteUser = useMutation({
+-    mutationFn: (userId: string) => deleteUserData(connection, userId),
+-    onSuccess: async (_result, userId) => {
++    mutationFn: ({ userId }: { userId: string; current: () => boolean }) => deleteUserData(connection, userId),
++    onSuccess: async (_result, { userId, current }) => {
++      if (!current()) return
+       toast.success(t('keys.deleteUser.done', { user: userId }))
+       await invalidate('keys', 'overview', 'logs')
+     },
+-    onError: (error) => toast.error(gatewayErrorMessage(t, error)),
++    onError: (error, { current }) => { if (current()) toast.error(gatewayErrorMessage(t, error)) },
+   })
+ 
+   const keys = [...(keysQuery.data ?? [])].sort(
+@@ -131,7 +136,7 @@
+   const profiles = profilesQuery.data ?? []
+   const allUpstreams = upstreamsQuery.data ?? []
+   const upstreams = EDGE_STUDIO
+-    ? allUpstreams.filter((upstream) => upstream.enabled && upstream.base_url === 'binding://workers-ai')
++    ? allUpstreams.filter((upstream) => edgeRoutableModels(upstream).length > 0)
+     : allUpstreams
+   const listsReady = profilesQuery.isSuccess && upstreamsQuery.isSuccess
+   const missing: Missing | null = !listsReady
+@@ -145,13 +150,13 @@
+           : null
+   const canIssue = listsReady && !missing
+   // Only someone who can't add upstreams or profiles waits for the gateway admin.
+-  const missingReason = missing
+-    ? t(
+-        EDGE_STUDIO || readOnly
+-          ? 'keys.prerequisites.managed'
+-          : `keys.prerequisites.${missing}`,
+-      )
+-    : undefined
++  const missingReason = EDGE_STUDIO && (profilesQuery.isError || upstreamsQuery.isError)
++    ? t('keys.edge.prerequisitesFailed')
++    : missing
++      ? EDGE_STUDIO
++        ? t(`keys.edge.prerequisites.${missing}`)
++        : t(readOnly ? 'keys.prerequisites.managed' : `keys.prerequisites.${missing}`)
++      : undefined
+   const refreshing =
+     keysQuery.isFetching ||
+     profilesQuery.isFetching ||
+@@ -248,6 +253,9 @@
+         }
+       />
+ 
++      {EDGE_STUDIO && missingReason && keys.length > 0 ? (
++        <p role="status" className="text-sm text-foreground">{missingReason}</p>
++      ) : null}
+       <Card className="overflow-hidden py-0">
+         <CardContent className="p-0">
+           {keysQuery.isPending ? (
+@@ -316,7 +324,7 @@
+                     key={key.id}
+                     gatewayKey={key}
+                     profiles={profilesQuery.isSuccess ? profiles : undefined}
+-                    upstreams={upstreamsQuery.isSuccess ? upstreams : undefined}
++                    upstreams={upstreamsQuery.isSuccess ? allUpstreams : undefined}
+                     showUser={canIssueForOthers}
+                     onRevoke={
+                       key.source === 'openviking'
+@@ -338,6 +346,7 @@
+ 
+       {(!EDGE_STUDIO || issueOpen) && <KeysIssueDialog
+         key={issueSession}
++        workspaceOnly={EDGE_STUDIO}
+         open={issueOpen}
+         onOpenChange={setIssueOpen}
+         profiles={profiles}
+@@ -371,7 +380,7 @@
+         confirmLabel={t('keys.revoke.confirm')}
+         icon={<Trash2Icon />}
+         onConfirm={() =>
+-          revokeTarget ? revoke.mutateAsync(revokeTarget) : undefined
++          revokeTarget ? revoke.mutateAsync({ key: revokeTarget, current: present }) : undefined
+         }
+       />
+ 
+@@ -394,7 +403,7 @@
+         confirmLabel={t('keys.deleteUser.confirm')}
+         icon={<UserXIcon />}
+         onConfirm={() =>
+-          userTarget !== null ? deleteUser.mutateAsync(userTarget) : undefined
++          userTarget !== null ? deleteUser.mutateAsync({ userId: userTarget, current: present }) : undefined
+         }
+       />
+     </div>
+@@ -515,7 +524,9 @@
+       <TableCell className={DESKTOP_ONLY}>
+         {direct ? (
+           defaults
+-        ) : profile ? (
++        ) : profile ? EDGE_STUDIO ? (
++          <span className="block max-w-48 break-words">{profile.name}</span>
++        ) : (
+           <Link
+             to="/admin/gateway/profiles/$profileId"
+             params={{ profileId: profile.id }}
+diff --git a/src/features/admin/gateway/components/keys-secret-dialog.tsx b/src/features/admin/gateway/components/keys-secret-dialog.tsx
+--- a/src/features/admin/gateway/components/keys-secret-dialog.tsx
++++ b/src/features/admin/gateway/components/keys-secret-dialog.tsx
+@@ -1,3 +1,4 @@
++import { EDGE_STUDIO } from '#/shared/lib/edge-studio'
+ import { Link } from '@tanstack/react-router'
+ import { CheckIcon, ExternalLinkIcon, TriangleAlertIcon } from 'lucide-react'
+ import { useTranslation } from 'react-i18next'
+@@ -189,7 +190,7 @@
+                   )
+                 })}
+               </Tabs>
+-              <div>
++              {!EDGE_STUDIO && <div>
+                 <Button
+                   variant="ghost"
+                   size="sm"
+@@ -206,7 +207,7 @@
+                   <ExternalLinkIcon />
+                   {t('keys.secret.moreClients')}
+                 </Button>
+-              </div>
++              </div>}
+             </section>
+ 
+             <DialogFooter>
+diff --git a/src/features/admin/gateway/lib/api.ts b/src/features/admin/gateway/lib/api.ts
+--- a/src/features/admin/gateway/lib/api.ts
++++ b/src/features/admin/gateway/lib/api.ts
+@@ -97,6 +97,7 @@
+ 
+ /** An upstream as listed by the gateway; secrets are never returned. */
+ export type Upstream = UpstreamSettings & {
++  routable_models?: string[]
+   id: string
+   revision: number
+   has_api_key: boolean
+diff --git a/src/features/admin/gateway/lib/use-gateway.ts b/src/features/admin/gateway/lib/use-gateway.ts
+--- a/src/features/admin/gateway/lib/use-gateway.ts
++++ b/src/features/admin/gateway/lib/use-gateway.ts
+@@ -1,7 +1,7 @@
+ import i18n from '#/i18n/core'
+ import type { UseQueryOptions } from '@tanstack/react-query'
+ import { useQuery, useQueryClient } from '@tanstack/react-query'
+-import { useCallback, useMemo } from 'react'
++import { useCallback, useLayoutEffect, useMemo } from 'react'
+ 
+ import { useManagementKey } from '#/features/admin/gateway/lib/management-key'
+ import { useAppConnection } from '#/features/connection/hooks/use-app-connection'
+@@ -221,6 +221,31 @@
+ export const useKeys = (options?: GatewayQueryOptions<GatewayKey[]>) =>
+   useGatewayQuery('keys', [], listKeys, options)
+ 
++/** This handle belongs to the view that initiated a mutation, not its reply. */
++export function useGatewayPresentation(connection: GatewayConnection) {
++  const view = useMemo(() => ({ active: false }), [connection])
++  useLayoutEffect(() => {
++    view.active = true
++    return () => { view.active = false }
++  }, [view])
++  return () => !EDGE_STUDIO || view.active
++}
++
++export function edgeKeyAccessReason(access: GatewayAccess | undefined, connection: Pick<GatewayConnection, 'accountId' | 'userId'>) {
++  if (!access || typeof access.account_id !== 'string' || typeof access.user_id !== 'string') return 'unconfirmed'
++  if (access.account_id !== connection.accountId || access.user_id !== connection.userId) return 'wrongIdentity'
++  if (access.role !== 'user' && access.role !== 'admin') return 'wrongRole'
++  if (access.edge?.dedicated_gateway_keys === false) return 'unmounted'
++  if (access.edge?.dedicated_gateway_keys !== true || keyOwnerPermission(access) === undefined ||
++      (access.role === 'user' && access.can_issue_for_others === true)) return 'unconfirmed'
++}
++
++export function edgeRoutableModels(upstream: Upstream): string[] {
++  return upstream.enabled === true && upstream.base_url === 'binding://workers-ai' && Array.isArray(upstream.routable_models)
++    ? upstream.routable_models.filter((name) => typeof name === 'string' && name.length > 0)
++    : []
++}
++
+ /** Permissions come from an API response; unknown is not the self-only grant. */
+ export function keyOwnerPermission(access: unknown): boolean | undefined {
+   if (!access || typeof access !== 'object' || !('can_issue_for_others' in access)) {
+@@ -234,6 +259,7 @@
+ export function useKeyUsers(
+   open: boolean,
+   accessQuery: ReturnType<typeof useAccess>,
++  workspaceOnly = false,
+ ) {
+   const { allowed, connection, scope } = useGatewayConnection()
+   const queryClient = useQueryClient()
+@@ -262,6 +288,9 @@
+         void queryClient.cancelQueries({ queryKey, exact: true })
+         return []
+       }
++      if (workspaceOnly && (edgeKeyAccessReason(access, connection) || access.role !== 'admin')) {
++        throw new Error(i18n.t('studio:errors.gatewayUnavailable'))
++      }
+       return listKeyUsers(connection)
+     },
+   })
+diff --git a/src/i18n/locales/en/gateway/keys.ts b/src/i18n/locales/en/gateway/keys.ts
+--- a/src/i18n/locales/en/gateway/keys.ts
++++ b/src/i18n/locales/en/gateway/keys.ts
+@@ -1,4 +1,31 @@
+ const keys = {
++  edge: {
++    access: {
++      connection: 'The Workspace connection did not authorize Gateway Keys. Choose a Workspace connection and try again.',
++      wrongIdentity: 'The Gateway confirmed a different account or user. Switch to the intended Workspace connection.',
++      wrongRole: 'This connection does not have a Workspace member or account admin role for Gateway Keys.',
++      unmounted: 'This Workspace reports that dedicated Gateway Keys are disabled. Return to the explorer.',
++      unconfirmed: 'Could not confirm dedicated Gateway Keys for this Workspace. Verify access again before continuing.',
++    },
++    verify: 'Verify access again',
++    forSelf: 'For me',
++    forOther: 'For another member',
++    recipient: 'Beneficiary in this account',
++    confirm: 'I confirm {{user}} in account {{account}}',
++    directoryFailed: 'Could not load the account directory. Retry or issue a key only for yourself.',
++    directoryEmpty: 'No other member is available in this account. Retry or issue a key only for yourself.',
++    retryDirectory: 'Retry account directory',
++    proofLabel: 'Current OpenViking API key for {{user}}',
++    proofHelp: 'The Gateway verifies this current OpenViking API key without saving it. The new Gateway key is different and is shown only once after issuance.',
++    prerequisites: {
++      profile: 'Ask your Workspace admin to configure a context profile before issuing a key.',
++      upstream: 'No rule currently serves a model on Workers AI. Ask your Workspace admin to check the model catalog and its routing rules.',
++      both: 'Ask your Workspace admin to configure a context profile and a rule that serves a model on Workers AI.',
++    },
++    prerequisitesFailed: 'Could not check the context profiles or model rules. Refresh the lists to try again.',
++    modelsHelp: 'Optional. Choose names or aliases served by the selected Workers AI rules. Leaving this empty adds no restriction to those rules.',
++    modelError: 'A model or alias is not available on the selected rules. Choose a compatible name or remove the unavailable entry.',
++  },
+   description:
+     "Each gateway key (starting with ovgw_) belongs to one OpenViking user and uses one context profile and a set of upstreams. Keys can't be edited — issue a new key and revoke the old one.",
+   issue: 'Issue key',
+diff --git a/src/i18n/locales/zh-CN/gateway/keys.ts b/src/i18n/locales/zh-CN/gateway/keys.ts
+--- a/src/i18n/locales/zh-CN/gateway/keys.ts
++++ b/src/i18n/locales/zh-CN/gateway/keys.ts
+@@ -1,4 +1,31 @@
+ const keys = {
++  edge: {
++    access: {
++      connection: '此工作区连接未授权使用网关密钥。请选择工作区连接后重试。',
++      wrongIdentity: '网关确认的是其他账户或用户。请切换到正确的工作区连接。',
++      wrongRole: '此连接没有使用网关密钥所需的工作区成员或账户管理员角色。',
++      unmounted: '此工作区已停用专用网关密钥。请返回资源管理器。',
++      unconfirmed: '无法确认此工作区的专用网关密钥权限。请重新验证后再继续。',
++    },
++    verify: '重新验证权限',
++    forSelf: '为自己签发',
++    forOther: '为其他成员签发',
++    recipient: '此账户中的受益人',
++    confirm: '我确认受益人为账户 {{account}} 中的 {{user}}',
++    directoryFailed: '无法加载账户成员列表。请重试，或仅为自己签发密钥。',
++    directoryEmpty: '此账户没有其他可选成员。请重试，或仅为自己签发密钥。',
++    retryDirectory: '重试加载成员列表',
++    proofLabel: '{{user}} 当前的 OpenViking API 密钥',
++    proofHelp: '网关验证此当前 OpenViking API 密钥，但不会保存它。新签发的网关密钥与它不同，签发后仅显示一次。',
++    prerequisites: {
++      profile: '签发前请让工作区管理员配置上下文配置。',
++      upstream: '当前没有规则可通过 Workers AI 提供模型。请让工作区管理员检查模型目录和路由规则。',
++      both: '请让工作区管理员配置上下文及可通过 Workers AI 提供模型的规则。',
++    },
++    prerequisitesFailed: '无法检查上下文配置或模型规则。请刷新列表后重试。',
++    modelsHelp: '可选。请选择所选 Workers AI 规则支持的模型名或别名。留空表示不对这些规则增加限制。',
++    modelError: '所选规则不支持某个模型名或别名。请选择兼容的名称，或移除不可用项。',
++  },
+   description:
+     '每个网关密钥（以 ovgw_ 开头）属于一个 OpenViking 用户，使用一份上下文配置和一组上游。密钥不能修改，需要调整时请签发新密钥并吊销旧密钥。',
+   issue: '签发密钥',

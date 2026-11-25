@@ -1,22 +1,32 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { DurableObject } from 'cloudflare:workers'
-import type { Caller, ControlCaller } from './context.js'
+import type { Caller, ControlCaller, Env } from './context.js'
+import type { KeyAuthority } from './gateway/keys.js'
+import { GatewayError, within } from './gateway/contract.js'
+import { authorityReceipt, isAuthorityRevision, sameAuthority, validRevision } from './data-authority.js'
+import type { AuthorityAdvance, AuthorityRevision, DataAuthorityGrant } from './data-authority.js'
 import { ApiError, apiError, isRecord, ok, readBytes, readJson } from './http.js'
-import { LIMIT, absent, bad, boolParam, directory, fields, forbidden, hasCallerShape, id, memberIds, newKey, rejectSeed, role, unavailable } from './control/input.js'
+import { LIMIT, absent, bad, boolParam, digestPattern, directory, fields, forbidden, hasCallerShape, id, memberIds, newKey, rejectSeed, role, unavailable } from './control/input.js'
 import { fixedCallers, Registry } from './control/registry.js'
 import type { ModelProbeBinding } from './control/provider.js'
 import { probeActiveModel, probeKind, probeModel } from './control/provider.js'
 import { configurationPatch, evolution, Settings, systemPatch, userPatch } from './control/settings.js'
 import { memoryTypes } from './control/template-defaults.js'
 import { memoryType, Templates } from './control/templates.js'
-import { bindModel, configFileLimit, legacyEmbedding, patchModels, selectedVlm } from './model-config.js'
-import type { ModelEnv, ModelSettings } from './model-config.js'
+import { bindModel, configFileLimit, edgeSearchDefaults, legacyEmbedding, patchModels, selectedVlm } from './model-config.js'
+import type { ModelSettings } from './model-config.js'
 
 export type { ControlCaller } from './context.js'
 
 const prefix = '/api/v1/admin/'
 const readBody = (request: Request) => readJson(request, LIMIT.body)
 const methodError = () => new ApiError(405, 'METHOD_NOT_ALLOWED', 'Method not allowed on this route.')
+const fenceUnavailable = () => new GatewayError(503, 'GATEWAY_FENCE_UNAVAILABLE',
+  'The Gateway model change has not been committed. Retry the same import after the workspaces can acknowledge it.')
+type PendingMount = { revision: number; data: string }
+type AuthorityMutation<T> = { scope: 'account' | readonly string[]; commit: () => T }
+export type GatewayMount = { status: 'ok'; revision: number; credentialRevision: AuthorityRevision; settings: ModelSettings; groups: string[];
+  principals: { users: string[]; groups: string[] } } | { status: 'changed' | 'expired' | 'authority_changed' }
 
 function root(caller: ControlCaller): void { if (caller.role !== 'root') throw forbidden() }
 function manager(caller: ControlCaller): void { if (caller.role === 'user') throw forbidden() }
@@ -51,12 +61,63 @@ async function optionalRotationBody(request: Request): Promise<void> {
   rejectSeed(value.seed)
 }
 
-export class Control extends DurableObject<ModelEnv> {
+export class Control extends DurableObject<Env> {
   #registry = new Registry(this.ctx.storage)
   #settings = new Settings(this.#registry.sql)
   #templates = new Templates(this.#registry.sql)
+  #mountSql = this.#initMountStore()
+  #changingMount = false
+  // Serialize conflicting registry writes, not the request queue of the DO.
+  // A member with a slow Workspace ACK must not block anyone else's grants.
+  #authorityWrites = new Set<string>()
+  #rotatingDigests = new Set<string>()
 
   resolve(digestHex: string): Caller | null { return this.#registry.resolve(digestHex) }
+
+  #gatewayIndex() {
+    const { sql } = this.#registry
+    sql.exec(`CREATE TABLE IF NOT EXISTS ov_control_gateway_index (
+      digest TEXT PRIMARY KEY CHECK(length(digest)=64), account_id TEXT NOT NULL
+    ) WITHOUT ROWID`)
+    sql.exec('CREATE INDEX IF NOT EXISTS ov_control_gateway_account ON ov_control_gateway_index(account_id)')
+    return sql
+  }
+
+  /** Private locator only. The owning Workspace still authenticates the digest. */
+  gatewayAccount(digest: string): string | null {
+    if (!digestPattern.test(digest)) return null
+    return this.#gatewayIndex().exec<{ account_id: string }>(`SELECT g.account_id FROM ov_control_gateway_index g
+      JOIN ov_control_accounts a ON a.account_id=g.account_id AND a.deleted=0 WHERE g.digest=?`, digest).toArray()[0]?.account_id ?? null
+  }
+
+  /** Called by the authenticated, single-issuer Workspace; prune interrupted issues or retired locators. */
+  registerGatewayDigest(issuer: KeyAuthority, owner: KeyAuthority, fixed: Caller[], digest: string, live: string[]): boolean {
+    const account = id(issuer.caller.accountId, 'account_id')
+    if (owner.caller.accountId !== account || (issuer.caller.role !== 'admin' &&
+        (owner.caller.userId !== issuer.caller.userId || owner.caller.agentId !== issuer.caller.agentId))) return false
+    if (!digestPattern.test(digest) || !Array.isArray(live) || live.length >= 128 || !live.every(known => digestPattern.test(known))) throw bad('Invalid Gateway index update.')
+    const sql = this.#gatewayIndex()
+    const locals = fixedCallers(fixed).filter(item => item.accountId === account)
+    return this.#registry.tx(() => {
+      if (!sql.exec('SELECT 1 FROM ov_control_accounts WHERE account_id=? AND deleted=0', account).toArray().length) return false
+      try {
+        for (const grant of [issuer, owner]) {
+          if (!hasCallerShape(grant.caller) || (grant.caller.role !== 'admin' && grant.caller.role !== 'user') || !digestPattern.test(grant.digest)) return false
+          if (this.#authorityPending(account, grant.caller.userId)) return false
+          this.#registry.admitted(grant.caller, locals, grant.managed ? grant.digest : undefined)
+        }
+      } catch (error) {
+        if (error instanceof ApiError && (error.status === 401 || error.status === 403)) return false
+        throw error
+      }
+      const retained = new Set(live)
+      for (const row of sql.exec<{ digest: string }>('SELECT digest FROM ov_control_gateway_index WHERE account_id=?', account).toArray()) {
+        if (!retained.has(row.digest)) sql.exec('DELETE FROM ov_control_gateway_index WHERE account_id=? AND digest=?', account, row.digest)
+      }
+      sql.exec('INSERT INTO ov_control_gateway_index VALUES (?,?)', digest, account)
+      return true
+    })
+  }
 
   /** Private lookup for a tuple already authenticated and mapped by the parent. */
   resolveManagedIdentity(accountId: string, userId: string, agentId: string): Caller | null {
@@ -65,8 +126,239 @@ export class Control extends DurableObject<ModelEnv> {
 
   probe(): boolean { return this.#registry.sql.exec<{ n: number }>('SELECT 1 AS n').one().n === 1 }
 
+  /** Read-only topology gate for the private backup binding. Fixed seats must
+   * have been provisioned independently; do not reserve or read any keys here. */
+  backupFixedTopology(accountId: string, users: string[]): boolean {
+    const account = id(accountId, 'account_id')
+    if (!Array.isArray(users) || users.length < 1 || users.length > 32) return false
+    const { sql } = this.#registry
+    if (!sql.exec("SELECT 1 FROM ov_control_accounts WHERE account_id=? AND origin='fixed' AND deleted=0", account).toArray().length) return false
+    const rows = sql.exec<{ user_id: string; origin: string; deleted: number }>(`SELECT user_id,origin,deleted FROM ov_control_users
+      WHERE account_id=? ORDER BY user_id LIMIT 33`, account).toArray()
+    return rows.length === users.length && rows.every((row, i) => row.origin === 'fixed' && !row.deleted && row.user_id === users[i]) &&
+      !sql.exec("SELECT 1 FROM ov_control_settings WHERE account_id=? AND user_id!='' LIMIT 1", account).toArray().length
+  }
+
   /** Private DO RPC: operational defaults only, never a deployment secret. */
   modelSettings(): ModelSettings { return this.#settings.models().settings }
+
+  #initMountStore() {
+    const { sql } = this.#registry
+    sql.exec(`CREATE TABLE IF NOT EXISTS ov_control_gateway_mount_workspaces (
+      account_id TEXT PRIMARY KEY REFERENCES ov_control_accounts(account_id)
+    ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS ov_control_gateway_mount_pending (
+      id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL, data TEXT NOT NULL CHECK(json_valid(data))
+    );
+    CREATE TABLE IF NOT EXISTS ov_control_gateway_credential_fence (
+      account_id TEXT PRIMARY KEY REFERENCES ov_control_accounts(account_id), revision INTEGER NOT NULL CHECK(revision>=0)
+    ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS ov_control_data_member_fence (
+      account_id TEXT NOT NULL, user_id TEXT NOT NULL, revision INTEGER NOT NULL CHECK(revision>0),
+      pending INTEGER NOT NULL CHECK(pending IN (0,1)), PRIMARY KEY (account_id,user_id),
+      FOREIGN KEY (account_id,user_id) REFERENCES ov_control_users(account_id,user_id)
+    ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS ov_control_data_account_pending (
+      account_id TEXT PRIMARY KEY REFERENCES ov_control_accounts(account_id), revision INTEGER NOT NULL CHECK(revision>0)
+    ) WITHOUT ROWID`)
+    return sql
+  }
+
+  /** Private DO RPC. One authoritative read of the grant, directory and mount.
+   * Enrollment must commit with the snapshot, before an import can freeze it. */
+  gatewayModelGrant(digest: string, owner: KeyAuthority, fixed: Caller[], expected?: number): GatewayMount {
+    return this.#gatewayMount(digest, owner, fixed, expected)
+  }
+
+  /** Only an authenticated ordinary Data requester can receive this mount. */
+  gatewayDataGrant(owner: KeyAuthority, fixed: Caller[], expected?: number): GatewayMount {
+    return this.#gatewayMount(null, owner, fixed, expected)
+  }
+
+  /** Binding-only: the directory and the credential/group revision are read
+   * together. This grant neither reads nor enrolls model configuration. */
+  dataAuthorityGrant(owner: KeyAuthority, fixed: Caller[], expected?: AuthorityRevision): DataAuthorityGrant {
+    const account = owner.caller.accountId
+    const locals = fixedCallers(fixed).filter(item => item.accountId === account)
+    return this.#registry.tx(() => {
+      if (!this.#admittedData(owner, locals)) return { status: 'expired' }
+      const revision = this.#dataRevision(account, owner.caller.userId, expected === undefined)
+      if (!revision || expected !== undefined && (!isAuthorityRevision(expected) || !sameAuthority(revision, expected))) return { status: 'changed' }
+      return { status: 'ok', revision, groups: this.#registry.groupsFor(owner.caller), principals: this.#registry.principals(account, locals) }
+    })
+  }
+
+  #admittedData(owner: KeyAuthority, locals: Caller[]): boolean {
+    if (!hasCallerShape(owner.caller) || owner.caller.role !== 'admin' && owner.caller.role !== 'user' ||
+        typeof owner.managed !== 'boolean' || !digestPattern.test(owner.digest)) return false
+    if (!owner.managed && !locals.some(item => item.userId === owner.caller.userId &&
+        item.agentId === owner.caller.agentId && item.role === owner.caller.role)) return false
+    try { this.#registry.admitted(owner.caller, locals, owner.managed ? owner.digest : undefined) }
+    catch (error) {
+      if (error instanceof ApiError && (error.status === 401 || error.status === 403)) return false
+      throw error
+    }
+    return this.#registry.active(owner.caller)
+  }
+
+  #accountRevision(account: string): number | undefined {
+    return this.#mountSql.exec<{ revision: number }>('SELECT revision FROM ov_control_gateway_credential_fence WHERE account_id=?', account).toArray()[0]?.revision
+  }
+
+  #authorityPending(account: string, user: string): boolean {
+    return this.#mountSql.exec<{ pending: number }>(`SELECT EXISTS(SELECT 1 FROM ov_control_data_account_pending WHERE account_id=?)
+      OR EXISTS(SELECT 1 FROM ov_control_data_member_fence WHERE account_id=? AND user_id=? AND pending=1) AS pending`,
+      account, account, user).one().pending === 1
+  }
+
+  #dataRevision(account: string, user: string, enroll: boolean): AuthorityRevision | undefined {
+    if (this.#authorityPending(account, user)) return undefined
+    const sql = this.#mountSql
+    if (enroll) sql.exec('INSERT OR IGNORE INTO ov_control_gateway_credential_fence VALUES (?,0)', account)
+    const accountRevision = this.#accountRevision(account)
+    const member = sql.exec<{ revision: number }>('SELECT revision FROM ov_control_data_member_fence WHERE account_id=? AND user_id=?', account, user).toArray()[0]?.revision ?? 0
+    return validRevision(accountRevision) && validRevision(member) ? { account: accountRevision, member } : undefined
+  }
+
+  #gatewayMount(digest: string | null, owner: KeyAuthority, fixed: Caller[], expected?: number): GatewayMount {
+    const account = owner.caller.accountId
+    const locals = fixedCallers(fixed).filter(item => item.accountId === account)
+    const sql = this.#mountSql
+    return this.#registry.tx(() => {
+      if ((digest !== null && this.gatewayAccount(digest) !== account) || !this.#admittedData(owner, locals)) return { status: 'expired' }
+      const { revision, settings } = this.#settings.models()
+      if (!validRevision(revision) || sql.exec('SELECT 1 FROM ov_control_gateway_mount_pending WHERE id=1').toArray().length ||
+          (expected !== undefined && expected !== revision)) return { status: 'changed' }
+      const credentialRevision = this.#dataRevision(account, owner.caller.userId, expected === undefined)
+      if (!credentialRevision) return { status: 'authority_changed' }
+      if (expected === undefined) {
+        sql.exec('INSERT OR IGNORE INTO ov_control_gateway_mount_workspaces VALUES (?)', account)
+      }
+      else if (!sql.exec('SELECT 1 FROM ov_control_gateway_mount_workspaces WHERE account_id=?', account).toArray().length) {
+        return { status: 'changed' }
+      }
+      return { status: 'ok', revision, credentialRevision, settings, groups: this.#registry.groupsFor(owner.caller),
+        principals: this.#registry.principals(account, locals) }
+    })
+  }
+
+  #requireIdleAuthorityWriter(account: string): void {
+    if (this.#authorityWrites.has(account)) throw new ApiError(409, 'CONFLICT', 'An authority change is already in progress in this account.')
+  }
+
+  #requireUnreservedDigest(digest: string): void {
+    if (this.#rotatingDigests.has(digest)) throw new ApiError(503, 'KEY_ISSUANCE_UNAVAILABLE', 'A new credential could not be allocated.')
+  }
+
+  /** Prepare the registry mutation and reserve its inputs and epoch together.
+   * Grant reads for other members stay available during the ACK. If the ACK
+   * is lost, no registry change or history entry commits: only affected grants
+   * remain frozen, even after restart, until an authorized effective retry. */
+  async #changeDataAuthority<T>(account: string, write: <U>(op: () => U) => U,
+    prepare: () => AuthorityMutation<T>, reservedDigest?: string): Promise<T> {
+    const unavailable = () => new ApiError(503, 'GATEWAY_FENCE_UNAVAILABLE', 'The authority change has not been committed. Retry when the Workspace can acknowledge it.')
+    this.#requireIdleAuthorityWriter(account)
+    if (reservedDigest) this.#requireUnreservedDigest(reservedDigest)
+    this.#authorityWrites.add(account)
+    if (reservedDigest) this.#rotatingDigests.add(reservedDigest)
+    const sql = this.#mountSql
+    try {
+      const plan = write(() => {
+        const { scope, commit } = prepare()
+        const before = this.#accountRevision(account)
+        if (before === undefined || scope !== 'account' && scope.length === 0) return { done: true as const, result: commit() }
+        let advance: AuthorityAdvance
+        if (scope === 'account') {
+          const revision = before + 1
+          if (!validRevision(revision)) throw unavailable()
+          sql.exec('UPDATE ov_control_gateway_credential_fence SET revision=? WHERE account_id=?', revision, account)
+          sql.exec(`INSERT INTO ov_control_data_account_pending VALUES (?,?) ON CONFLICT(account_id) DO UPDATE SET revision=excluded.revision`, account, revision)
+          advance = { scope: 'account', revision }
+        } else {
+          const floors = [...new Set(scope)].sort().map(user => {
+            const row = sql.exec<{ revision: number }>('SELECT revision FROM ov_control_data_member_fence WHERE account_id=? AND user_id=?', account, user).toArray()[0]
+            const revision = (row?.revision ?? 0) + 1
+            if (!validRevision(revision)) throw unavailable()
+            return [user, revision] as const
+          })
+          sql.exec(`INSERT INTO ov_control_data_member_fence(account_id,user_id,revision,pending)
+            SELECT ?,json_extract(value,'$[0]'),json_extract(value,'$[1]'),1 FROM json_each(?) WHERE true
+            ON CONFLICT(account_id,user_id) DO UPDATE SET revision=excluded.revision,pending=1`, account, JSON.stringify(floors))
+          advance = { scope: 'members', floors }
+        }
+        return { done: false as const, advance, commit }
+      })
+      if (plan.done) return plan.result
+      const workspace = this.env.WORKSPACES.getByName(`openviking:account:${account}`)
+      try {
+        const receipt = await within(4_000, () => workspace.fenceGatewayCredentials(account, plan.advance),
+          () => new GatewayError(503, 'GATEWAY_FENCE_UNAVAILABLE', 'The Workspace did not acknowledge the authority change.'))
+        if (receipt !== authorityReceipt(plan.advance)) throw unavailable()
+      } catch { throw unavailable() }
+      return write(() => {
+        const result = plan.commit()
+        const { advance } = plan
+        if (advance.scope === 'account') {
+          sql.exec('DELETE FROM ov_control_data_account_pending WHERE account_id=? AND revision=?', account, advance.revision)
+        } else {
+          sql.exec(`UPDATE ov_control_data_member_fence SET pending=0 WHERE account_id=? AND (user_id,revision) IN
+            (SELECT json_extract(value,'$[0]'),json_extract(value,'$[1]') FROM json_each(?))`, account, JSON.stringify(advance.floors))
+        }
+        return result
+      })
+    } finally {
+      this.#authorityWrites.delete(account)
+      if (reservedDigest) this.#rotatingDigests.delete(reservedDigest)
+    }
+  }
+
+  /** Freeze admissions, fence every enrolled Workspace, then commit. A partial
+   * fence is never unwound; after interruption only the same import can resume. */
+  async #importModels(match: string | null, dryRun: boolean, body: Record<string, unknown>, write: <T>(op: () => T) => T) {
+    const sql = this.#mountSql
+    const conflict = () => new ApiError(409, 'CONFLICT', 'Configuration revision changed or another model import is pending.')
+    const plan = write(() => {
+      const current = this.#settings.models()
+      if (match !== null && Number(match) !== current.revision) throw conflict()
+      const settings = patchModels(current.settings, body, this.env)
+      const data = JSON.stringify(settings)
+      if (dryRun) return { ...current, settings }
+      const pending = sql.exec<PendingMount>('SELECT revision,data FROM ov_control_gateway_mount_pending WHERE id=1').toArray()[0]
+      if (!pending && data === JSON.stringify(current.settings)) return current
+      const revision = current.revision + 1
+      if (!validRevision(revision) || this.#changingMount || (pending && (pending.revision !== revision || pending.data !== data))) throw conflict()
+      sql.exec('INSERT OR IGNORE INTO ov_control_gateway_mount_pending VALUES (1,?,?)', revision, data)
+      const accounts = sql.exec<{ account_id: string }>('SELECT account_id FROM ov_control_gateway_mount_workspaces ORDER BY account_id').toArray()
+      // Includes suspended/deleted tenants if they once received this mount.
+      if (accounts.length > LIMIT.accounts) throw fenceUnavailable()
+      return { revision, settings, data, accounts }
+    })
+    if (!('accounts' in plan)) return plan
+    this.#changingMount = true
+    try {
+      const deadline = Date.now() + 10_000
+      for (let i = 0; i < plan.accounts.length; i += 16) {
+        const remaining = deadline - Date.now()
+        if (remaining <= 0) throw fenceUnavailable()
+        try {
+          await within(remaining, async () => {
+            await Promise.all(plan.accounts.slice(i, i + 16).map(async ({ account_id }) => {
+              const workspace = this.env.WORKSPACES.getByName(`openviking:account:${account_id}`)
+              if (await workspace.fenceGatewayModel(account_id, plan.revision) !== plan.revision) throw fenceUnavailable()
+            }))
+          }, fenceUnavailable)
+        } catch { throw fenceUnavailable() }
+      }
+      return write(() => {
+        const pending = sql.exec<PendingMount>('SELECT revision,data FROM ov_control_gateway_mount_pending WHERE id=1').one()
+        if (pending.revision !== plan.revision || pending.data !== plan.data ||
+            this.#settings.models().revision !== plan.revision - 1) throw conflict()
+        this.#settings.saveModels(plan.revision, plan.settings)
+        sql.exec('DELETE FROM ov_control_gateway_mount_workspaces; DELETE FROM ov_control_gateway_mount_pending WHERE id=1')
+        return { revision: plan.revision, settings: plan.settings }
+      })
+    } finally { this.#changingMount = false }
+  }
 
   groupsFor(caller: Caller): string[] { return this.#registry.groupsFor(caller) }
 
@@ -153,7 +445,9 @@ export class Control extends DurableObject<ModelEnv> {
           return ok({ revision, dry_run, settings, effective: {
             vlm: vlm ? { ...vlm, configured: !!bindModel(this.env, vlm) } : null,
             embedding: { ...embedding, configured: !!bindModel(this.env, embedding), scope: 'new_workspaces' },
-            default_search_limit: settings.default_search_limit ?? 10,
+            default_search_limit: settings.default_search_limit ?? edgeSearchDefaults.limit,
+            default_search_score_threshold: settings.default_search_score_threshold ?? edgeSearchDefaults.score,
+            retrieval: { use_session_context: settings.retrieval?.enable_intent ?? edgeSearchDefaults.sessionContext, intent_planner: false },
           } })
         }
         if (verb === 'GET') {
@@ -164,15 +458,8 @@ export class Control extends DurableObject<ModelEnv> {
         const match = params.get('if_revision')
         if (match !== null && (!/^\d+$/.test(match) || !Number.isSafeInteger(Number(match)))) throw bad('Invalid configuration revision.')
         const body = await readJson(request, configFileLimit)
-        return write(() => {
-          const current = this.#settings.models()
-          if (match !== null && Number(match) !== current.revision) throw new ApiError(409, 'CONFLICT', 'Configuration revision changed.')
-          const settings = patchModels(current.settings, body, this.env)
-          const changed = JSON.stringify(settings) !== JSON.stringify(current.settings)
-          const revision = !dryRun && changed ? current.revision + 1 : current.revision
-          if (!dryRun && changed) this.#settings.saveModels(revision, settings)
-          return view(revision, settings, dryRun)
-        })
+        const { revision, settings } = await this.#importModels(match, dryRun, body, write)
+        return view(revision, settings, dryRun)
       }
       if (path.length === 2 && account === 'test-model') {
         if (verb !== 'POST') throw methodError()
@@ -233,6 +520,7 @@ export class Control extends DurableObject<ModelEnv> {
       const userConfig = userPatch({}, body.user_config, true)
       const { key, digest } = await newKey()
       write(() => {
+        this.#requireUnreservedDigest(digest)
         registry.create(accountId, userId, digest)
         this.#settings.saveSystem(accountId, settings)
         this.#settings.saveUser(accountId, userId, userConfig)
@@ -244,7 +532,10 @@ export class Control extends DurableObject<ModelEnv> {
       root(caller)
       if (verb === 'GET') return ok(registry.accounts(uniqueFixedUsers(fixed), account)[0])
       if (verb !== 'DELETE') throw methodError()
-      write(() => registry.revoke(account))
+      await this.#changeDataAuthority(account, write, () => {
+        if (registry.account(account).origin !== 'managed') throw forbidden()
+        return { scope: 'account', commit: () => registry.revoke(account) }
+      })
       return ok({ account_id: account, status: 'revoked', data_retained: true }, 202)
     }
     if ((collection === 'settings' || collection === 'configuration') && path.length === 3) {
@@ -291,11 +582,16 @@ export class Control extends DurableObject<ModelEnv> {
         const body = await readBody(request)
         fields(body, ['group_id'])
         const group = id(body.group_id, 'group_id')
-        return ok(write(() => registry.createGroup(account, group)))
+        return ok(write(() => { this.#requireIdleAuthorityWriter(account); return registry.createGroup(account, group) }))
       }
       if (path.length === 4) {
         if (verb !== 'DELETE') throw methodError()
-        write(() => registry.deleteGroup(account, user))
+        await this.#changeDataAuthority(account, write, () => {
+          registry.listMembers(account, user, fixed)
+          // Deletion changes the account's ACL-principal catalogue as well
+          // as memberships, including for ACL authors outside the group.
+          return { scope: 'account', commit: () => registry.deleteGroup(account, user) }
+        })
         return ok({ deleted: true })
       }
       if (path.length !== 5 || action !== 'members') throw absent()
@@ -303,7 +599,10 @@ export class Control extends DurableObject<ModelEnv> {
       if (verb !== 'PUT' && verb !== 'DELETE') throw methodError()
       const members = memberIds(await readBody(request))
       const add = verb === 'PUT'
-      const changed = write(() => registry.updateMembers(account, user, members, fixed, add))
+      const changed = await this.#changeDataAuthority(account, write, () => {
+        const { changed, commit } = registry.prepareMembers(account, user, members, fixed, add)
+        return { scope: changed, commit }
+      })
       return ok(add ? { added: changed } : { removed: changed })
     }
     if (collection !== 'users') throw absent()
@@ -334,6 +633,8 @@ export class Control extends DurableObject<ModelEnv> {
       const userConfig = userPatch({}, body.user_config, true)
       const { key, digest } = await newKey()
       write(() => {
+        this.#requireIdleAuthorityWriter(account)
+        this.#requireUnreservedDigest(digest)
         registry.register(account, userId, newRole, digest)
         this.#settings.saveUser(account, userId, userConfig)
       })
@@ -343,7 +644,10 @@ export class Control extends DurableObject<ModelEnv> {
       manager(caller)
       if (verb === 'GET') return ok(registry.member(account, user, fixed))
       if (verb !== 'DELETE') throw methodError()
-      write(() => registry.revoke(account, user))
+      await this.#changeDataAuthority(account, write, () => {
+        registry.writableUser(account, user)
+        return { scope: [user], commit: () => registry.revoke(account, user) }
+      })
       return ok({ account_id: account, user_id: user, status: 'revoked', data_retained: true }, 202)
     }
     if (path.length !== 5) throw absent()
@@ -353,7 +657,10 @@ export class Control extends DurableObject<ModelEnv> {
       const body = await readBody(request)
       fields(body, ['role'])
       const newRole = role(body.role)
-      write(() => registry.changeRole(account, user, newRole))
+      await this.#changeDataAuthority(account, write, () => ({
+        scope: registry.writableUser(account, user).role === newRole ? [] : [user],
+        commit: () => registry.changeRole(account, user, newRole),
+      }))
       return ok({ account_id: account, user_id: user, role: newRole })
     }
     if (action === 'settings') {
@@ -374,7 +681,7 @@ export class Control extends DurableObject<ModelEnv> {
     const previous = registry.writableUser(account, user).digest
     await optionalRotationBody(request)
     const { key, digest } = await newKey()
-    write(() => registry.rotate(account, user, digest, previous))
+    await this.#changeDataAuthority(account, write, () => ({ scope: [user], commit: registry.prepareRotation(account, user, digest, previous) }), digest)
     return ok({ user_key: key })
   }
 }

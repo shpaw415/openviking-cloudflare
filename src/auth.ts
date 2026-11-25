@@ -4,6 +4,9 @@ import { ApiError, isRecord } from './http.js'
 import { authenticateOidc, reauthorizeOidc } from './oidc.js'
 import type { OidcGrant, ResolveOidcUser } from './oidc.js'
 import type { ModelSettings } from './model-config.js'
+import type { KeyAuthority } from './gateway/keys.js'
+import type { GatewayMount } from './control.js'
+import type { AuthorityRevision, DataAuthorityGrant } from './data-authority.js'
 
 interface Principal {
   key: string
@@ -16,10 +19,18 @@ export interface AuthGrant {
   managed: boolean
   oauth?: string
   oidc?: OidcGrant
+  /** Internal only; set by the public Worker after route and credential admission. */
+  gatewayDigest?: string
+  gatewayKeysMounted?: true
 }
 
 type ControlClient = {
   resolve(digest: string): Promise<Caller | null>
+  gatewayAccount(digest: string): Promise<string | null>
+  gatewayModelGrant(digest: string, owner: KeyAuthority, fixed: Caller[], expected?: number): Promise<GatewayMount>
+  gatewayDataGrant(owner: KeyAuthority, fixed: Caller[], expected?: number): Promise<GatewayMount>
+  dataAuthorityGrant(owner: KeyAuthority, fixed: Caller[], expected?: AuthorityRevision): Promise<DataAuthorityGrant>
+  registerGatewayDigest(issuer: KeyAuthority, owner: KeyAuthority, fixed: Caller[], digest: string, live: string[]): Promise<boolean>
   resolveManagedIdentity(accountId: string,userId: string,agentId: string): Promise<Caller | null>
   dispatch(request: Request, caller: ControlCaller, fixed: ControlCaller[], credentialDigest?: string): Promise<Response>
   groupsFor(caller: Caller): Promise<string[]>
@@ -34,6 +45,7 @@ export function controlFor(env: Env): ControlClient | null {
 }
 
 const credentialPattern = /^[A-Za-z0-9_-]{32,128}$/
+export const gatewayCredentialPattern = /^ovgw_[A-Za-z0-9_-]{43}$/
 const idPattern = /^[A-Za-z0-9_-]{1,48}$/
 const encoder = new TextEncoder()
 const configurationError = () => new ApiError(503, 'AUTH_NOT_CONFIGURED', 'Worker API keys are not configured.')
@@ -73,6 +85,12 @@ export function extractCredential(request: Request): string {
   const candidate = authorization === null ? apiKey : /^Bearer ([A-Za-z0-9_-]{32,128})$/i.exec(authorization)?.[1]
   if (!candidate || !credentialPattern.test(candidate)) throw authError()
   return candidate
+}
+
+export function dedicatedGatewayCredential(request: Request): string | undefined {
+  const candidate = request.headers.get('x-api-key') ?? /^Bearer (.+)$/i.exec(request.headers.get('authorization') ?? '')?.[1]
+  if (!candidate?.startsWith('ovgw_')) return undefined
+  return extractCredential(request)
 }
 
 export async function credentialDigest(raw: string): Promise<string> {
@@ -123,7 +141,9 @@ export async function authenticateApiKey(request: Request, env: Env): Promise<Au
   configuredPrincipals(env)
   // Match upstream api_key mode: old clients send default account/user hints.
   // They are ignored, and the allow-list below keeps them out of the Durable Object.
-  return await resolveDigest(await credentialDigest(extractCredential(request)), env)
+  const key = extractCredential(request)
+  if (gatewayCredentialPattern.test(key)) throw authError()
+  return await resolveDigest(await credentialDigest(key), env)
 }
 
 function oidcResolver(env:Env):ResolveOidcUser|undefined {
