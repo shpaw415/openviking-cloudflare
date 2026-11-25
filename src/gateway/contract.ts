@@ -10,7 +10,7 @@ export const bytes = (text: string) => encoder.encode(text).byteLength
 export const protocols = ['chat', 'responses', 'anthropic'] as const
 export type Protocol = typeof protocols[number]
 
-export type TransferOperation = 'issue' | 'upload' | 'download'
+export type TransferOperation = 'issue' | 'upload' | 'download' | 'delete'
 export type Route = { kind: 'admin'; parts: string[] } | { kind: 'model'; endpoint: string } | { kind: 'transfer'; operation: TransferOperation }
 const prefix = '/gateway'
 const paths = ['/v1', '/api/v3', '/api/compatible/v1']
@@ -25,6 +25,7 @@ export function gatewayPath(path: string): Route | undefined {
   if (rest === '/uploads') return { kind: 'transfer', operation: 'upload' }
   if (rest === '/downloads') return { kind: 'transfer', operation: 'download' }
   if (rest === '/transfers/tickets') return { kind: 'transfer', operation: 'issue' }
+  if (rest === '/transfers/attachments') return { kind: 'transfer', operation: 'delete' }
   return undefined
 }
 

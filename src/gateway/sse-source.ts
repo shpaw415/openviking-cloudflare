@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { ApiError, isRecord } from '../http.js'
-import { GatewayError, bytes, maxOutputBytes, within } from './contract.js'
+import { breaksProviderCredential, isProviderCredential, maxProviderCredentialLength } from '../provider-credential.js'
+import { GatewayError, bytes, integer, maxOutputBytes, within } from './contract.js'
 import { usageNumber } from './providers.js'
+import { maxArgumentBytes, maxCalls, maxToolPayload, readCall, toolOutputError, validateCalls, wellFormed } from './tool-dto.js'
+import type { Call, ToolRules } from './tool-dto.js'
 
 const maxWireBytes = 256 * 1024
 const maxEventBytes = 96 * 1024
@@ -77,36 +80,104 @@ async function* parse(read: () => Promise<ReadableStreamReadResult<Uint8Array>>)
   }
 }
 
-export type Finish = 'stop' | 'length' | 'content_filter' | null
+export type Finish = 'stop' | 'length' | 'content_filter' | 'tool_calls' | null
 export type Usage = { inputTokens: number | null; outputTokens: number | null }
-type Piece = { delta: string } | { finish: Finish; usage: Usage; text: string }
+export type Piece = { delta: string } | { calls: Call[]; text: string } | { finish: Finish; usage: Usage; text: string; calls: Call[] }
+export type StreamTools = { rules: ToolRules; ids: ReadonlySet<string>; secret: (value: string) => void }
+export type TextFilter = (delta: string, final?: boolean) => string[]
 
-/** Reject a literal credential even across adjacent deltas. Buffer only a suffix
- * matching its prefix (linear-time prefix matcher), not the producer's reply. */
-export function protectStreamText(secret: string) {
+/** Buffer arguments per tool only. A parsed, declared call is eligible for
+ * projection at the upstream call boundary; [DONE] still owes the terminal. */
+function toolFragments(config: StreamTools) {
+  const parts = new Map<number, { id: string; name: string; args: string; size: number; typed: boolean }>()
+  let total = 0
+  const append = (prior: string, fragment: unknown, limit: number) => {
+    if (fragment === undefined || fragment === null) return prior
+    if (!wellFormed(fragment) || prior.length + fragment.length > limit) throw toolOutputError()
+    return prior + fragment
+  }
+  return {
+    add(value: unknown) {
+      if (!Array.isArray(value) || value.length > maxCalls || value.length && (!config.rules.tools.length || config.rules.choice === 'none')) throw toolOutputError()
+      const indexes = new Set<number>()
+      for (const delta of value) {
+        if (!isRecord(delta) || !integer(delta.index, 0, maxCalls - 1) || indexes.has(delta.index) ||
+            delta.type != null && delta.type !== 'function' || delta.function != null && !isRecord(delta.function) ||
+            Object.keys(delta).some(key => !['index', 'id', 'type', 'function'].includes(key))) throw toolOutputError()
+        indexes.add(delta.index)
+        let part = parts.get(delta.index)
+        if (!part) { part = { id: '', name: '', args: '', size: 0, typed: false }; parts.set(delta.index, part) }
+        part.typed ||= delta.type === 'function'
+        part.id = append(part.id, delta.id, 128)
+        if (isRecord(delta.function)) {
+          const spec = delta.function
+          if (Object.keys(spec).some(key => !['name', 'arguments'].includes(key))) throw toolOutputError()
+          part.name = append(part.name, spec.name, 64)
+          if (spec.arguments != null) {
+            if (!wellFormed(spec.arguments)) throw toolOutputError()
+            const size = bytes(spec.arguments)
+            if ((part.size += size) > maxArgumentBytes || (total += size) > maxToolPayload) throw toolOutputError()
+            part.args += spec.arguments
+          }
+        }
+      }
+    },
+    make(finish: Exclude<Finish, null>, text: string) {
+      const calls: Call[] = []
+      for (let index = 0; index < parts.size; index++) {
+        const part = parts.get(index)
+        if (!part?.typed) throw toolOutputError()
+        config.secret(part.args)
+        calls.push(readCall(config.rules, part.id, part.name, part.args, true, toolOutputError))
+      }
+      validateCalls(calls, finish, config.rules, config.ids, config.secret, text)
+      return calls
+    },
+  }
+}
+
+/** Publish whole frames up to a public lexical boundary or a fixed lookahead.
+ * The literal matcher can reject a stream, but cannot change the release
+ * schedule for innocent text. A boundary is unsafe until the published
+ * grammar excludes all future matches crossing it, not just today's key. */
+export function protectStreamText(secret: string): TextFilter {
+  if (!isProviderCredential(secret)) throw failed()
   const prefix = Array<number>(secret.length).fill(0)
   for (let i = 1, j = 0; i < secret.length; i++) {
     while (j && secret[i] !== secret[j]) j = prefix[j - 1]
     if (secret[i] === secret[j]) j++
     prefix[i] = j
   }
-  let matched = 0
+  let matched = 0, received = 0, boundary = 0, head = 0, closed = false
+  let pending: { text: string; end: number }[] = []
   return (delta: string, final = false) => {
-    const text = secret.slice(0, matched) + delta
+    if (closed) throw failed()
     for (let i = 0; i < delta.length; i++) {
+      if (breaksProviderCredential(delta[i])) boundary = received + i + 1
       while (matched && delta[i] !== secret[matched]) matched = prefix[matched - 1]
       if (delta[i] === secret[matched]) matched++
-      if (matched === secret.length) throw failed()
+      if (matched === secret.length) { closed = true; pending = []; throw failed() }
     }
-    if (final) matched = 0
-    return text.slice(0, text.length - matched)
+    if (delta) {
+      received += delta.length
+      pending.push({ text: delta, end: received })
+    }
+    if (final) closed = true
+    const ready: string[] = [], safeThrough = final ? received : Math.max(boundary, received - maxProviderCredentialLength + 1)
+    while (head < pending.length && pending[head].end <= safeThrough) ready.push(pending[head++].text)
+    if (head === pending.length) { pending = []; head = 0 }
+    else if (head > 32 && head * 2 >= pending.length) { pending = pending.slice(head); head = 0 }
+    return ready
   }
 }
 
 export async function* generationPieces(reader: ReadableStreamDefaultReader<Uint8Array>, wait: <T>(task: Promise<T>) => Promise<T>,
-  external = false, filter?: (delta: string, final?: boolean) => string): AsyncGenerator<Piece> {
+  external = false, filter?: TextFilter, tools?: StreamTools): AsyncGenerator<Piece> {
   const chunks: string[] = []
   let outputBytes = 0, hasText = false, finish: Finish = null
+  const fragments = tools && toolFragments(tools)
+  let calls: Call[] = []
+  let filterClosed = false
   const usage: Usage = { inputTokens: null, outputTokens: null }
   const read = async () => {
     try { return await within(12_000, () => wait(reader.read()), streamTimeout) }
@@ -115,10 +186,9 @@ export async function* generationPieces(reader: ReadableStreamDefaultReader<Uint
   for await (const frame of parse(read)) {
     if (frame.event === 'error') throw failed()
     if (frame.data.trim() === '[DONE]') {
-      if (!hasText || (external && finish === null)) throw incomplete()
-      const tail = filter?.('', true)
-      if (tail) yield { delta: tail }
-      yield { finish, usage, text: chunks.join('') }
+      if ((!hasText && !calls.length) || (external && finish === null)) throw incomplete()
+      if (!filterClosed && filter) for (const delta of filter('', true)) yield { delta }
+      yield { finish, usage, text: chunks.join(''), calls }
       return
     }
     let value: unknown
@@ -139,15 +209,20 @@ export async function* generationPieces(reader: ReadableStreamDefaultReader<Uint
         const choice: unknown = value.choices[0]
         if (!isRecord(choice) || (choice.index !== undefined && choice.index !== 0) || !isRecord(choice.delta)) throw badFrame()
         const delta = choice.delta
-        if ((delta.tool_calls != null && !(external && Array.isArray(delta.tool_calls) && delta.tool_calls.length === 0)) ||
+        if ((delta.tool_calls != null && !fragments && !(external && Array.isArray(delta.tool_calls) && delta.tool_calls.length === 0)) ||
             delta.function_call != null || delta.refusal != null ||
-            (delta.role != null && delta.role !== 'assistant')) throw badFrame()
+            (delta.role != null && delta.role !== 'assistant') ||
+            tools && (delta.audio != null || delta.reasoning != null || delta.reasoning_content != null)) throw badFrame()
+        if (fragments && delta.tool_calls != null) {
+          if (finish !== null) throw badFrame()
+          fragments.add(delta.tool_calls)
+        }
         text = delta.content
         reason = choice.finish_reason
       } else if (!info) throw badFrame()
     } else if (!isNative && !info && reason == null) throw badFrame()
     if ((isNative || text != null) && (typeof text !== 'string' || /\p{Cs}/u.test(text))) throw badFrame()
-    if (value.tool_calls != null || value.function_call != null || reason === 'tool_calls' || reason === 'function_call') throw badFrame()
+    if (value.tool_calls != null || value.function_call != null || !fragments && reason === 'tool_calls' || reason === 'function_call') throw badFrame()
     if (typeof text === 'string' && text.length) {
       if (finish !== null) throw badFrame()
       outputBytes += bytes(text)
@@ -155,16 +230,23 @@ export async function* generationPieces(reader: ReadableStreamDefaultReader<Uint
       chunks.push(text)
       hasText ||= !!text.trim()
     }
+    const priorFinish = finish
     if (reason != null) {
       const next: Finish = reason === 'stop' || reason === 'eos_token' ? 'stop' :
-        reason === 'length' || reason === 'max_tokens' ? 'length' : reason === 'content_filter' ? 'content_filter' : null
+        reason === 'length' || reason === 'max_tokens' ? 'length' : reason === 'content_filter' ? 'content_filter' :
+          fragments && reason === 'tool_calls' ? 'tool_calls' : null
       if (external && next === null) throw badFrame()
       if (finish !== null && next !== finish) throw badFrame()
       finish = next
     }
+    if (fragments && priorFinish === null && finish !== null) calls = fragments.make(finish, chunks.join(''))
     if (typeof text === 'string' && text.length) {
-      const delta = filter ? filter(text) : text
-      if (delta) yield { delta }
+      for (const delta of filter ? filter(text) : [text]) yield { delta }
+    }
+    if (calls.length && priorFinish === null) {
+      filterClosed = true
+      if (filter) for (const delta of filter('', true)) yield { delta }
+      yield { calls, text: chunks.join('') }
     }
   }
 }

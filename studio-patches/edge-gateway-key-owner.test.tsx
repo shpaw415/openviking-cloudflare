@@ -141,3 +141,38 @@ it('does not use a role or a truthy non-boolean as permission to load users', as
   expect(screen.queryByText('keys.form.openvikingKey.paste')).toBeNull()
   expect(calls()).toEqual([['GET', accessPath]])
 })
+
+it('keeps focus on the paste field when the directory resolves before the opening focus frame', async () => {
+  // Hold frame delivery, not the dialog, requests or query observer.
+  const frames = new Map<number, FrameRequestCallback>()
+  let frameId = 0
+  const requestFrame = vi.spyOn(window, 'requestAnimationFrame').mockImplementation(callback => {
+    frames.set(++frameId, callback)
+    return frameId
+  })
+  const cancelFrame = vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(id => { frames.delete(id) })
+  try {
+    const { accessReply, usersReply } = fixture()
+    await act(async () => {})
+    expect(frames.size).toBeGreaterThan(0)
+    expect(screen.queryByLabelText('keys.form.openvikingKey.forUser')).toBeNull()
+
+    accessReply.resolve(ok(access))
+    await waitFor(() => expect(calls()).toEqual([['GET', accessPath], ['GET', usersPath]]))
+    usersReply.resolve(ok([{ ...user, api_key_available: false }]))
+    const field = await screen.findByLabelText('keys.form.openvikingKey.forUser')
+    await act(async () => {
+      for (const id of [...frames.keys()]) {
+        const callback = frames.get(id)
+        frames.delete(id)
+        callback?.(performance.now())
+      }
+    })
+    expect(document.activeElement === field).toBe(true)
+    expect(calls()).toEqual([['GET', accessPath], ['GET', usersPath]])
+  } finally {
+    cleanup()
+    cancelFrame.mockRestore()
+    requestFrame.mockRestore()
+  }
+})

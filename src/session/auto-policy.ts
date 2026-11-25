@@ -2,12 +2,13 @@
 import { sessionColumns, sessionForeignKey, sessionWhere } from './flight.js'
 import type { SessionKey } from './flight.js'
 import { invalid, isRecord, unsupported } from './protocol.js'
+import { edgeSessionDefaults } from '../model-config.js'
 
-const defaults = { pending_token_threshold: 150_000, message_count_threshold: 100,
+const defaults = { pending_token_threshold: edgeSessionDefaults.pendingTokenThreshold, message_count_threshold: edgeSessionDefaults.messageThreshold,
   idle_timeout_seconds: 0, keep_recent_count: 0, min_commit_interval_seconds: 0 }
-const maxima: typeof defaults = { pending_token_threshold: 1_000_000, message_count_threshold: 1_000,
+export type AutoPolicy = Record<keyof typeof defaults, number>
+const maxima: AutoPolicy = { pending_token_threshold: 1_000_000, message_count_threshold: 1_000,
   idle_timeout_seconds: 604_800, keep_recent_count: 1_000, min_commit_interval_seconds: 604_800 }
-export type AutoPolicy = typeof defaults
 type PolicyRow = { policy: string | null, revision: string, last_auto_commit_at: string }
 
 export function initAutoPolicy(sql: SqlStorage): void {

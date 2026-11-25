@@ -50,7 +50,7 @@ export async function semantic(fs: Filesystem, request: Request, search: boolean
          (body.search_type != null && body.search_type !== 'semantic') || (body.mode != null && body.mode !== 'list') || body.args != null))) {
     unsupported('Only text semantic and metadata-only list search is implemented here.')
   }
-  const { query, hits, searched, eligible, sessionUsed } = await rankedHits(fs, body)
+  const { query, hits, searched, eligible, sessionUsed } = await rankedHits(fs, body, undefined, request.signal)
   return ok({ memories: hits.filter(hit => hit.context_type === 'memory'), resources: hits.filter(hit => hit.context_type === 'resource'),
     skills: hits.filter(hit => hit.context_type === 'skill'), total: hits.length,
     ...(query && bool(body.include_provenance, 'include_provenance') && { provenance: [{ query, searched_directories: searched,
@@ -60,7 +60,7 @@ export async function semantic(fs: Filesystem, request: Request, search: boolean
     }] }) })
 }
 
-export async function rankedHits(fs: Filesystem, body: Record<string, unknown>, groupFor?: (path: FsPath) => string | undefined) {
+export async function rankedHits(fs: Filesystem, body: Record<string, unknown>, groupFor?: (path: FsPath) => string | undefined, signal?: AbortSignal) {
   const query = str(body.query, 'query', '', 1024).trim()
   const roots = optionalList(body.target_uri, 'target_uri', 8).map(uri => pathFor(uri, fs.caller))
   if (!roots.length) roots.push(pathFor(ROOT, fs.caller))
@@ -99,10 +99,12 @@ export async function rankedHits(fs: Filesystem, body: Record<string, unknown>, 
   const context = history?.text.trim() ?? ''
   const vector = query ? await queryVector(fs.ctx, query, context) : undefined
   if (vector) await fs.ctx.reauthorize?.()
-  if (history) {
+  const checkHistory = () => {
+    if (!history) return
     const fresh = sessionContext()
     if (fresh.text !== history.text || fresh.usedMessages !== history.usedMessages) conflict('The session changed while searching; retry with its current context.')
   }
+  checkHistory()
 
   const candidates: Candidate[] = []
   const seen = new Set<string>()
@@ -148,18 +150,43 @@ export async function rankedHits(fs: Filesystem, body: Record<string, unknown>, 
     }
   }
   const grouped = new Set<string>()
-  const ranked = candidates.sort((a, b) => b.score - a.score || (!vector ? b.record.updated_at - a.record.updated_at : 0) ||
+  let ranked = candidates.sort((a, b) => b.score - a.score || (!vector ? b.record.updated_at - a.record.updated_at : 0) ||
     compare(a.entry.uri, b.entry.uri) || a.record.level - b.record.level).filter(item => {
     if (!item.group) return true
     if (grouped.has(item.group)) return false
     grouped.add(item.group)
     return true
-  }).slice(0, limit)
+  })
+  const textFor = ({ path, fileLevel }: Pick<Candidate, 'path' | 'fileLevel'>) => {
+    if (fileLevel === undefined) return fs.content(path).body
+    return readFileLevels(fs, path, fileLevel)[0]?.body ?? conflict('The indexed file level no longer exists.')
+  }
+  const reranker = signal && vector && ranked.length ? fs.ctx.searchReranker : undefined
+  if (reranker && signal) {
+    const shortlist = ranked.slice(0, maxHits)
+    const documents = shortlist.map(textFor)
+    const scores = await reranker.score(query, documents, signal)
+    await fs.ctx.reauthorize?.()
+    fs.ctx.assertActive?.()
+    checkHistory()
+    // Provider ranking is bound to the readable bytes in the shortlist, not to
+    // whatever may occupy the URI after returning from HTTP.
+    for (const [i, item] of shortlist.entries()) {
+      const current = fs.previewEntry(item.path)
+      if (current?.revision !== item.entry.revision || (item.record.level < 2 && !fs.acl.allows(fs.parent(item.path), 'read')) ||
+          (item.fileLevel !== undefined && textFor(item) !== documents[i])) {
+        conflict('The ranked candidates changed while searching; retry with current content and permissions.')
+      }
+    }
+    ranked = shortlist.map((item, index) => ({ ...item, score: scores[index] }))
+      .filter(item => item.score > reranker.threshold).sort((a, b) => b.score - a.score)
+  }
+  ranked = ranked.slice(0, limit)
   const hits = ranked.map(({ entry, path, record, score, fileLevel }) => {
-    const text = fileLevel === undefined ? fs.content(path).body : readFileLevels(fs, path, fileLevel)[0].body
+    const text = textFor({ path, fileLevel })
     return { uri: vector ? entry.uri : record.uri, context_type: path.kind, level: record.level, score,
       abstract: excerpt(record.level < 2 ? summaryText(text) : text, 256),
-      overview: null, category: record.category, match_reason: vector ? (context ? 'cosine_similarity_session' : 'cosine_similarity') : 'metadata_filter', tags: record.search_tags,
+      overview: null, category: record.category, match_reason: reranker ? 'provider_rerank' : vector ? (context ? 'cosine_similarity_session' : 'cosine_similarity') : 'metadata_filter', tags: record.search_tags,
       ...(readContent && { content: text }) }
   })
   const searched = [...new Set(roots.filter(root => fs.previewEntry(root)?.is_dir).map(root => root.uri))]

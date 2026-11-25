@@ -1,0 +1,229 @@
+diff --git a/src/features/admin/gateway/components/keys-issue-dialog.tsx b/src/features/admin/gateway/components/keys-issue-dialog.tsx
+--- a/src/features/admin/gateway/components/keys-issue-dialog.tsx
++++ b/src/features/admin/gateway/components/keys-issue-dialog.tsx
+@@ -203,6 +203,7 @@
+   const cannotCheckOwner = !checkingOwner && !canPickUser && permission !== false
+   const present = useGatewayPresentation(connection)
+   const formId = React.useId()
++  const popupRef = React.useRef<HTMLDivElement>(null)
+   const userTriggerRef = React.useRef<HTMLButtonElement>(null)
+   const keyInputRef = React.useRef<HTMLInputElement>(null)
+   const modelInputRef = React.useRef<HTMLInputElement>(null)
+@@ -375,15 +376,34 @@
+   // takes focus; the switch button goes away with the previous field.
+   const focusField = workspaceOnly ? (forOther && recipientConfirmed ? 'key' : 'self') : mode === 'key' || pasteForUser ? 'key' : mode
+   const focusedField = React.useRef(focusField)
+-  React.useEffect(() => {
++  React.useLayoutEffect(() => {
++    if (!open) {
++      focusedField.current = focusField
++      return
++    }
++    if (pending) return
+     const previous = focusedField.current
+-    focusedField.current = focusField
+-    if (focusField === 'key' && previous !== 'key') {
+-      keyInputRef.current?.focus()
+-    } else if (focusField === 'user' && previous === 'key') {
+-      userTriggerRef.current?.focus()
++    if (focusField === previous) return
++    if (focusField !== 'key') {
++      focusedField.current = focusField
++      if (focusField === 'user' && previous === 'key') userTriggerRef.current?.focus()
++      return
+     }
+-  }, [focusField])
++    const focusPaste = () => {
++      const input = keyInputRef.current
++      if (!input?.isConnected || input.disabled) return
++      focusedField.current = 'key'
++      if (input.ownerDocument.activeElement !== input) input.focus()
++    }
++    if (workspaceOnly) {
++      focusPaste()
++      return
++    }
++    // When the directory resolves after Base UI chose its opening target,
++    // run the transfer after that queued frame, not before it.
++    const frame = window.requestAnimationFrame(focusPaste)
++    return () => window.cancelAnimationFrame(frame)
++  }, [focusField, open, pending, workspaceOnly])
+ 
+   function switchMode(next: 'user' | 'key') {
+     setChosenMode(next)
+@@ -432,7 +452,18 @@
+       }}
+       onOpenChangeComplete={onClosed ? (isOpen) => { if (!isOpen) onClosed() } : undefined}
+     >
+-      <DialogContent finalFocus={finalFocus} showCloseButton={!pending} className="gap-5 sm:max-w-2xl">
++      <DialogContent
++        ref={popupRef}
++        initialFocus={workspaceOnly ? undefined : (method) => {
++          if (method === 'touch') return popupRef.current
++          // Resolve against the live DOM if the paste field is already ready.
++          const input = keyInputRef.current
++          return input && !input.disabled ? input : true
++        }}
++        finalFocus={finalFocus}
++        showCloseButton={!pending}
++        className="gap-5 sm:max-w-2xl"
++      >
+         <DialogHeader>
+           <DialogTitle className="text-lg">{t('keys.form.title')}</DialogTitle>
+           <DialogDescription>{t('keys.form.description')}</DialogDescription>
+diff --git a/src/features/workbench/resources/components/add-resource-page.tsx b/src/features/workbench/resources/components/add-resource-page.tsx
+--- a/src/features/workbench/resources/components/add-resource-page.tsx
++++ b/src/features/workbench/resources/components/add-resource-page.tsx
+@@ -169,16 +169,21 @@
+   const sourceMode = availableSources.includes(requestedSource) ? requestedSource : undefined
+   const isSite = sourceMode === 'site'
+   const isWebDocument = sourceMode === 'html' || sourceMode === 'git'
++  const modeHint = sourceMode ? undefined : t('studio:edge.webImportModeHint')
+   const webInput = sourceMode === 'git' ? { label: t('studio:edge.webImportAlias'), hint: t('studio:edge.webImportGitHint'), alias: true }
+     : isSite ? { hint: t('studio:edge.webImportSiteHint') }
+-    : sourceMode === 'html' ? { hint: t('studio:edge.webImportHtmlHint') } : undefined
++    : sourceMode === 'html' ? { hint: t('studio:edge.webImportHtmlHint') }
++    : modeHint ? { hint: modeHint } : undefined
+   const urlError = urlIssue === 'empty' ? t(sourceMode === 'git' ? 'studio:edge.webImportAliasRequired' : 'studio:edge.urlImportRequired')
+-    : urlIssue === 'url' ? t(sourceMode === 'git' ? 'studio:edge.webImportAliasInvalid' : webInput ? 'studio:edge.webImportUrlInvalid' : 'studio:edge.urlImportInvalid')
+-    : refusal === 'source' ? t(webInput ? 'studio:edge.webImportSourceRefused' : 'studio:edge.urlImportSource')
++    : urlIssue === 'url' ? t(sourceMode === 'git' ? 'studio:edge.webImportAliasInvalid' : isSite || isWebDocument ? 'studio:edge.webImportUrlInvalid' : 'studio:edge.urlImportInvalid')
++    : refusal === 'source' ? t(isSite || isWebDocument ? 'studio:edge.webImportSourceRefused' : 'studio:edge.urlImportSource')
+     : refusal === 'sourceTimeout' ? t('studio:edge.urlImportSourceTimeout') : undefined
++  const exactHint = modeHint ?? (isSite || isWebDocument
++    ? t(isSite ? 'studio:edge.webImportFolderHint' : 'studio:edge.webImportFileHint') : undefined)
+   const exactInvalid = isSite ? 'studio:edge.webImportFolderInvalid' : isWebDocument ? 'studio:edge.webImportFileInvalid' : 'studio:edge.urlImportExactInvalid'
+   const destinationError = urlIssue === 'destination'
+     ? t(urlDraft.mode === 'to' ? exactInvalid : 'studio:edge.urlImportParentInvalid')
++    : refusal === 'siteFolderExists' ? t('studio:edge.webImportFolderExists')
+     : refusal === 'destination' ? t('studio:edge.urlImportDestinationRefused') : undefined
+   const waiting = urlState.phase === 'submitting' || urlState.phase === 'tracking'
+   const urlLocked = waiting || urlState.phase === 'interrupted' || urlState.phase === 'unknown'
+@@ -528,10 +533,10 @@
+         ) : null}
+ 
+         <ResourceDestinationFields
+-          disabled={edgeUrl ? urlLocked : remotePhase === 'processing'}
++          disabled={edgeUrl ? urlLocked || !sourceMode : remotePhase === 'processing'}
+           exactOnly={sourceCapabilities.exactDestination}
+           approvedTextOnly={edgeUrl}
+-          approvedExactHint={edgeUrl && (isSite || isWebDocument) ? t(isSite ? 'studio:edge.webImportFolderHint' : 'studio:edge.webImportFileHint') : undefined}
++          approvedExactHint={edgeUrl ? exactHint : undefined}
+           inputRef={edgeUrl ? destinationInput : undefined}
+           destinationError={edgeUrl ? destinationError : undefined}
+           mode={edgeUrl ? urlDraft.mode : effectiveDestinationMode}
+@@ -542,7 +547,7 @@
+           uri={edgeUrl ? urlDraft.destination : targetUri}
+         />
+ 
+-        {edgeUrl && urlDraft.mode === 'to' && isApprovedDestinationShape(urlDraft) && !urlLocked && (
++        {edgeUrl && sourceMode && urlDraft.mode === 'to' && isApprovedDestinationShape(urlDraft) && !urlLocked && (
+           <label className="flex items-start gap-2 text-sm" htmlFor="add-resource-allow-replacement">
+             <input
+               id="add-resource-allow-replacement"
+@@ -558,7 +563,7 @@
+             </span>
+           </label>
+         )}
+-        {edgeUrl && urlIssue === 'consent' && (
++        {edgeUrl && sourceMode && urlIssue === 'consent' && (
+           <p id="add-resource-consent-error" className="text-sm text-destructive" role="alert">{t(isSite ? 'studio:edge.webImportFolderConsentRequired' : 'studio:edge.urlImportConsentRequired')}</p>
+         )}
+         {edgeUrl && (
+@@ -579,7 +584,7 @@
+             {urlState.phase === 'failed' && <p className="text-sm" role="alert">{t('studio:edge.urlImportFailed')}</p>}
+             {urlState.phase === 'cancelled' && <p className="text-sm" role="alert">{t('studio:edge.urlImportCancelled')}</p>}
+             {refusal === 'authority' && <p className="text-sm" role="alert">{t('studio:edge.urlImportAuthorityRefused')}</p>}
+-            {refusal === 'request' && <p className="text-sm" role="alert">{t('studio:edge.urlImportRefused')}</p>}
++            {refusal === 'request' && <p className="text-sm" role="alert">{t(sourceMode === 'git' ? 'studio:edge.webImportGitRefused' : 'studio:edge.urlImportRefused')}</p>}
+             {(urlState.phase === 'interrupted' || urlState.phase === 'unknown') && (
+               <div className="flex flex-wrap gap-2">
+                 {urlState.phase === 'interrupted' && (
+diff --git a/src/features/workbench/resources/hooks/use-approved-url-import.ts b/src/features/workbench/resources/hooks/use-approved-url-import.ts
+--- a/src/features/workbench/resources/hooks/use-approved-url-import.ts
++++ b/src/features/workbench/resources/hooks/use-approved-url-import.ts
+@@ -6,7 +6,7 @@
+ export type ApprovedSource = 'text' | 'html' | 'site' | 'git'
+ export type ApprovedUrlDraft = { url: string; mode: 'parent' | 'to'; destination: string; source?: ApprovedSource }
+ type Task = { id: string; uri: string }
+-type Refusal = 'source' | 'sourceTimeout' | 'destination' | 'authority' | 'request'
++type Refusal = 'source' | 'sourceTimeout' | 'destination' | 'siteFolderExists' | 'authority' | 'request'
+ type Interruption = 'unavailable' | 'timeout' | 'paused'
+ type State =
+   | { phase: 'idle' }
+@@ -63,12 +63,13 @@
+   }
+ }
+ 
+-function refusalKind(error: unknown): Refusal | undefined {
++function refusalKind(error: unknown, draft: ApprovedUrlDraft): Refusal | undefined {
+   const { code, statusCode } = normalizeOvClientError(error)
+   // This Worker code means admission failed before creating the task.
+   if (statusCode === 503 && code === 'AUTH_UNAVAILABLE') return 'authority'
+   if (code === 'DEADLINE_EXCEEDED') return 'sourceTimeout'
+   if (['SOURCE_UNAVAILABLE', 'UNSUPPORTED_MEDIA_TYPE', 'ROBOTS_DENIED'].includes(code)) return 'source'
++  if (statusCode === 409 && code === 'ALREADY_EXISTS' && draft.source === 'site' && draft.mode === 'to') return 'siteFolderExists'
+   if (['INVALID_URI', 'RESOURCE_BUSY', 'ALREADY_EXISTS', 'NOT_FOUND', 'CONFLICT'].includes(code)) return 'destination'
+   if (statusCode && statusCode >= 400 && statusCode < 500 || code === 'NOT_IMPLEMENTED' || code === 'EMBEDDING_UNAVAILABLE') return 'request'
+   // No authoritative rejection: even a dropped POST response may hide a committed admission.
+@@ -190,7 +191,7 @@
+       } catch (error) {
+         if (!current()) return
+         stop()
+-        const refusal = refusalKind(error)
++        const refusal = refusalKind(error, draft)
+         publish(refusal ? { phase: 'rejected', draft, refusal } : { phase: 'unknown', draft })
+       }
+     })()
+diff --git a/src/i18n/locales/en/studio.ts b/src/i18n/locales/en/studio.ts
+--- a/src/i18n/locales/en/studio.ts
++++ b/src/i18n/locales/en/studio.ts
+@@ -41,6 +41,7 @@
+     urlImportVerify: 'Check task status',
+     urlImportShowTasks: 'Open Processing Tasks',
+     webImportMode: 'Approved source type',
++    webImportModeHint: 'Choose a source type above to see what to enter.',
+     webImportChooseMode: 'Choose an approved source type.',
+     webImportText: 'Text document',
+     webImportHtml: 'HTML page',
+@@ -50,12 +51,14 @@
+     webImportHtmlHint: 'Enter the exact approved HTTPS .html or .htm address. Only text from the approved snapshot is indexed; links are not followed.',
+     webImportSiteHint: 'Enter the approved HTTPS entry page. Imports up to six catalogue pages on that origin, no more than two links deep, subject to the site policy.',
+     webImportGitHint: 'Enter the alias provided by your operator. This reads a pinned documentation file. No repository address or credentials are needed.',
++    webImportGitRefused: 'The GitHub import request was rejected. Check your connection, the approved alias, and write access to the destination before trying again.',
+     webImportAliasRequired: 'Enter the approved collection alias.',
+     webImportAliasInvalid: 'Use the exact alias: lowercase letters, digits, hyphens or underscores, starting with a letter or digit.',
+     webImportUrlInvalid: 'Copy the exact approved HTTPS .html or .htm address without a query, fragment, port, or credentials.',
+     webImportSourceRefused: 'The approved source is unavailable or not permitted. Check the exact address or alias with your operator.',
+     webImportFolderHint: 'Enter the exact URI of a new resources folder. An existing folder will not be replaced.',
+     webImportFolderInvalid: 'Enter an exact URI for a new folder. Use letters, digits, hyphens or underscores for the final folder name.',
++    webImportFolderExists: 'That location is already in use. Enter a new folder path or choose a parent folder.',
+     webImportFolderConsent: 'Create a new site folder at this exact location:',
+     webImportFolderConsentRequired: 'Confirm this exact folder, or choose a parent folder instead.',
+     webImportFileHint: 'Enter an exact .txt file URI. This import can replace an existing file at that path.',
+diff --git a/src/i18n/locales/zh-CN/studio.ts b/src/i18n/locales/zh-CN/studio.ts
+--- a/src/i18n/locales/zh-CN/studio.ts
++++ b/src/i18n/locales/zh-CN/studio.ts
+@@ -41,6 +41,7 @@
+     urlImportVerify: '查询任务状态',
+     urlImportShowTasks: '打开处理任务',
+     webImportMode: '已批准的来源类型',
++    webImportModeHint: '请先在上方选择来源类型，再按提示填写。',
+     webImportChooseMode: '请选择已批准的来源类型。',
+     webImportText: '文本文档',
+     webImportHtml: 'HTML 网页',
+@@ -50,12 +51,14 @@
+     webImportHtmlHint: '请原样输入已批准的 HTTPS .html 或 .htm 地址。仅索引已批准快照的文本，不访问链接。',
+     webImportSiteHint: '请输入已批准的 HTTPS 入口页。按站点规则，仅导入同源目录清单内最多六个页面，且最多跟随两层链接。',
+     webImportGitHint: '请输入管理员提供的别名，以读取固定版本的文档。无需填写仓库地址或凭据。',
++    webImportGitRefused: 'GitHub 文档导入请求被拒绝。请检查连接、已批准的别名和目标位置的写入权限后再试。',
+     webImportAliasRequired: '请输入已批准的集合别名。',
+     webImportAliasInvalid: '请原样输入别名。别名使用小写字母、数字、连字符或下划线，并以字母或数字开头。',
+     webImportUrlInvalid: '请原样复制已批准的 HTTPS .html 或 .htm 地址，不要添加查询参数、片段、端口或凭据。',
+     webImportSourceRefused: '来源不可用或不允许导入。请向管理员核对完整地址或别名。',
+     webImportFolderHint: '请输入新资源目录的完整 URI。不会替换已有目录。',
+     webImportFolderInvalid: '请输入新目录的完整 URI。最后一级目录名可使用字母、数字、连字符或下划线。',
++    webImportFolderExists: '该位置已被占用。请输入新目录的路径，或改选上级目录。',
+     webImportFolderConsent: '在此指定位置创建新的站点资料目录：',
+     webImportFolderConsentRequired: '请确认此指定目录，或改选上级目录。',
+     webImportFileHint: '请输入 .txt 文件的完整 URI。导入可能替换该路径下已有的文件。',

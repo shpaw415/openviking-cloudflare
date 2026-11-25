@@ -63,7 +63,7 @@ export class Control extends ProductionControl {
 `
 }
 
-export async function localWorker({ principals, embeddings = 'missing', assetsDir, persist, port = 0, vars = {}, serviceBindings, outboundService } = {}) {
+export async function localWorker({ principals, embeddings = 'missing', assetsDir, persist, port = 0, vars = {}, serviceBindings, outboundService, privateWorkers = [] } = {}) {
   const worker = await build({
     absWorkingDir: project,
     ...(embeddings === 'missing' ? { entryPoints: ['src/worker.ts'] } : {
@@ -72,8 +72,8 @@ export async function localWorker({ principals, embeddings = 'missing', assetsDi
     platform: 'browser', format: 'esm', bundle: true, write: false,
     external: ['cloudflare:workers'],
   })
-  const options = convertV4MiniflareOptions({
-    name: 'openviking-edge-local', host: '127.0.0.1', port, modules: true, script: worker.outputFiles[0].text, cf: false,
+  const options = convertV4MiniflareOptions({ host: '127.0.0.1', port, cf: false, log: new Log(LogLevel.ERROR), workers: [{
+    name: 'openviking-edge-local', modules: true, script: worker.outputFiles[0].text,
     compatibilityDate: '2026-11-19',
     durableObjects: { WORKSPACES: { className: 'Workspace', useSQLite: true }, CONTROL: { className: 'Control', useSQLite: true }, OAUTH: { className: 'OAuth', useSQLite: true } },
     ...(serviceBindings && { serviceBindings }),
@@ -84,8 +84,7 @@ export async function localWorker({ principals, embeddings = 'missing', assetsDi
       routerConfig: { has_user_worker: true, invoke_user_worker_ahead_of_assets: true },
       assetConfig: { html_handling: 'none', not_found_handling: 'none' },
     } }),
-    log: new Log(LogLevel.ERROR),
-  })
+  }, ...privateWorkers] })
   const runtime=new Miniflare(persist ? { ...options, resourcePersistencePath: persist } : options)
   runtime.localBuildSha256=createHash('sha256').update(worker.outputFiles[0].text).digest('hex')
   return runtime

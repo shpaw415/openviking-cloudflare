@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import type { Caller, GenerationStream, ModelMessage, WorkspaceContext } from '../context.js'
+import type { Caller, StreamGenerationOptions, WorkspaceContext } from '../context.js'
 import type { AuthorityAdvance, AuthorityRevision } from '../data-authority.js'
 import { GatewayError, encoder, safeError, within } from './contract.js'
 import type { Protocol } from './contract.js'
 import { credentialChanged, modelChanged } from './model-authority.js'
 import type { Metrics } from './store.js'
 import { generationPieces, streamTimeout, translateStreamFailure } from './sse-source.js'
-import type { Finish, Usage } from './sse-source.js'
+import type { Piece, StreamTools, TextFilter } from './sse-source.js'
 import { sseWire } from './sse-wire.js'
 import type { ResponseMeta } from './wire.js'
 
@@ -128,11 +128,40 @@ export function invalidateGatewayRouting(storage: DurableObjectStorage, account:
   registries.get(storage)?.invalidateRouting(account)
 }
 
+/** Apply the same actor-scoped disconnect and revision wake-up to rich JSON calls. */
+export async function withCancellableGatewayCall<T>(ctx: WorkspaceContext, request: Request, requestId: string, revision: number | undefined,
+  credentialRevision: AuthorityRevision | undefined, action: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const lifecycle = new AbortController(), parent = request.signal
+  let resolveWake!: (cause?: GatewayError) => void
+  const wake = new Promise<GatewayError | undefined>(resolve => { resolveWake = resolve })
+  const now = Date.now()
+  const unregister = registry(ctx.storage).register(requestId, ctx.caller, resolveWake, now + maxLifetime, now, revision, credentialRevision)
+  void wake.then(cause => { if (cause) lifecycle.abort(cause) })
+  const disconnect = () => lifecycle.abort(clientGone())
+  const timer = setTimeout(() => lifecycle.abort(new GatewayError(504, 'upstream_timeout', 'The generation binding did not answer in time.')), 25_000)
+  if (parent.aborted) disconnect()
+  else parent.addEventListener('abort', disconnect, { once: true })
+  try {
+    lifecycle.signal.throwIfAborted()
+    return await new Promise<T>((resolve, reject) => {
+      const abort = () => reject(lifecycle.signal.reason)
+      lifecycle.signal.addEventListener('abort', abort, { once: true })
+      action(lifecycle.signal).then(resolve, reject).finally(() => lifecycle.signal.removeEventListener('abort', abort)).catch(() => {})
+    })
+  } finally {
+    clearTimeout(timer)
+    parent.removeEventListener('abort', disconnect)
+    unregister()
+    resolveWake()
+  }
+}
+
 type StreamOptions = {
-  request: Request; ctx: WorkspaceContext; messages: ModelMessage[]; maxTokens: number
+  request: Request; ctx: WorkspaceContext; maxTokens: number
   protocol: Protocol; model: string; note: string; includeUsage: boolean; metrics: Metrics
-  source: GenerationStream; external: boolean
-  textFilter?: (delta: string, final?: boolean) => string
+  source: (options: StreamGenerationOptions) => Promise<ReadableStream<Uint8Array>>; external: boolean
+  textFilter?: TextFilter
+  tools?: StreamTools
   response?: ResponseMeta
   modelRevision?: number
   credentialRevision?: AuthorityRevision
@@ -226,8 +255,8 @@ export async function streamTurn(options: StreamOptions): Promise<Response> {
     fence()
   }
 
-  const emitSuccess = (out: ReadableStreamDefaultController<Uint8Array>, text: string, reason: Finish, usage: Usage) => {
-    out.enqueue(encoder.encode(wire.finish(text, reason, usage)))
+  const emitSuccess = (out: ReadableStreamDefaultController<Uint8Array>, { text, finish: reason, usage, calls }: Extract<Piece, { finish: unknown }>) => {
+    out.enqueue(encoder.encode(wire.finish(text, reason, usage, calls)))
     out.close()
     finish()
   }
@@ -236,7 +265,7 @@ export async function streamTurn(options: StreamOptions): Promise<Response> {
     await reauthorize(true)
     let source: ReadableStream<Uint8Array>
     try {
-      source = await within(12_000, () => wait(options.source(options.messages, { maxTokens: options.maxTokens, signal }).then(stream => {
+      source = await within(12_000, () => wait(options.source({ maxTokens: options.maxTokens, signal }).then(stream => {
         // A late opening after client cancellation/timeout must not leave a live provider body.
         if (signal.aborted) { if (stream instanceof ReadableStream) void stream.cancel().catch(() => {}); throw signal.reason }
         return stream
@@ -244,11 +273,12 @@ export async function streamTurn(options: StreamOptions): Promise<Response> {
     } catch (error) { throw translateStreamFailure(error) }
     if (!(source instanceof ReadableStream) || source.locked) throw new GatewayError(503, 'generation_unavailable', 'The generation binding did not supply a readable stream.')
     reader = source.getReader()
-    const pieces = generationPieces(reader, wait, options.external, options.textFilter)
+    const pieces = generationPieces(reader, wait, options.external, options.textFilter, options.tools)
     const first = await pieces.next()
-    if (first.done || !('delta' in first.value)) throw new GatewayError(502, 'stream_incomplete', 'The generation stream supplied no text delta.')
+    if (first.done || 'finish' in first.value) throw new GatewayError(502, 'stream_incomplete', 'The generation stream supplied no safe output.')
     await reauthorize(true)
-    const initial = first.value.delta
+    const initial = first.value
+    const encodePiece = (piece: Exclude<Piece, { finish: unknown }>) => 'delta' in piece ? wire.delta(piece.delta) : wire.tools(piece.calls, piece.text)
     let opening = true
     const stream = new ReadableStream<Uint8Array>({
       start(out) { output = out },
@@ -259,17 +289,17 @@ export async function streamTurn(options: StreamOptions): Promise<Response> {
             opening = false
             await reauthorize()
             fence()
-            out.enqueue(encoder.encode(wire.opening() + wire.delta(initial)))
+            out.enqueue(encoder.encode(wire.opening('delta' in initial) + encodePiece(initial)))
             metrics.first_chunk_ms = since()
             return
           }
           const current = await pieces.next()
           if (finished) return
           if (current.done) throw new GatewayError(502, 'stream_incomplete', 'The generation stream ended unexpectedly.')
-          if ('delta' in current.value) {
+          if (!('finish' in current.value)) {
             await reauthorize()
             fence()
-            out.enqueue(encoder.encode(wire.delta(current.value.delta)))
+            out.enqueue(encoder.encode(encodePiece(current.value)))
             return
           }
           const { text, finish: reason, usage } = current.value
@@ -286,14 +316,14 @@ export async function streamTurn(options: StreamOptions): Promise<Response> {
             metrics.capture_reason = 'provider_incomplete'
           }
           fence()
-          emitSuccess(out, text, reason, usage)
+          emitSuccess(out, current.value)
         } catch (error) { fail(safeError(error)) }
       },
       cancel() { finish(clientGone()) },
     }, { highWaterMark: 0 })
     const response = new Response(stream, { headers: { 'Content-Type': 'text/event-stream; charset=utf-8',
       'Cache-Control': 'private, no-store, no-transform', 'x-openviking-request-id': metrics.request_id,
-      'x-openviking-recall': metrics.recall_reason ?? 'disabled' } })
+      'x-openviking-recall': metrics.recall_reason ?? 'disabled', ...(options.tools && { 'x-openviking-capture': 'disabled' }) } })
     metrics.status = 200
     metrics.stream = true
     returned = true

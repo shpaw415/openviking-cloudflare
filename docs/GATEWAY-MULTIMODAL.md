@@ -1,0 +1,49 @@
+# Gateway Edge — médias en entrée et fonctions du client
+
+Ces capacités sont **fermées par défaut**, indépendantes pour `image`, `audio` et `tools`. L’opérateur déclare que son modèle HTTP **déjà configuré et autorisé** accepte les DTO Chat Completions correspondants, par exemple dans la variable de déploiement `OPENVIKING_EDGE_GATEWAY_CAPABILITIES` :
+
+```json
+[{"api_base":"https://rich.fixture.test/v1","model":"fixture-vision-audio","capabilities":["image","audio","tools"]}]
+```
+
+Le couple correspond exactement à la base HTTPS canonique (sans `/` final) et au nom réel après résolution des alias. Ce n’est ni un inventaire de destinations, ni un réglage `ov.conf`, ni une clé. L’autorité modèle Control, la sélection de route du Workspace et le secret fournisseur F3 restent obligatoires. Une entrée incorrecte ou dupliquée ferme le montage des capacités. Une règle Workspace ne peut pas les activer, et la règle gagnante n’est jamais remplacée par une autre. Les clés dédiées restent **Workers AI** seules ; aucun octroi à Root, OAuth ou OIDC.
+
+Les trois protocoles **clients** traduisent vers le seul `POST {base}/chat/completions` du modèle admis ; il ne s’agit pas de fournisseurs Responses ou Anthropic natifs en sortie. Aucun paramètre de destination, header, secret, contenu fournisseur brut, redirection, second appel, ni téléchargement de média arbitraire. L’opt-in est une attestation opérateur, pas une sonde de modèle. Un modèle qui ne sait pas répondre dans le sous-ensemble demandé renvoie une erreur statique, sans repli. `edge.tools` et `/gateway/admin/tools` désignent toujours le catalogue d’outils OpenViking non porté, **distinct** des fonctions déclarées par le client.
+
+## Entrée multimédia
+
+Blocs `content` du rôle `user` (éventuellement seuls, ou intercalés dans le texte) :
+
+| Endpoint | Image | Audio |
+|---|---|---|
+| `/chat/completions` | `{type:"image_url",image_url:{url:"data:image/png;base64,…",detail?:"auto"\|"low"\|"high"}}` ; même forme pour `image/jpeg` | `{type:"input_audio",input_audio:{format:"wav",data:"…"}}` |
+| `/responses` | Item `message` utilisateur ou message sans `type`, bloc `{type:"input_image",image_url:"data:image/png;base64,…",detail?:…}` ; PNG ou JPEG | Refusé ; pas de convention audio Responses extrapolée |
+| `/messages` | `{type:"image",source:{type:"base64",media_type:"image/png",data:"…"}}` ; PNG ou JPEG | Refusé ; pas de convention audio Messages extrapolée |
+
+Base64 standard canonique, vérifié par décodage et réencodage, sans encodage URL, espaces ou padding ambigu. Maximum **4 blocs**, **64 Kio décodés par bloc**, **128 Kio décodés par tour**, y compris l’historique fourni. PNG : signature, CRC des chunks, dimensions ≤ 2 048 × 2 048, au plus 128 chunks de palette/couleur/pixels autorisés, sans animation ou métadonnées compressées. JPEG : JFIF sans EXIF/ICC, ou JPEG sans métadonnées ; contrôle structurel, 8 bits, gris/RGB, SOF0/SOF2, au plus 256 segments, mêmes dimensions. Ce sont des contrôles de conteneur, pas un décodage complet des pixels sur le Worker. WAV : conteneur RIFF canonique `fmt` + `data`, PCM 16 bits, 1–2 canaux, 8–48 kHz ; tailles et alignement cohérents. Pas de transcodage, MP3, autres conteneurs, fichiers PDF/GIF/WebP, sorties audio/image, URLs HTTP même sur la même origine, URI Viking, pseudo-fichier ou stockage fournisseur. `/messages/count_tokens` reste texte seulement.
+
+### Couture interne pour les pièces du lot Transferts
+
+Les références exigent à la fois le média autorisé pour le modèle et les transferts signés réellement configurés, sous une clé Data directe et son bail d’origine. Elles restent refusées sans ce montage ; aucun nouveau drapeau public ni route. Le consommateur accepte uniquement les identifiants canoniques `att_` suivis de 32 hexadécimaux minuscules : en Chat `image_url.url` ou `input_audio.file_id` (avec `format:"wav"`, sans `data`), en Responses `input_image.file_id` (sans URL), en Messages `image.source:{type:"file",file_id:…}`. Le fournisseur ne voit ni l’ID ni le nom du fichier, seulement le bloc inline contrôlé. Le lecteur vérifie le propriétaire exact compte/utilisateur/agent et l’expiration, sans exception admin ni héritage de partage. Le Gateway vérifie le type et les octets et rappelle `assertCurrent()` avant l’unique invocation et avant remise au client.
+
+## Appels et résultats de fonctions
+
+| Endpoint | Déclaration | Appel dans la réponse | Résultat fourni à la requête suivante |
+|---|---|---|---|
+| Chat | `tools:[{type:"function",function:{name,description?,parameters,strict?}}]` | `choices[0].message.tool_calls[]`, fin `tool_calls` | Rejouer le message assistant, puis les `role:"tool"` avec `tool_call_id` et `content` texte |
+| Responses | `tools:[{type:"function",name,description?,parameters,strict?}]` | `output[]` de type `function_call`, avec `call_id` et `arguments` | Rejouer les items `output` complets puis `{type:"function_call_output",call_id,output}` avec `output` texte ; `store:false` ou absent |
+| Messages | `tools:[{name,description?,input_schema}]` | Blocs assistant `tool_use`, fin `tool_use` | Rejouer les blocs assistant (texte avant appels), puis un message `user` composé uniquement de blocs `tool_result` correspondants, `content` texte ; `is_error` booléen optionnel est traduit en indication textuelle de résultat |
+
+Le client resoumet le **transcript complet** et les mêmes déclarations à chaque requête, changements de `tool_choice` permis. Un identifiant d’appel n’est jamais une capacité ou un pointeur serveur : il associe un appel et son résultat **dans le même corps**. Tous les résultats doivent suivre immédiatement le groupe d’appels (sans doublons ni résultat orphelin), avant la suite du dialogue. Une requête finale peut finir sur ces résultats sans message utilisateur supplémentaire. Le serveur n’atteste pas l’origine, l’exécution ou la véracité des items rapportés par le client. Aucun accès réseau d’outil, shell, code, appel MCP, recherche web, outil fourni par le modèle, résultat multimédia, exécution de fond ou tour automatique. Les paramètres sont des données pour le modèle, jamais des instructions exécutées par le Gateway.
+
+- Choix supportés : `auto`, `none`, `required` et fonction nommée (la forme native est propre au protocole ; Messages utilise `any`, `tool` et `disable_parallel_tool_use`). `parallel_tool_calls` booléen en Chat/Responses. Si présent, le choix est transmis sous forme Chat et son résultat validé. Les appels non déclarés, mal typés, hors choix ou sans raison de fin cohérente ne sont pas publiés.
+- Schémas fermés : racine objet ; types `object`, `array`, `string`, `number`, `integer`, `boolean`, `null`, `enum` scalaire, `description`, `required`, `properties`, `items`, `additionalProperties:false` (appliqué également si omis). `strict:true` exige toutes les propriétés obligatoires à chaque niveau objet. Pas de `$ref`, de composition de schémas ni d’extensions. Profondeur 5 sous la racine, 128 nœuds agrégés, 24 propriétés par objet, 16 valeurs d’énumération, 32 éléments par tableau d’arguments, 8 fonctions et 16 Kio de déclarations.
+- 4 appels par groupe et 24 identifiants distincts au plus dans le transcript. Arguments objet JSON et résultats texte bien formés, 8 Kio chacun, 24 Kio au total pour le transcript des arguments/résultats et 24 Kio pour les arguments de la réponse. L’enveloppe F3 reste à 304 Kio de requête et 48 messages / 48 Kio de texte ; projection interne ≤ 288 Kio. La taille projetée (médias, schémas et résultats inclus) compte dans les deux budgets existants d’entrée et génération.
+
+## Flux, confidentialité et erreurs
+
+Les requêtes riches exigent une politique effective **sans capture, profil d’ouverture ni rappel**. `store:true` et `previous_response_id` sont refusés pour ces requêtes (`rich_persistence_unsupported` ou `rich_context_unsupported`), pas ignorés silencieusement. Aucun historique, argument, résultat, média ou nouveau rattachement de session n’est écrit ; le verrou nommé et les compteurs/métadonnées F3 restent. Les réponses de texte seules continuent à utiliser la conservation F3 lorsqu’elle est demandée.
+
+`stream:true` exige l’activation F3 `OPENVIKING_EDGE_OPERATOR_STREAMING=1` et un vrai SSE Chat du modèle. Le filtre libère les deltas complets jusqu’à la dernière frontière textuelle exclue par la grammaire publique des clés, ou après une fenêtre de lecture fixe de 2 047 caractères. Ainsi une clé particulière ne change pas le découpage ou l'ordre de libération d'un texte licite ; un premier delta sûr peut sortir sans attendre le suivant. Un fragment sans séparateur public peut attendre un séparateur, la fin de texte valide ou la fenêtre fixe. Une correspondance littérale complète fait échouer la réponse sans vider le tampon. Les fragments d’outil restent privés jusqu’à validation d’un appel complet (arguments et raison `tool_calls`, schéma, identité dans le transcript, contrôle du secret brut/décodé), puis sortent en événements Chat `tool_calls`, Responses `function_call_arguments` et Messages `input_json_delta`. Ils peuvent arriver **avant `[DONE]`** ; le client attend le terminal de succès avant de les consommer comme un appel valide. Pas de transformation d’une réponse JSON finale en SSE, ni de trame de succès à EOF. Les refus avant toute donnée sûre sont JSON ; ceux après ouverture sont terminaux, typés et sans succès. Les bornes, l’annulation en cours et les barrières F3 modèle/autorité s’appliquent. Codes typiques : `media_invalid`, `media_limit`, `non_text_input_unsupported`, `tools_unsupported`, `tool_declaration_invalid`, `tool_history_invalid`, `streaming_unavailable`, `tool_call_invalid` et `upstream_error`.
+
+Preuve locale : `tests/gateway-rich.test.mjs`, Worker réel et Durable Objects SQLite sous Workerd, fournisseur HTTP fictif intercepté avant réseau. Aucun résultat de modèle commercial, SDK complet, publication Studio ou déploiement distant n’est attesté.

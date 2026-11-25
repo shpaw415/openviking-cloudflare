@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { WorkspaceContext } from './context.js'
 import { GatewayError, body, bytes, digest, fields, forbidden, gatewayError, gatewayPath, invalid, invalidConfig, json, methodError,
-  missing, modelId, objectId, safeError, unconfigured, unsupported } from './gateway/contract.js'
+  missing, modelId, objectId, safeError, unconfigured, unsupported, within } from './gateway/contract.js'
 import { publishTurn } from './gateway/capture.js'
 import { disabledKeys, inspectKey, invalidGatewayKey, issueKey, keySpec, listKeys, resetKeyCapture, revokeKey } from './gateway/keys.js'
 import { parseProfile, resolveProfile } from './gateway/profiles.js'
@@ -13,8 +13,9 @@ import { checkResponseQuota, forgetResponse, inspectResponse, responseId, respon
 import { checkConversationLimit, conversation, deleteUserState, enter, epoch, initStore, logs, overview, profileFor,
   profileList, remove, reserve, resetConversation, save, upstreamList, writeLog } from './gateway/store.js'
 import type { Metrics } from './gateway/store.js'
-import { checkStreamAdmission, invalidateGatewayRouting, streamTurn } from './gateway/stream.js'
-import { modelEndpoint, normalizeTurn, protocolFor, render } from './gateway/wire.js'
+import { checkStreamAdmission, invalidateGatewayRouting, streamTurn, withCancellableGatewayCall } from './gateway/stream.js'
+import { modelEndpoint, normalizeTurn, protocolFor, render, renderRich } from './gateway/wire.js'
+import type { Turn } from './gateway/wire.js'
 
 export type { GatewayContext, GatewayProvider } from './gateway/providers.js'
 export type { GatewayStreamActor } from './gateway/stream.js'
@@ -227,21 +228,39 @@ async function modelRoute(request: Request, endpoint: string, ctx: GatewayContex
   if (name !== null && (!/^[A-Za-z0-9_@.-]{1,128}$/.test(name) || name === '.' || name === '..')) {
     throw invalid('Invalid X-OpenViking-Session identifier.', 'session_invalid')
   }
-  const turn = normalizeTurn(await body(request, modelBodyLimit), kind)
-  if (!allowedModel(turn.model)) throw new GatewayError(403, 'model_not_allowed', 'This model is not allowed for this Gateway key.')
+  const raw = await body(request, modelBodyLimit)
+  let plain: Turn | undefined, refusal: GatewayError | undefined
+  try { plain = normalizeTurn(raw, kind) }
+  catch (error) {
+    if (!(error instanceof GatewayError) || !['tools_unsupported', 'non_text_input_unsupported'].includes(error.code) ||
+        binding || kind === 'count_tokens' || !modelId(raw.model) || !ctx.gatewayProvider?.rich || !ctx.assertGatewayMount) throw error
+    refusal = error
+  }
+  const model = plain?.model ?? raw.model as string
+  if (!allowedModel(model)) throw new GatewayError(403, 'model_not_allowed', 'This model is not allowed for this Gateway key.')
   const session = name === null || kind === 'count_tokens' ? null : await digest(name)
   await ctx.reauthorize?.()
   ctx.assertActive?.()
   const protocol = protocolFor(kind)
-  const target = resolveTarget(ctx, upstreams(), protocol, turn.model)
-  const source = turn.stream ? streamSource(ctx, target) : undefined
-  if (turn.stream && !source) {
+  const target = resolveTarget(ctx, upstreams(), protocol, model)
+  // Added modalities cannot create a route or modify the winner's capabilities.
+  const adapter = !plain && target.rule.binding === 'operator' && ctx.gatewayProvider?.rich?.model === target.model ? ctx.gatewayProvider.rich : undefined
+  if (!plain && !adapter) throw refusal!
+  const turn = plain ?? normalizeTurn(raw, kind, adapter!.capabilities, !!ctx.readPrivateGatewayAttachment)
+  const source = turn.stream && !turn.rich ? streamSource(ctx, target) : undefined
+  if (turn.stream && !(turn.rich ? adapter?.stream : source)) {
     throw unsupported('The selected model binding has no native streaming contract.', 'streaming_unavailable')
   }
-  if (turn.stream) checkStreamAdmission(ctx.storage, metrics.request_id, ctx.caller)
+  if (turn.stream || turn.rich) checkStreamAdmission(ctx.storage, metrics.request_id, ctx.caller)
   const { policy, keys, provenance } = currentProfile()
+  if (turn.rich && (turn.response?.store || turn.response?.previous_response_id || policy.capture)) {
+    throw unsupported('Inline media and client tool turns cannot use capture or retained Responses history.', 'rich_persistence_unsupported')
+  }
+  if (turn.rich && (policy.profile || policy.recall)) {
+    throw unsupported('Inline media and client tool turns require a profile without automatic context inclusion.', 'rich_context_unsupported')
+  }
   const scope = checkStoredRoute ? { provenance, checkRoute: checkStoredRoute } : undefined
-  const previous = turn.response?.previous_response_id ? resume(ctx, turn.response.previous_response_id, target, turn.messages, scope) : null
+  const previous = !turn.rich && turn.response?.previous_response_id ? resume(ctx, turn.response.previous_response_id, target, turn.messages, scope) : null
   if (turn.response?.store) checkResponseQuota(ctx)
   // Only names already present in account configuration enter metadata logs.
   metrics.model = turn.model
@@ -255,6 +274,67 @@ async function modelRoute(request: Request, endpoint: string, ctx: GatewayContex
   const lease = () => { admission.guard(); configStillCurrent(); parentGuard?.() }
   let transferred = false
   try {
+    if (turn.rich && adapter) {
+      const started = Date.now()
+      const rich = turn.rich
+      metrics.recall_reason = 'disabled'
+      metrics.capture_status = 'disabled'
+      metrics.capture_reason = 'rich_turn_not_retained'
+      const prepare = (signal: AbortSignal) => {
+        let live = true
+        return within(8_000, () => rich.resolve(ctx.readPrivateGatewayAttachment, () => {
+          signal.throwIfAborted()
+          if (!live) throw new GatewayError(504, 'attachment_timeout', 'The private attachment did not become available in time.')
+          lease()
+          if (turn.stream) checkStreamAdmission(ctx.storage, metrics.request_id, ctx.caller)
+        }), () => {
+          live = false
+          return new GatewayError(504, 'attachment_timeout', 'The private attachment did not become available in time.')
+        })
+      }
+      if (turn.stream) {
+        const input = await prepare(request.signal)
+        await ctx.reauthorize?.()
+        const guard = () => { lease(); input.assertCurrent() }
+        guard()
+        checkStreamAdmission(ctx.storage, metrics.request_id, ctx.caller)
+        reserve(ctx, input.inputBytes + turn.maxTokens * 4)
+        const response = await streamTurn({ ctx, request, protocol, model: turn.model, note: '', response: turn.response,
+          includeUsage: turn.includeUsage, maxTokens: turn.maxTokens, metrics, guard, publish: async () => {},
+          modelRevision: ctx.gatewayModelRevision, credentialRevision: ctx.gatewayCredentialRevision,
+          source: ({ signal }) => {
+            metrics.upstream_attempted = true
+            return adapter.stream!(target.model, input, turn.maxTokens, signal!, guard)
+          }, external: true, textFilter: ctx.gatewayProvider!.streamTextFilter!(),
+          tools: { rules: input.rules, ids: input.ids, secret: adapter.secretGuard }, release() {
+            if (admission.deleted()) metrics.error_reason = 'gateway_state_deleted'
+            admission.done()
+            recordLog()
+          } })
+        transferred = true
+        deferLog()
+        return response
+      }
+      return await withCancellableGatewayCall(ctx, request, metrics.request_id, ctx.gatewayModelRevision,
+        ctx.gatewayCredentialRevision, async signal => {
+          const input = await prepare(signal)
+          await ctx.reauthorize?.()
+          const guard = () => { signal.throwIfAborted(); lease(); input.assertCurrent() }
+          guard()
+          reserve(ctx, input.inputBytes + turn.maxTokens * 4)
+          metrics.upstream_attempted = true
+          const reply = await adapter.generate(target.model, input, turn.maxTokens, signal, guard)
+          await ctx.reauthorize?.()
+          guard()
+          metrics.duration_ms = Date.now() - started
+          metrics.upstream_status = 200
+          if (reply.inputTokens !== null) metrics.input_tokens = reply.inputTokens
+          if (reply.outputTokens !== null) metrics.output_tokens = reply.outputTokens
+          return json(renderRich(protocol, turn.model, reply, metrics.request_id, turn.response),
+            { ...requestHeaders, 'x-openviking-recall': 'disabled', 'x-openviking-capture': 'disabled' })
+        })
+    }
+    if (turn.rich) throw refusal!
     if (kind === 'count_tokens') {
       if (target.rule.binding !== 'operator' || !ctx.gatewayProvider?.countTokens) {
         throw unsupported('No exact input tokenizer is available for this binding.', 'token_count_unavailable')
@@ -288,8 +368,9 @@ async function modelRoute(request: Request, endpoint: string, ctx: GatewayContex
     if (source) {
       const external = target.rule.binding === 'operator'
       const response = await streamTurn({ ctx, request, protocol, model: turn.model, note: recallNote(policy, metrics), response: turn.response,
-        includeUsage: turn.includeUsage, messages: inbound.input, maxTokens: turn.maxTokens, metrics, guard, publish, modelRevision: ctx.gatewayModelRevision,
-        source, external, credentialRevision: ctx.gatewayCredentialRevision, textFilter: external ? ctx.gatewayProvider?.streamTextFilter?.() : undefined,
+        includeUsage: turn.includeUsage, maxTokens: turn.maxTokens, metrics, guard, publish, modelRevision: ctx.gatewayModelRevision,
+        source: options => source(inbound.input, options), external, credentialRevision: ctx.gatewayCredentialRevision,
+        textFilter: external ? ctx.gatewayProvider?.streamTextFilter?.() : undefined,
         release() {
           if (admission.deleted()) metrics.error_reason = 'gateway_state_deleted'
           admission.done()

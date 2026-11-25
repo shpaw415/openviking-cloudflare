@@ -22,7 +22,8 @@ export function ensureParentPlan(fs: Filesystem, parent: FsPath, create: boolean
 
 /** Shared with staged uploads. An ACL refusal at a candidate leaf is not a license to inspect it. */
 export function nextResourceLeaf(fs: Filesystem, parent: FsPath, name: string) {
-  const dot = name.lastIndexOf('.')
+  const lastDot = name.lastIndexOf('.')
+  const dot = lastDot < 0 ? name.length : lastDot
   const ext = name.slice(dot)
   for (let suffix = 0; suffix <= ACCOUNT_ENTRIES; suffix++) {
     const ending = `_${suffix}${ext}`

@@ -5,6 +5,8 @@ import { decoder, encoder, invalid, quota } from './common.js'
 export const ZIP_BYTES = 1_500_000 // Below the Durable Object SQLite per-row limit.
 export const ZIP_ENTRIES = 261 // 256 entries in the tree plus container/metadata members.
 const ZIP_EXPANDED_BYTES = 2 * 1024 * 1024 + 2 * 384 * 1024
+type ZipLimits = { bytes: number; entries: number; expanded: number; storedOnly?: boolean }
+const packLimits: ZipLimits = { bytes: ZIP_BYTES, entries: ZIP_ENTRIES, expanded: ZIP_EXPANDED_BYTES }
 const LOCAL = 0x04034b50
 const CENTRAL = 0x02014b50
 const END = 0x06054b50
@@ -42,8 +44,8 @@ type Bytes = Uint8Array<ArrayBuffer>
 export type Member = { name: string; method: number; size: number; crc: number; compressed: Bytes }
 
 /** Read a deliberately narrow ZIP32 container into bounded, inert members. Never extract to an OS path. */
-export function inspectZip(bytes: Bytes): Map<string, Member> {
-  if (bytes.byteLength > ZIP_BYTES) quota('OVPack ZIP body exceeds the byte limit.')
+export function inspectZip(bytes: Bytes, limits = packLimits): Map<string, Member> {
+  if (bytes.byteLength > limits.bytes) quota('Archive ZIP body exceeds the byte limit.')
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
   const u16 = (i: number) => view.getUint16(i, true)
   const u32 = (i: number) => view.getUint32(i, true)
@@ -52,7 +54,7 @@ export function inspectZip(bytes: Bytes): Map<string, Member> {
   if (end < 0 || u32(end) !== END || u16(end + 4) || u16(end + 6) || u16(end + 20)) return malformed()
   const files = u16(end + 10)
   if (!files || files !== u16(end + 8)) return malformed()
-  if (files > ZIP_ENTRIES) quota('OVPack contains too many ZIP members.')
+  if (files > limits.entries) quota('Archive contains too many ZIP members.')
   let central = u32(end + 16)
   const centralStart = central
   if (central >= end || central + u32(end + 12) !== end) return malformed()
@@ -66,7 +68,7 @@ export function inspectZip(bytes: Bytes): Map<string, Member> {
     const attrs = u32(central + 38), at = u32(central + 42)
     const mode = (attrs >>> 16) & 0xf000
     if (!length || length > 1401 || central + 46 + length > end || (flags & ~(UTF8 | (method === 8 ? 6 : 0))) ||
-        (method !== 0 && method !== 8) || (method === 0 && packed !== size) || u16(central + 6) > 20 ||
+        (method !== 0 && (limits.storedOnly || method !== 8)) || (method === 0 && packed !== size) || u16(central + 6) > 20 ||
         u16(central + 30) || u16(central + 32) || u16(central + 34) || at + 30 + length > centralStart) return malformed()
     const raw = bytes.subarray(central + 46, central + 46 + length)
     const name = decodeName(raw, flags)
@@ -79,7 +81,7 @@ export function inspectZip(bytes: Bytes): Map<string, Member> {
     const start = at + 30 + length, finish = start + packed
     if (finish > centralStart) return malformed()
     expanded += size
-    if (expanded > ZIP_EXPANDED_BYTES) quota('OVPack exceeds the expanded byte limit.')
+    if (expanded > limits.expanded) quota('Archive exceeds the expanded byte limit.')
     ranges.push([at, finish]); members.set(name, { name, method, size, crc, compressed: bytes.subarray(start, finish) })
     central += 46 + length
   }
@@ -124,11 +126,11 @@ export async function memberBytes(member: Member, limit: number): Promise<Bytes>
   return bytes
 }
 
-export function storedZip(entries: readonly { name: string; bytes: Bytes }[]): Bytes {
+export function storedZip(entries: readonly { name: string; bytes: Bytes }[], limits = packLimits): Bytes {
   const items = entries.map(entry => ({ ...entry, label: encoder.encode(entry.name) }))
   const localSize = items.reduce((sum, { label, bytes }) => sum + 30 + label.byteLength + bytes.byteLength, 0)
   const centralSize = items.reduce((sum, { label }) => sum + 46 + label.byteLength, 0)
-  if (!items.length || items.length > ZIP_ENTRIES || localSize + centralSize + 22 > ZIP_BYTES) quota('OVPack export exceeds the ZIP size or entry limit.')
+  if (!items.length || items.length > limits.entries || localSize + centralSize + 22 > limits.bytes) quota('Archive export exceeds the ZIP size or entry limit.')
   const result = new Uint8Array(localSize + centralSize + 22)
   const view = new DataView(result.buffer)
   const u16 = (at: number, n: number) => view.setUint16(at, n, true)

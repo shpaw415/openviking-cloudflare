@@ -14,6 +14,9 @@ import type { Permit, Scope } from './backup-authority.js'
 import { aclSeal, captureAclCeiling, readAclCeiling } from './backup-acl.js'
 import { hasTable, type Domain } from './backup-domain.js'
 import { captureDomains, decodeEdge, edgeFilename, encodeEdge, planDomains } from './edge-backup.js'
+import { armGatewayAttachmentPurge } from '../gateway/attachments.js'
+import { attachmentsExpired, captureAttachments, publishAttachments, unwrapAttachments, wrapAttachments } from './instance-attachments.js'
+import type { AttachmentSeats } from './instance-attachments.js'
 
 const privateHeaders = { 'cache-control': 'private, no-store' }
 const entryPrefix = 'viking://'
@@ -243,44 +246,59 @@ function domainContext(storage: DurableObjectStorage, scope: Scope, fs: BackupFi
   return { sql: storage.sql, scope, fs: owner => fs.fs(owner) }
 }
 
-export async function captureBackup(storage: DurableObjectStorage, env: Env, scope: Scope, permit: Permit, input: unknown): Promise<Response> {
+type Sealer = { key: string; label: string }
+type InstanceScope = { seal: Sealer; live: () => void; seats?: AttachmentSeats }
+type InstanceCapture = InstanceScope & { check: () => void }
+type InstanceRestore = InstanceScope & { cold: () => void; plan?: string; commit: (attachmentDeadline: number | null, attachmentCount: number) => string }
+
+export async function captureBackup(storage: DurableObjectStorage, env: Env, scope: Scope, permit: Permit | undefined, input: unknown,
+  instance?: InstanceCapture): Promise<Response> {
   const body = options(input, true), format = profile(body)
   if (bool(body.include_vectors, 'include_vectors')) policyUnsupported()
-  await assertFixedDirectory(env, scope)
-  assertPermitLive(permit)
-  const { entries, ceiling, domains } = storage.transactionSync(() => {
+  const live = instance?.live ?? (() => assertPermitLive(permit!))
+  if (!instance) await assertFixedDirectory(env, scope)
+  live()
+  const { entries, ceiling, domains, attachments } = storage.transactionSync(() => {
+    instance?.check()
     const fs = new BackupFilesystem(storage, scope)
     const domains = format === 'edge-v1' ? captureDomains(domainContext(storage, scope, fs)) : undefined
     const snapshot = fs.capture(domains?.skills.owned)
-    return { ...snapshot, domains }
+    return { ...snapshot, domains, attachments: instance?.seats && captureAttachments(storage.sql, instance.seats) }
   })
   const content = await encodeBackup(entries)
-  const zip = domains ? await encodeEdge(content, domains) : content
+  const edge = domains ? await encodeEdge(content, domains) : content
+  const zip = attachments ? await wrapAttachments(edge, attachments) : edge
   const sha256 = await digest(zip)
-  const seal = await sign(scope, 'archive', sha256, ceiling)
-  assertPermitLive(permit)
+  const seal = await sign(instance ? { ...scope, key: instance.seal.key } : scope, instance?.seal.label ?? 'archive', sha256, ceiling)
+  live()
   return new Response(zip, { headers: { ...privateHeaders, 'content-type': 'application/zip',
     'content-disposition': attachment(domains ? edgeFilename : `${backupRoot.name}.ovpack`),
     'x-ovpack-sha256': sha256, 'x-ovpack-seal': `${ceiling}.${seal}` } })
 }
 
-export async function restoreBackup(storage: DurableObjectStorage, env: Env, workspaceId: string, scope: Scope, permit: Permit,
-  evaluate: boolean, bytes: ArrayBuffer, seal: unknown, input: unknown, receipt?: unknown): Promise<Response> {
+export async function restoreBackup(storage: DurableObjectStorage, env: Env, workspaceId: string, scope: Scope, permit: Permit | undefined,
+  evaluate: boolean, bytes: ArrayBuffer, seal: unknown, input: unknown, receipt?: unknown, instance?: InstanceRestore): Promise<Response> {
   const { policy, profile: format } = restoreOptions(input)
-  const approved = evaluate ? undefined : approvalToken(receipt)
+  const approved = evaluate || instance ? undefined : approvalToken(receipt)
+  const livePermit = instance?.live ?? (() => assertPermitLive(permit!))
   if (approved && approved.expires_at <= Date.now()) stale()
   const { ceiling, mac } = aclSeal(seal, scope.users.length)
   const zip = new Uint8Array(bytes), sha256 = await digest(zip)
-  if (!await verifies(scope, 'archive', mac, sha256, ceiling)) {
+  const signing = instance ? { ...scope, key: instance.seal.key } : scope
+  if (!await verifies(signing, instance?.seal.label ?? 'archive', mac, sha256, ceiling)) {
     fail(403, 'BACKUP_SEAL_INVALID', 'The backup bytes are not sealed for the named workspace.')
   }
   const fs = new BackupFilesystem(storage, scope), domain = domainContext(storage, scope, fs)
-  const incoming = format === 'edge-v1' ? await decodeEdge(domain, zip) : undefined
+  const pieces = instance?.seats ? await unwrapAttachments(zip, instance.seats) : undefined
+  const checkDeadline = () => { if (pieces?.deadline != null && pieces.deadline <= Date.now()) attachmentsExpired() }
+  const incoming = format === 'edge-v1' ? await decodeEdge(domain, pieces?.edge ?? zip) : undefined
   const entries = incoming?.entries ?? await decodeBackup(zip)
   const allowsOverwrite = readAclCeiling(ceiling, entries, scope.users)
-  await assertFixedDirectory(env, scope)
-  assertPermitLive(permit)
+  if (!instance) await assertFixedDirectory(env, scope)
+  livePermit()
   const prepare = () => {
+    instance?.cold()
+    checkDeadline()
     const live = incoming && captureDomains(domain)
     const state = fs.state(live?.skills.owned)
     const domains = incoming && live && planDomains(domain, incoming, live, policy === 'skip')
@@ -290,23 +308,37 @@ export async function restoreBackup(storage: DurableObjectStorage, env: Env, wor
     return { files, domains, stamp: JSON.stringify([files.stamp, domains?.stamp]), outcome: domains?.changed ? 'ready' : files.outcome }
   }
   const plan = storage.transactionSync(prepare)
-  const conditions = [workspaceId, format, policy, sha256, mac, plan.stamp, plan.files.counts, plan.domains?.counts, plan.outcome]
+  const conditions: unknown[] = [workspaceId, format, policy, sha256, mac, plan.stamp, plan.files.counts, plan.domains?.counts, plan.outcome]
+  if (pieces) conditions.push(pieces.deadline)
   const result = { uri: ROOT, scopes: backupScopes, profile: format, archive_sha256: sha256, counts: plan.files.counts,
     ...(plan.domains && { domain_counts: plan.domains.counts }),
     index_status: plan.files.counts.files_written || plan.domains?.counts.skills ? 'deferred' : 'unchanged', outcome: plan.outcome }
-  if (!approved) {
+  if (evaluate) {
+    if (instance) {
+      const plan = await sign(signing, `${instance.seal.label}:plan`, ...conditions)
+      livePermit()
+      checkDeadline()
+      return ok({ ...result, dry_run: true, plan,
+        ...(pieces && { attachment_count: pieces.items.length, attachment_deadline: pieces.deadline }) })
+    }
     const expires_at = Date.now() + approvalMs
     const mac = await sign(scope, 'approve', expires_at, ...conditions)
-    assertPermitLive(permit)
+    livePermit()
     return new Response(ok({ ...result, dry_run: true, approval: { expires_at, mac } }).body,
       { headers: { ...privateHeaders, 'content-type': 'application/json' } })
   }
-  if (!await verifies(scope, 'approve', approved.mac, approved.expires_at, ...conditions)) stale()
+  if (instance ? !instance.plan || !await verifies(signing, `${instance.seal.label}:plan`, instance.plan, ...conditions)
+    : !approved || !await verifies(scope, 'approve', approved.mac, approved.expires_at, ...conditions)) stale()
   // Recheck admission and all mutable filesystem preconditions after the await.
-  await assertFixedDirectory(env, scope)
-  storage.transactionSync(() => {
-    assertPermitLive(permit)
-    if (approved.expires_at <= Date.now()) stale()
+  if (!instance) await assertFixedDirectory(env, scope)
+  if (pieces?.deadline != null) {
+    livePermit()
+    checkDeadline()
+    await armGatewayAttachmentPurge(storage, pieces.deadline)
+  }
+  const installed = storage.transactionSync(() => {
+    livePermit()
+    if (approved && approved.expires_at <= Date.now()) stale()
     const current = scopeFor(env, scope.account)
     if (current.key !== scope.key || current.realm !== scope.realm || JSON.stringify(current.users) !== JSON.stringify(scope.users) ||
         JSON.stringify(current.sessionOwners) !== JSON.stringify(scope.sessionOwners)) stale()
@@ -317,8 +349,12 @@ export async function restoreBackup(storage: DurableObjectStorage, env: Env, wor
       if (!latest.files.ready && !latest.files.writes.length && latest.domains.counts.skills) initFilesystem(fs.fs().ctx)
       latest.domains.publish()
     }
+    if (pieces && instance?.seats) publishAttachments(storage.sql, instance.seats, pieces.items)
+    checkDeadline()
+    return instance?.commit(pieces?.deadline ?? null, pieces?.items.length ?? 0)
   })
   await storage.sync()
+  if (instance) return ok({ receipt: installed })
   return new Response(ok({ ...result, dry_run: false, outcome: plan.outcome === 'ready' ? 'applied' : plan.outcome }).body,
     { headers: { ...privateHeaders, 'content-type': 'application/json' } })
 }

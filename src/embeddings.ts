@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { ApiError, isRecord } from './http.js'
-import { legacyEmbedding } from './model-config.js'
+import { embeddingBatchLimit, legacyEmbedding } from './model-config.js'
 import type { BoundModel, EmbeddingConfig } from './model-config.js'
 import { modelEmbedding } from './model-runtime.js'
 
@@ -18,23 +18,31 @@ export function embeddingVectors(data: unknown, count: number, dimension: number
 }
 
 export async function embed(binding: BoundModel | undefined, config: EmbeddingConfig, texts: string[], reserve: (count: number) => void,
-  report?: (tokens: number) => void): Promise<number[][]> {
+  report?: (tokens: number) => void, beforeNextBatch?: () => Promise<void>): Promise<number[][]> {
   if (!binding) throw unavailable()
-  if (!texts.length || texts.length > 32 || texts.some(text => typeof text !== 'string' || text.length > 4096)) {
+  if (!texts.length || texts.length > embeddingBatchLimit || texts.some(text => typeof text !== 'string' || text.length > 4096)) {
     throw new ApiError(400, 'INVALID_ARGUMENT', 'The embedding batch exceeds the Worker limits.')
   }
   reserve(texts.length)
-  try {
-    const data = await modelEmbedding(binding, config, texts)
-    const vectors = embeddingVectors(data, texts.length, config.dimension)
-    if (isRecord(data) && isRecord(data.usage)) {
-      const count=data.usage.prompt_tokens??data.usage.total_tokens
-      if(typeof count==='number'&&Number.isSafeInteger(count)&&count>=0&&count<=1_000_000)report?.(count)
-    }
-    return vectors
-  } catch {
-    throw unavailable()
+  const batchSize = config.batch_size ?? embeddingBatchLimit
+  const deadline = Date.now() + 20_000 // The HTTP deadline covers the entire logical batch, not each split.
+  const vectors: number[][] = []
+  let usage: number | undefined = 0
+  for (let offset = 0; offset < texts.length; offset += batchSize) {
+    if (offset) await beforeNextBatch?.()
+    const left = deadline - Date.now()
+    if (left <= 0) throw unavailable()
+    const batch = texts.slice(offset, offset + batchSize)
+    try {
+      const data = await modelEmbedding(binding, config, batch, left / 1000)
+      vectors.push(...embeddingVectors(data, batch.length, config.dimension))
+      const count = isRecord(data) && isRecord(data.usage) ? data.usage.prompt_tokens ?? data.usage.total_tokens : undefined
+      if (usage !== undefined && typeof count === 'number' && Number.isSafeInteger(count) && count >= 0 && usage + count <= 1_000_000) usage += count
+      else usage = undefined
+    } catch { throw unavailable() }
   }
+  if (usage !== undefined) report?.(usage)
+  return vectors
 }
 
 export function initEmbeddingSelection(sql: SqlStorage): void {

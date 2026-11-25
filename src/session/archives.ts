@@ -2,6 +2,7 @@
 import type { WorkspaceContext } from '../context.js'
 import { ApiError, ok } from '../http.js'
 import { pathFor } from '../fs/contract.js'
+import { edgeSessionDefaults } from '../model-config.js'
 import { eventsPrompt, eventDocument, overviewPrompt, parseEvents, transcript } from './extraction.js'
 import { callFilesystem, guardedFilesystem } from './filesystem.js'
 import { acquire, assertFlight, assertIdle, currentFlight, release, sessionColumns, sessionWhere } from './flight.js'
@@ -15,7 +16,7 @@ import { autoDecision } from './auto-commit.js'
 import { autoState, noteAutoSuccess } from './auto-policy.js'
 
 type Flight = ReturnType<typeof acquire>
-type Options = { extract: boolean, working: boolean, tags: string[] }
+type Options = { extract: boolean, working: boolean, tags: string[], extractMaxTokens?: number }
 type Plan = { overview: string, events: ReturnType<typeof parseEvents> }
 type Work = { job_id: string, flight_token: string, options: string, sealed_at: string, status: 'pending' | 'failed' | 'completed',
   failure: string | null, plan: string | null, overview: string, task_id: string | null }
@@ -80,11 +81,12 @@ export function hasActiveArchiveTask(ctx: WorkspaceContext, key: SessionKey): bo
   return pending.some(work => archiveOwner(ctx, key, work) === 'active')
 }
 
-function archiveOptions(sql: SqlStorage, key: SessionKey, policy: string | null, opts: ReturnType<typeof commitOptions>): Options {
+function archiveOptions(ctx: WorkspaceContext, key: SessionKey, policy: string | null, opts: ReturnType<typeof commitOptions>): Options {
   const configured = policy ? JSON.parse(policy) : null
-  return { extract: (configured?.self?.enabled ?? true) && (configured?.memory_types ?? ['events']).includes('events'),
+  return { extract: ctx.memorySettings?.extraction_enabled !== false && (configured?.self?.enabled ?? true) && (configured?.memory_types ?? ['events']).includes('events'),
     working: !opts.reset && (opts.working ?? configured?.working_memory?.enabled ?? false),
-    tags: opts.tags ?? sessionConfig(sql, key).memory_extraction_config.events.tags }
+    tags: opts.tags ?? sessionConfig(ctx.sql, key).memory_extraction_config.events.tags,
+    ...(ctx.memorySettings?.edge_extraction_max_tokens !== undefined && { extractMaxTokens: ctx.memorySettings.edge_extraction_max_tokens }) }
 }
 
 export function commitAnchor(sql: SqlStorage, key: SessionKey, row: SessionRow): string {
@@ -114,7 +116,8 @@ export function rotateArchive(ctx: WorkspaceContext, key: SessionKey, opts: Retu
     if (!auto && expected !== undefined && commitAnchor(sql, key, session) !== expected) {
       throw new ApiError(409, 'CONFLICT', 'The session changed after job submission; review and submit a new commit.')
     }
-    const options = archiveOptions(sql, key, session.memory_policy, opts)
+    ctx.assertArchiveSettingsCurrent?.()
+    const options = archiveOptions(ctx, key, session.memory_policy, opts)
     const now = new Date().toISOString(), retained = Math.min(opts.keep, session.message_count)
     const archived = session.message_count > retained, cutoff = session.total_message_count - retained
     let count = session.commit_count, n = 0, flight: Flight | undefined
@@ -216,7 +219,7 @@ async function processArchive<T extends object>(ctx: WorkspaceContext, key: Sess
         storage.transactionSync(() => { guard(); addUsage(sql, key, g) })
         return g.text
       }
-      const events = opts.extract ? parseEvents(await run(eventsPrompt, data(), 1536, 12 * 1024), lines) : []
+      const events = opts.extract ? parseEvents(await run(eventsPrompt, data(), opts.extractMaxTokens ?? edgeSessionDefaults.extractionTokens, 12 * 1024), lines) : []
       const overview = opts.working ? (await run(overviewPrompt, data(latestOverview(sql, key, n)), 512, 3072)).trim() : ''
       plan = { events, overview }
       // Validate every document before the first publication, then persist

@@ -13,8 +13,10 @@ import { probeActiveModel, probeKind, probeModel } from './control/provider.js'
 import { configurationPatch, evolution, Settings, systemPatch, userPatch } from './control/settings.js'
 import { memoryTypes } from './control/template-defaults.js'
 import { memoryType, Templates } from './control/templates.js'
-import { bindModel, configFileLimit, edgeSearchDefaults, legacyEmbedding, patchModels, selectedVlm } from './model-config.js'
+import { bindModel, bindReranker, configFileLimit, edgeSearchDefaults, edgeSessionDefaults, legacyEmbedding, patchModels, selectedVlm } from './model-config.js'
 import type { ModelSettings } from './model-config.js'
+import { InstanceRecovery } from './archives/instance-control.js'
+import type { ControlCommand } from './archives/instance-authority.js'
 
 export type { ControlCaller } from './context.js'
 
@@ -66,13 +68,23 @@ export class Control extends DurableObject<Env> {
   #settings = new Settings(this.#registry.sql)
   #templates = new Templates(this.#registry.sql)
   #mountSql = this.#initMountStore()
+  #instance = new InstanceRecovery(this.ctx.storage, this.env, this.ctx.id.toString(), (account, users) => this.#backupFixedTopology(account, users))
   #changingMount = false
   // Serialize conflicting registry writes, not the request queue of the DO.
   // A member with a slow Workspace ACK must not block anyone else's grants.
   #authorityWrites = new Set<string>()
   #rotatingDigests = new Set<string>()
 
-  resolve(digestHex: string): Caller | null { return this.#registry.resolve(digestHex) }
+  resolve(digestHex: string): Caller | null {
+    this.#instance.assertServing()
+    return this.#registry.resolve(digestHex)
+  }
+
+  instanceServing(destination?: string, job?: string): boolean { return this.#instance.serving(destination, job) }
+
+  instanceArchive(command: ControlCommand, permit: unknown, archive?: unknown, argument?: unknown): Promise<Response> {
+    return this.#instance.run(command, permit, archive, argument)
+  }
 
   #gatewayIndex() {
     const { sql } = this.#registry
@@ -85,6 +97,7 @@ export class Control extends DurableObject<Env> {
 
   /** Private locator only. The owning Workspace still authenticates the digest. */
   gatewayAccount(digest: string): string | null {
+    this.#instance.assertServing()
     if (!digestPattern.test(digest)) return null
     return this.#gatewayIndex().exec<{ account_id: string }>(`SELECT g.account_id FROM ov_control_gateway_index g
       JOIN ov_control_accounts a ON a.account_id=g.account_id AND a.deleted=0 WHERE g.digest=?`, digest).toArray()[0]?.account_id ?? null
@@ -92,6 +105,7 @@ export class Control extends DurableObject<Env> {
 
   /** Called by the authenticated, single-issuer Workspace; prune interrupted issues or retired locators. */
   registerGatewayDigest(issuer: KeyAuthority, owner: KeyAuthority, fixed: Caller[], digest: string, live: string[]): boolean {
+    this.#instance.assertServing()
     const account = id(issuer.caller.accountId, 'account_id')
     if (owner.caller.accountId !== account || (issuer.caller.role !== 'admin' &&
         (owner.caller.userId !== issuer.caller.userId || owner.caller.agentId !== issuer.caller.agentId))) return false
@@ -121,14 +135,20 @@ export class Control extends DurableObject<Env> {
 
   /** Private lookup for a tuple already authenticated and mapped by the parent. */
   resolveManagedIdentity(accountId: string, userId: string, agentId: string): Caller | null {
+    this.#instance.assertServing()
     return this.#registry.resolveManagedIdentity(accountId, userId, agentId)
   }
 
-  probe(): boolean { return this.#registry.sql.exec<{ n: number }>('SELECT 1 AS n').one().n === 1 }
+  probe(): boolean { return this.#instance.serving() && this.#registry.sql.exec<{ n: number }>('SELECT 1 AS n').one().n === 1 }
 
   /** Read-only topology gate for the private backup binding. Fixed seats must
    * have been provisioned independently; do not reserve or read any keys here. */
   backupFixedTopology(accountId: string, users: string[]): boolean {
+    this.#instance.assertServing()
+    return this.#backupFixedTopology(accountId, users)
+  }
+
+  #backupFixedTopology(accountId: string, users: string[]): boolean {
     const account = id(accountId, 'account_id')
     if (!Array.isArray(users) || users.length < 1 || users.length > 32) return false
     const { sql } = this.#registry
@@ -178,6 +198,7 @@ export class Control extends DurableObject<Env> {
   /** Binding-only: the directory and the credential/group revision are read
    * together. This grant neither reads nor enrolls model configuration. */
   dataAuthorityGrant(owner: KeyAuthority, fixed: Caller[], expected?: AuthorityRevision): DataAuthorityGrant {
+    this.#instance.assertServing()
     const account = owner.caller.accountId
     const locals = fixedCallers(fixed).filter(item => item.accountId === account)
     return this.#registry.tx(() => {
@@ -221,6 +242,7 @@ export class Control extends DurableObject<Env> {
   }
 
   #gatewayMount(digest: string | null, owner: KeyAuthority, fixed: Caller[], expected?: number): GatewayMount {
+    this.#instance.assertServing()
     const account = owner.caller.accountId
     const locals = fixedCallers(fixed).filter(item => item.accountId === account)
     const sql = this.#mountSql
@@ -378,6 +400,7 @@ export class Control extends DurableObject<Env> {
 
   // The binding caller can pass current key-free fixed identities or merge them itself.
   principalsFor(accountId: string, fixedIdentities?: ControlCaller[]): { users: string[]; groups: string[] } {
+    this.#instance.assertServing()
     const account = id(accountId, 'account_id')
     const fixed = fixedIdentities === undefined ? [] : fixedCallers(fixedIdentities).filter(item => item.accountId === account)
     return this.#registry.tx(() => {
@@ -388,6 +411,7 @@ export class Control extends DurableObject<Env> {
 
   /** Called only after the outer Worker verifies a current fixed credential. */
   admitFixed(caller: Caller): boolean {
+    this.#instance.assertServing()
     if (!hasCallerShape(caller) || (caller.role !== 'admin' && caller.role !== 'user')) return false
     try { this.#registry.tx(() => this.#registry.reserveFixed([caller])); return true } catch (error) {
       if (error instanceof ApiError) return false
@@ -399,6 +423,7 @@ export class Control extends DurableObject<Env> {
     const correlation = crypto.randomUUID()
     let response: Response
     try {
+      this.#instance.assertServing()
       const url = new URL(request.url)
       const path = paths(url.pathname)
       const fixed = fixedCallers(fixedIdentities)
@@ -410,6 +435,7 @@ export class Control extends DurableObject<Env> {
       // Recheck after body / Web Crypto awaits, in the same synchronous
       // transaction as each mutation. No permission derived from the request.
       const write = <T>(operation: () => T): T => registry.tx(() => {
+        this.#instance.assertServing()
         registry.admitted(caller, fixed, expectedDigest)
         return operation()
       })
@@ -447,7 +473,17 @@ export class Control extends DurableObject<Env> {
             embedding: { ...embedding, configured: !!bindModel(this.env, embedding), scope: 'new_workspaces' },
             default_search_limit: settings.default_search_limit ?? edgeSearchDefaults.limit,
             default_search_score_threshold: settings.default_search_score_threshold ?? edgeSearchDefaults.score,
-            retrieval: { use_session_context: settings.retrieval?.enable_intent ?? edgeSearchDefaults.sessionContext, intent_planner: false },
+            retrieval: { use_session_context: settings.retrieval?.enable_intent ?? edgeSearchDefaults.sessionContext, intent_planner: false,
+              ...(settings.retrieval?.session_context_messages !== undefined && { session_context_messages: settings.retrieval.session_context_messages }),
+              ...(settings.retrieval?.session_context_chars !== undefined && { session_context_chars: settings.retrieval.session_context_chars }) },
+            rerank: settings.rerank ? { ...settings.rerank, configured: !!bindReranker(this.env, settings.rerank) } : null,
+            memory: { extraction_enabled: settings.memory?.extraction_enabled ?? true,
+              edge_extraction_max_tokens: settings.memory?.edge_extraction_max_tokens ?? edgeSessionDefaults.extractionTokens,
+              edge_context_token_budget: settings.memory?.edge_context_token_budget ?? null,
+              session_auto_commit: settings.memory?.session_auto_commit?.enabled ? { enabled: true,
+                message_count_threshold: settings.memory.session_auto_commit.message_count_threshold ?? edgeSessionDefaults.messageThreshold,
+                pending_token_threshold: settings.memory.session_auto_commit.pending_token_threshold ?? edgeSessionDefaults.pendingTokenThreshold,
+              } : { enabled: false } },
           } })
         }
         if (verb === 'GET') {

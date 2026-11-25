@@ -2,6 +2,8 @@
 import type { GatewayError, Protocol } from './contract.js'
 import type { Finish, Usage } from './sse-source.js'
 import type { ResponseMeta } from './wire.js'
+import { chatCall, messagesCall, responsesCall } from './tool-dto.js'
+import type { Call } from './tool-dto.js'
 
 const data = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`
 const event = (type: string, value: Record<string, unknown> = {}) => `event: ${type}\n${data({ type, ...value })}`
@@ -19,7 +21,8 @@ export function sseWire(protocol: Protocol, model: string, requestId: string, no
   const part = (text: string) => ({ type: 'output_text', text, annotations: [] })
   const item = (content: ReturnType<typeof part>[], status: 'in_progress' | 'completed' | 'incomplete') => ({ id: itemId,
     type: 'message', role: 'assistant', status, content })
-  const response = (status: string, output: ReturnType<typeof item>[], usage: Usage | null, incomplete_details: { reason: string } | null = null) => ({
+  const response = (status: string, output: Array<ReturnType<typeof item> | ReturnType<typeof responsesCall>>, usage: Usage | null,
+    incomplete_details: { reason: string } | null = null) => ({
     id, object: 'response', created_at: created, status, model, output, error: null, incomplete_details, ...meta,
     ...(usage && usage.inputTokens !== null && usage.outputTokens !== null ? { usage: {
       input_tokens: usage.inputTokens, output_tokens: usage.outputTokens, total_tokens: usage.inputTokens + usage.outputTokens,
@@ -31,42 +34,69 @@ export function sseWire(protocol: Protocol, model: string, requestId: string, no
     if (protocol === 'responses') return responsesEvent('response.output_text.delta', { ...indices, delta: text, logprobs: [] })
     return event('content_block_delta', { index: 0, delta: { type: 'text_delta', text } })
   }
+  let hasText = false, textClosed = false
+  const closeText = (text: string, status: 'completed' | 'incomplete') => {
+    if (!hasText || textClosed || protocol === 'chat') return ''
+    textClosed = true
+    if (protocol === 'anthropic') return event('content_block_stop', { index: 0 })
+    const final = part(prefix + text)
+    return responsesEvent('response.output_text.done', { ...indices, text: final.text, logprobs: [] }) +
+      responsesEvent('response.content_part.done', { ...indices, part: final }) +
+      responsesEvent('response.output_item.done', { output_index: 0, item: item([final], status) })
+  }
+  const functionItems = (calls: Call[]) => calls.map((call, index) => responsesCall(call, nonce, index + Number(hasText)))
   return {
-    opening() {
+    opening(textWillFollow = true) {
+      hasText = textWillFollow
       let out: string
-      if (protocol === 'chat') out = chat({ role: 'assistant', content: '' })
+      if (protocol === 'chat') out = chat({ role: 'assistant', ...(hasText && { content: '' }) })
       else if (protocol === 'responses') out = responsesEvent('response.created', { response: response('in_progress', [], null) }) +
         responsesEvent('response.in_progress', { response: response('in_progress', [], null) }) +
-        responsesEvent('response.output_item.added', { output_index: 0, item: item([], 'in_progress') }) +
-        responsesEvent('response.content_part.added', { ...indices, part: part('') })
+        (hasText ? responsesEvent('response.output_item.added', { output_index: 0, item: item([], 'in_progress') }) +
+        responsesEvent('response.content_part.added', { ...indices, part: part('') }) : '')
       else out = event('message_start', { message: { id, type: 'message', role: 'assistant', model, content: [],
         stop_reason: null, stop_sequence: null, ...(!external && { usage: { input_tokens: null, output_tokens: null } }) } }) +
-        event('content_block_start', { index: 0, content_block: { type: 'text', text: '' } })
+        (hasText ? event('content_block_start', { index: 0, content_block: { type: 'text', text: '' } }) : '')
       return out + (prefix ? delta(prefix) : '')
     },
     delta,
+    tools(calls: Call[], text: string) {
+      if (protocol === 'chat') return chat({ tool_calls: calls.map((call, index) => ({ index, ...chatCall(call) })) })
+      const endText = closeText(text, 'completed')
+      const start = Number(hasText)
+      if (protocol === 'anthropic') return endText + calls.map((call, offset) => {
+        const index = start + offset
+        return event('content_block_start', { index, content_block: { ...messagesCall(call), input: {} } }) +
+          event('content_block_delta', { index, delta: { type: 'input_json_delta', partial_json: call.arguments } }) +
+          event('content_block_stop', { index })
+      }).join('')
+      return endText + functionItems(calls).map((value, offset) => {
+        const output_index = start + offset, item_id = value.id, { arguments: args } = value
+        return responsesEvent('response.output_item.added', { output_index, item: { ...value, status: 'in_progress', arguments: '' } }) +
+          responsesEvent('response.function_call_arguments.delta', { item_id, output_index, delta: args }) +
+          responsesEvent('response.function_call_arguments.done', { item_id, output_index, arguments: args, name: value.name }) +
+          responsesEvent('response.output_item.done', { output_index, item: value })
+      }).join('')
+    },
     snapshot(text: string, usage: Usage) { return response('completed', [item([part(prefix + text)], 'completed')], usage) },
-    finish(text: string, reason: Finish, usage: Usage) {
+    finish(text: string, reason: Finish, usage: Usage, calls: Call[] = []) {
       if (protocol === 'chat') {
         const actual = includeUsage && usage.inputTokens !== null && usage.outputTokens !== null ? data({ id,
           object: 'chat.completion.chunk', created, model, choices: [], usage: { prompt_tokens: usage.inputTokens,
             completion_tokens: usage.outputTokens, total_tokens: usage.inputTokens + usage.outputTokens } }) : ''
         return chat({}, reason) + actual + 'data: [DONE]\n\n'
       }
-      if (protocol === 'anthropic') return event('content_block_stop', { index: 0 }) +
+      if (protocol === 'anthropic') return closeText(text, 'completed') +
         event('message_delta', { delta: { stop_reason: reason === 'stop' ? 'end_turn' : reason === 'length' ? 'max_tokens' :
-          reason === 'content_filter' ? 'refusal' : null, stop_sequence: null },
+          reason === 'content_filter' ? 'refusal' : reason === 'tool_calls' ? 'tool_use' : null, stop_sequence: null },
          ...(!external ? { usage: { input_tokens: usage.inputTokens, output_tokens: usage.outputTokens } } :
            usage.inputTokens === null && usage.outputTokens === null ? {} : { usage: {
              ...(usage.inputTokens !== null && { input_tokens: usage.inputTokens }),
              ...(usage.outputTokens !== null && { output_tokens: usage.outputTokens }),
            } }) }) + event('message_stop')
       const status = reason === 'length' || reason === 'content_filter' ? 'incomplete' : 'completed'
-      const final = part(prefix + text), finalItem = item([final], status)
-      return responsesEvent('response.output_text.done', { ...indices, text: final.text, logprobs: [] }) +
-        responsesEvent('response.content_part.done', { ...indices, part: final }) +
-        responsesEvent('response.output_item.done', { output_index: 0, item: finalItem }) +
-        responsesEvent(`response.${status}`, { response: response(status, [finalItem], usage,
+      const final = hasText ? [item([part(prefix + text)], status)] : []
+      return closeText(text, status) + responsesEvent(`response.${status}`, { response: response(status, [...final, ...functionItems(calls)], usage,
           status === 'incomplete' ? { reason: reason === 'length' ? 'max_output_tokens' : 'content_filter' } : null) })
     },
     fail(error: GatewayError) {

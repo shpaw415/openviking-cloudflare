@@ -17,6 +17,8 @@ import { initEvolution, routeEvolution } from './bot/evolution.js'
 import { initArchives, isWebDavPath, routeArchives, WEB_DAV_REQUEST_HEADERS } from './archives.js'
 import { admitPermit, backupResponse, zipBuffer } from './archives/backup-authority.js'
 import { captureBackup, restoreBackup } from './archives/backup-workspace.js'
+import { assertInstanceServing, maintainStandbyAttachments, workspaceInstanceBackup } from './archives/instance-workspace.js'
+import { instanceMode } from './archives/instance-authority.js'
 import { armCompileSchedule, compileExampleSkills, initCompile, routeCompile, runCompile, runDueCompileSchedule } from './compile.js'
 import { initMcp, isMcpHttpPath, routeMcp } from './mcp.js'
 import { oauthAllows, oauthFor, oauthRoute, oauthTokenDigest } from './oauth.js'
@@ -28,6 +30,7 @@ import { retrievalContext } from './session-search-context.js'
 import { cancelGatewayStream, initGateway, isDedicatedGatewayRoute, isGatewayPath, routeGateway } from './gateway.js'
 import { invalidateGatewayCredentials, invalidateGatewayStreams } from './gateway/stream.js'
 import { protectStreamText } from './gateway/sse-source.js'
+import { richOperator } from './gateway/operator-rich.js'
 import type { GatewayContext } from './gateway.js'
 import { deleteKeyDigest, disabledKeys, invalidGatewayKey, keyByDigest, keyOwner } from './gateway/keys.js'
 import type { KeyAuthority } from './gateway/keys.js'
@@ -36,17 +39,22 @@ import { assertCredentialRevision, assertModelRevision, credentialChanged, fence
   initModelFence, modelAuthorityUnavailable, modelChanged } from './gateway/model-authority.js'
 import { dataAuthorityChanged, dataAuthorityUnavailable, fenceDataAuthority, initDataAuthorityFence, mountDataAuthority, sameAuthority, storedAuthority } from './data-authority.js'
 import type { AuthorityAdvance, AuthorityRevision } from './data-authority.js'
-import { initGatewayTransfers, routeGatewayTransfer, transferTicketHeader } from './gateway/transfers.js'
+import { gatewayTransfersConfigured, initGatewayTransfers, readPrivateGatewayAttachment, routeGatewayTransfer, transferTicketHeader } from './gateway/transfers.js'
+import { initGatewayAttachments, sweepGatewayAttachments } from './gateway/attachments.js'
 import { bindModel, legacyEmbedding, selectedVlm } from './model-config.js'
 import type { EmbeddingConfig, ModelSettings } from './model-config.js'
+import { searchReranker } from './fs/rerank.js'
 import type { JobKind } from './tasks.js'
 import { claimWatch, identityForWatch, initWatches, prepareWatchRegistrar, remoteTextSource, revokeWatch, routeWatches, runWatch, scheduleWatch } from './watches.js'
 import { boundUrlSource } from './url-source.js'
 import { isOneShotUrlImport } from './fs/url-import.js'
+import { webImportMode } from './fs/web-import.js'
+import { boundWebSources } from './web/catalog.js'
 
 export { Control } from './control.js'
 export { OAuth } from './oauth.js'
 export { BackupOperator } from './archives/backup-operator.js'
+export { InstanceBackupOperator } from './archives/instance-operator.js'
 
 const version = '0.1.0-alpha.1'
 const upstream = '000f0765d7ec183886fbabbc22e69bc289cc429d'
@@ -60,7 +68,7 @@ const availableJobs = new Set(consumers.keys())
 
 async function runResourceJob(payload:Record<string, unknown>,ctx:WorkspaceContext) {
   if (!isRecord(payload.body)) throw new ApiError(409, 'FAILED_PRECONDITION', 'The queued import must be submitted again.')
-  if (isOneShotUrlImport(payload.body)) {
+  if (isOneShotUrlImport(payload.body) || webImportMode(payload.body)) {
     const revision = storedAuthority(payload.dataAuthorityRevision)
     if (!revision) throw dataAuthorityChanged()
     await mountDataAuthority(ctx, revision)
@@ -149,7 +157,7 @@ async function ready(env: Env): Promise<Response> {
     const candidate = principals.find(p => p.caller.role !== 'root')
     if (candidate) {
       const caller = requireDataGrant({ caller: candidate.caller, digest: '', managed: false })
-      filesystem = await workspace(env, caller).probe(caller) ? 'ok' : 'unavailable'
+      filesystem = await workspace(env, caller).probe() ? 'ok' : 'unavailable'
     } else if (await controlFor(env)?.probe()) {
       filesystem = 'ok'
     } else {
@@ -181,6 +189,8 @@ async function capabilities(env: Env, grant: AuthGrant): Promise<Response> {
   const embedding = role === 'root' ? embeddingDefault
     : await workspace(env, caller).embeddingSelection({ ...caller, role }, embeddingDefault)
   const embeddingMounted = !!bindModel(env, embedding)
+  const webSources = (role === 'user' || role === 'admin') && !grant.oidc && !grant.oauth && !grant.gatewayDigest &&
+    control && env.WORKSPACES && embeddingMounted ? boundWebSources(env, caller.accountId) : undefined
   const result={
     runtime: 'cloudflare-workers', upstream_commit: upstream, version, parity: 'partial',
     storage: 'durable-object-sqlite', unsupported_api_status: 501,
@@ -195,6 +205,9 @@ async function capabilities(env: Env, grant: AuthGrant): Promise<Response> {
       watches: caller.role !== 'root' && !!remoteTextSource(env),
       urlImport: (role === 'user' || role === 'admin') && !grant.oidc && !grant.oauth && !grant.gatewayDigest &&
         !!control && !!env.WORKSPACES && embeddingMounted && !!boundUrlSource(env),
+      htmlImport: webSources?.has('html') === true,
+      siteImport: webSources?.has('site') === true,
+      gitDocsImport: webSources?.has('git') === true,
       privacyConfigs: caller.role !== 'root', tasks: caller.role !== 'root', audit: caller.role !== 'root' && env.OPENVIKING_EDGE_AUDIT !== '0',
       monitoring: role !== 'root' && !!env.WORKSPACES,
       mcp: caller.role !== 'root' && ['read','read-write'].includes(env.OPENVIKING_EDGE_MCP ?? ''),
@@ -260,6 +273,9 @@ async function studio(request: Request, url: URL, env: Env): Promise<Response> {
 
 async function route(request: Request, url: URL, env: Env, id: string, execution?: ExecutionContext): Promise<Response> {
   const path = url.pathname
+  // Anonymous liveness is not readiness. No auth, consumer or data mount is
+  // entered while the instance is in maintenance, including the standby prefix.
+  if (!(path === '/health' && isRead(request) && !hasCredentials(request))) await assertInstanceServing(env)
   if (path === '/' && isRead(request)) return new Response(null, { status: 307, headers: { Location: '/studio/' } })
   if (path === '/studio' || path.startsWith('/studio/')) return studio(request, url, env)
   const protocol = await oauthRoute(request, env)
@@ -378,6 +394,7 @@ export class Workspace extends DurableObject<Env> {
       initDocuments(context.sql)
       initGateway(context)
       initGatewayTransfers(context.sql)
+      initGatewayAttachments(context.sql)
       initModelFence(context.sql)
       initDataAuthorityFence(context.sql)
     })
@@ -401,13 +418,15 @@ export class Workspace extends DurableObject<Env> {
   }
 
   /** Private DO RPC used by the authenticated capability route, without any provider I/O. */
-  embeddingSelection(caller: Caller, configured: EmbeddingConfig): EmbeddingConfig {
+  async embeddingSelection(caller: Caller, configured: EmbeddingConfig): Promise<EmbeddingConfig> {
+    await this.assertServing()
     return workspaceEmbedding(this.localContext(caller).sql, caller.accountId, configured)
   }
 
   /** Called only through the private binding after the public Worker resolves the locator. */
-  gatewayOwner(accountId: string, digest: string): KeyAuthority | null {
+  async gatewayOwner(accountId: string, digest: string): Promise<KeyAuthority | null> {
     if (!this.isAccountWorkspace(accountId) || !/^[a-f0-9]{64}$/.test(digest)) return null
+    await this.assertServing()
     const ctx = this.localContext({ accountId, userId: '', agentId: '', role: 'user' })
     const row = keyByDigest(ctx.sql, accountId, digest)
     return row ? keyOwner(row) : null
@@ -418,9 +437,16 @@ export class Workspace extends DurableObject<Env> {
       this.ctx.id.toString() === this.env.WORKSPACES.idFromName(`openviking:account:${accountId}`).toString()
   }
 
+  private assertServing(): Promise<void> { return assertInstanceServing(this.env, this.ctx.storage.sql) }
+
+  instanceBackup(command: unknown, permit: unknown, archive?: unknown, seal?: unknown): Promise<Response> {
+    return workspaceInstanceBackup(this.ctx.storage, this.env, this.ctx.id.toString(), command, permit, archive, seal)
+  }
+
   /** Internal RPC only. Never call from the default HTTP/Data dispatcher. */
   captureBackup(rawPermit: unknown, options: unknown): Promise<Response> {
     return backupResponse(async () => {
+      await this.assertServing()
       const { scope, permit } = await admitPermit(this.env, account => this.isAccountWorkspace(account), rawPermit, 'capture')
       return captureBackup(this.ctx.storage, this.env, scope, permit, options)
     })
@@ -430,6 +456,7 @@ export class Workspace extends DurableObject<Env> {
   restoreBackup(rawPermit: unknown, op: 'evaluate' | 'apply', archive: unknown, seal: unknown,
     options: unknown, approval?: unknown): Promise<Response> {
     return backupResponse(async () => {
+      await this.assertServing()
       if (op !== 'evaluate' && op !== 'apply') throw new ApiError(403, 'PERMISSION_DENIED', 'Invalid backup operation.')
       const { scope, permit } = await admitPermit(this.env, account => this.isAccountWorkspace(account), rawPermit, op)
       return restoreBackup(this.ctx.storage, this.env, this.ctx.id.toString(), scope, permit,
@@ -441,6 +468,7 @@ export class Workspace extends DurableObject<Env> {
    * the fence, and SQLite and all productive boundaries share this actor. */
   async fenceGatewayModel(accountId: string, revision: number): Promise<number> {
     if (!this.isAccountWorkspace(accountId)) throw modelAuthorityUnavailable()
+    await this.assertServing()
     const { sql, storage } = this.localContext({ accountId, userId: '', agentId: '', role: 'user' })
     storage.transactionSync(() => fenceModelRevision(sql, revision))
     invalidateGatewayStreams(storage, accountId, revision)
@@ -450,6 +478,7 @@ export class Workspace extends DurableObject<Env> {
 
   async fenceGatewayCredentials(accountId: string, advance: AuthorityAdvance): Promise<string> {
     if (!this.isAccountWorkspace(accountId)) throw dataAuthorityUnavailable()
+    await this.assertServing()
     const { sql, storage } = this.localContext({ accountId, userId: '', agentId: '', role: 'user' })
     const receipt = storage.transactionSync(() => fenceDataAuthority(sql, advance))
     invalidateGatewayCredentials(storage, accountId, advance)
@@ -457,7 +486,7 @@ export class Workspace extends DurableObject<Env> {
     return receipt
   }
 
-  private async workspaceContext(grant: AuthGrant, taskId?: string, request?: Request): Promise<GatewayContext> {
+  private async workspaceContext(grant: AuthGrant, taskId?: string, request?: Request, sealsArchive = false): Promise<GatewayContext> {
     const authority = requireDataGrant(grant)
     const caller: Caller = grant.oauth ? { ...authority,role:'user' } : authority
     const context = this.localContext(caller)
@@ -469,9 +498,12 @@ export class Workspace extends DurableObject<Env> {
     const fixedCallers = fixed.map(item => requireDataGrant({ caller: item.caller, digest: '', managed: false }))
     let mount: { revision: number; credentialRevision: AuthorityRevision; settings: ModelSettings } | undefined
     const route = request && gatewayPath(new URL(request.url).pathname)
+    const searchRequest = !grant.oauth && !grant.oidc && !gatewayDigest && !taskId && request?.method === 'POST' &&
+      /^\/api\/v1\/search\/(?:find|search)\/?$/.test(new URL(request.url).pathname)
+    const searchSettings = searchRequest ? await control?.modelSettings() : undefined
     const dataMount = !grant.oauth && !grant.oidc && !taskId && (route?.kind === 'model' || (route?.kind === 'admin' &&
       (route.parts.join('/') === 'access' || /^upstreams\/[A-Za-z0-9_-]{1,64}\/test$/.test(route.parts.join('/')))))
-    const modelOwner = owner ?? (dataMount ? { caller, digest: grant.digest, managed: grant.managed } : undefined)
+    const modelOwner = owner ?? (dataMount || searchSettings?.rerank ? { caller, digest: grant.digest, managed: grant.managed } : undefined)
     if (gatewayDigest && (!request || taskId || grant.oauth || grant.oidc || !owner || !control ||
         !isDedicatedGatewayRoute(new URL(request.url).pathname, request.method) ||
         !sameCaller(caller, { ...owner.caller, role: 'user' }) || owner.digest !== grant.digest || owner.managed !== grant.managed)) {
@@ -561,6 +593,7 @@ export class Workspace extends DurableObject<Env> {
       if (grant.managed) context.compileScheduleCredential = grant.digest
     }
     if (control && !grant.oauth && !grant.oidc && !gatewayDigest && this.isAccountWorkspace(caller.accountId)) {
+      context.webSources = boundWebSources(this.env, caller.accountId)
       const dataOwner = { caller, digest: grant.digest, managed: grant.managed }
       context.loadDataAuthority = async expected => {
         try {
@@ -572,7 +605,29 @@ export class Workspace extends DurableObject<Env> {
         }
       }
     }
-    const settings = mount ? mount.settings : await control?.modelSettings() ?? {}
+    let archiveSettings: ModelSettings | undefined
+    if (control && !grant.oauth && !grant.oidc && !gatewayDigest && this.isAccountWorkspace(caller.accountId) && (
+      sealsArchive || request?.method === 'POST' && /^\/api\/v1\/sessions\/[^/]+\/commit\/?$/.test(new URL(request.url).pathname))) {
+      const snapshot = await within(4_000, () => control.gatewayDataGrant({ caller, digest: grant.digest, managed: grant.managed },
+        fixedCallers), modelAuthorityUnavailable)
+      if (snapshot.status === 'expired' || snapshot.status === 'authority_changed') throw credentialChanged()
+      if (snapshot.status !== 'ok') throw new ApiError(409, 'CONFLICT', 'The archive policy changed; submit a new commit.')
+      const { revision, credentialRevision } = snapshot
+      const check = () => {
+        assertCredentialRevision(context.sql, caller.userId, credentialRevision)
+        try { assertModelRevision(context.sql, revision) }
+        catch (error) {
+          if (error instanceof GatewayError && error.code === 'gateway_configuration_changed') {
+            throw new ApiError(409, 'CONFLICT', 'The archive policy changed; submit a new commit.')
+          }
+          throw error
+        }
+      }
+      check()
+      context.assertArchiveSettingsCurrent = check
+      archiveSettings = snapshot.settings
+    }
+    const settings = mount?.settings ?? archiveSettings ?? searchSettings ?? await control?.modelSettings() ?? {}
     const embedding = workspaceEmbedding(context.sql, caller.accountId, settings.embedding?.dense ?? legacyEmbedding)
     const configuredEmbeddingBinding = bindModel(this.env, embedding)
     const embeddingBinding = ownedKey && configuredEmbeddingBinding?.kind !== 'workers_ai' ? undefined : configuredEmbeddingBinding
@@ -581,12 +636,18 @@ export class Workspace extends DurableObject<Env> {
     context.defaultSearchLimit = settings.default_search_limit
     context.defaultSearchScore = settings.default_search_score_threshold
     context.useSearchSessionContext = settings.retrieval?.enable_intent
+    context.retrievalSettings = settings.retrieval
+    context.memorySettings = settings.memory
+    if (searchRequest && mount && settings.rerank) context.searchReranker = searchReranker(context, this.env, settings.rerank)
     context.embed = async texts => {
       if (embeddingBinding?.kind === 'openai') await context.reauthorize?.()
       context.assertActive?.()
       let usage: number | undefined
       const vectors = await embed(embeddingBinding, embedding, texts,
-        count => reserveEmbeddingBudget(context.storage, caller.userId, count), count => { usage = count })
+        count => reserveEmbeddingBudget(context.storage, caller.userId, count), count => { usage = count }, async () => {
+          await context.reauthorize?.()
+          context.assertActive?.()
+        })
       await context.reauthorize?.()
       context.assertActive?.()
       pinEmbedding(context.sql, embedding)
@@ -639,12 +700,18 @@ export class Workspace extends DurableObject<Env> {
         const generate = context.generate
         const stream = this.env.OPENVIKING_EDGE_OPERATOR_STREAMING === '1' && control && context.assertGatewayMount
           ? streamGeneration(context, binding, vlm) : undefined
+        const rich = !ownedKey && control && context.assertGatewayMount && route?.kind === 'model'
+          ? richOperator(context, binding, vlm, this.env.OPENVIKING_EDGE_GATEWAY_CAPABILITIES, !!stream) : undefined
+        if (rich && context.loadDataAuthority && gatewayTransfersConfigured(this.env)) {
+          context.readPrivateGatewayAttachment = id => readPrivateGatewayAttachment(this.env, context, id)
+        }
         const check = (model: string) => { if (model !== vlm.model) throw modelChanged() }
         context.gatewayProvider = {
           models: [vlm.model],
           responseScope: route?.kind === 'model' && (route.endpoint === 'responses' || route.endpoint.startsWith('responses/'))
             ? await digest(binding.base) : undefined,
           async generate(model, messages, options) { check(model); return generate(messages, options) },
+          ...(rich && { rich }),
           ...(stream && {
             async generateStream(model, messages, options) { check(model); return stream(messages, options) },
             streamTextFilter: () => protectStreamText(binding.key),
@@ -658,12 +725,15 @@ export class Workspace extends DurableObject<Env> {
     return context
   }
 
-  probe(caller: Caller): boolean {
-    const { sql } = this.localContext(caller)
+  async probe(): Promise<boolean> {
+    await this.assertServing()
+    // Liveness of SQLite is not permission to initialize a cold restore target.
+    const { sql } = this.ctx.storage
     return sql.exec<{ available: number }>('SELECT 1 AS available').one().available === 1
   }
 
-  cancelGateway(id:string,actor:Pick<Caller,'accountId'|'userId'|'agentId'>):void {
+  async cancelGateway(id:string,actor:Pick<Caller,'accountId'|'userId'|'agentId'>):Promise<void> {
+    await this.assertServing()
     if(/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/u.test(id))cancelGatewayStream(this.ctx.storage,id,actor)
   }
 
@@ -674,6 +744,7 @@ export class Workspace extends DurableObject<Env> {
     let response: Response
     let code: string | undefined
     try {
+      await this.assertServing()
       const route = gatewayPath(url.pathname)
       if (route?.kind === 'transfer' && (grant.gatewayDigest || grant.oauth || grant.oidc)) {
         throw new ApiError(403, 'PERMISSION_DENIED', 'Transfers require a direct tenant API key.')
@@ -708,7 +779,7 @@ export class Workspace extends DurableObject<Env> {
     if(isGatewayPath(url.pathname))context.gatewayRequestId=id
     if (url.pathname === '/metrics') return routeMetrics(request,context)
     if (isRead(request) && url.pathname === '/api/v1/system/status') return ok({ initialized: true, user: caller.userId })
-    if (isRead(request) && url.pathname === '/api/v1/debug/health') return ok({ healthy: this.probe(caller), account_id: caller.accountId })
+    if (isRead(request) && url.pathname === '/api/v1/debug/health') return ok({ healthy: await this.probe(), account_id: caller.accountId })
     if (request.method === 'POST' && url.pathname === '/api/v1/system/wait') return waitForTasks(request,context)
     const response = await routeTasks(request,url,context) ?? await routeWatches(request,url,context) ?? routeObservability(request,url,context)
       ?? await routeStorageInspection(request,url,context) ?? await routePolicies(request,url,context) ?? routeEvolution(request,url,context)
@@ -720,9 +791,18 @@ export class Workspace extends DurableObject<Env> {
 
   async alarm(): Promise<void> {
     const storage = this.ctx.storage
+    try { await this.assertServing() }
+    catch (error) {
+      if (!(error instanceof ApiError && error.code === 'INSTANCE_MAINTENANCE')) throw error
+      // Defer a pre-existing source alarm; never run a consumer in maintenance.
+      if (instanceMode(this.env)?.mode === 'source') await storage.setAlarm(Date.now() + 60_000)
+      else await maintainStandbyAttachments(storage)
+      return
+    }
     initTasks(storage.sql)
     initWatches(storage.sql)
     try {
+      await sweepGatewayAttachments(storage)
       const watch = storage.transactionSync(() => claimWatch(storage.sql))
       if (watch) {
         // Re-arm the recurring clock before provider I/O, since alarms are not a reliable place to retry writes blindly.
@@ -759,7 +839,8 @@ export class Workspace extends DurableObject<Env> {
       const consumer = consumers.get(job.kind)
       if (!consumer) { completeJob(storage,job.taskId,null,'failed'); return }
       try {
-        const context = await this.workspaceContext(grant, job.taskId)
+        const sealsArchive = job.kind === 'session_commit' && (job.payload.op === 'commit' || job.payload.op === 'auto')
+        const context = await this.workspaceContext(grant, job.taskId, undefined, sealsArchive)
         context.assertActive?.()
         const result = await consumer({...job.payload,taskId:job.taskId,createdAt:job.createdAt},context)
         // One-shot URL imports finalize content, reservation and the success

@@ -9,6 +9,7 @@ export { generationModel } from './model-config.js'
 const encoder = new TextEncoder()
 const bad = () => new ApiError(400, 'INVALID_ARGUMENT', 'Generation input is invalid or too large.')
 const unavailable = () => new ApiError(503, 'GENERATION_UNAVAILABLE', 'The configured generation provider is unavailable.')
+const activeGenerations = new WeakMap<DurableObjectStorage, { calls: number }>()
 
 export function initGeneration(sql: SqlStorage): void {
   sql.exec(`CREATE TABLE IF NOT EXISTS ov_generation_budget (
@@ -16,7 +17,7 @@ export function initGeneration(sql: SqlStorage): void {
   )`)
 }
 
-function reserve(ctx: WorkspaceContext, units: number): void {
+export function reserveModelBudget(ctx: WorkspaceContext, units: number): void {
   const day = Math.floor(Date.now() / 86_400_000)
   ctx.storage.transactionSync(() => {
     // Explicit per-user subquota; rotating an API key doesn't reset it.
@@ -44,12 +45,24 @@ async function authorizeInput(ctx: WorkspaceContext, messages: ModelMessage[], m
     await ctx.reauthorize?.()
     signal?.throwIfAborted()
     ctx.assertActive?.()
-    // Account in input bytes plus a conservative output allowance, not fake provider tokens.
-    reserve(ctx, bytes + max * 4)
-    return input
+    return { input, units: bytes + max * 4 }
 }
 
-function outputLimit(requested: number | undefined, config: VlmConfig): number {
+/** Called after authority checks, in the same synchronous turn as provider admission. */
+export function admitGeneration(ctx: WorkspaceContext, config: VlmConfig, units: number): () => void {
+  const active = activeGenerations.get(ctx.storage) ?? { calls: 0 }
+  if (config.max_concurrent !== undefined && active.calls >= config.max_concurrent) {
+    throw new ApiError(429, 'RATE_LIMITED', 'The workspace generation concurrency limit is reached.')
+  }
+  // Quotas account in bytes plus a conservative output allowance, not fake provider tokens.
+  reserveModelBudget(ctx, units)
+  active.calls++
+  activeGenerations.set(ctx.storage, active)
+  let released = false
+  return () => { if (!released) { released = true; active.calls-- } }
+}
+
+export function outputLimit(requested: number | undefined, config: VlmConfig): number {
   const max = requested ?? 512
   if (!Number.isSafeInteger(max) || max < 1 || max > maxGenerationTokens) throw bad()
   return Math.min(max, config.max_tokens ?? max)
@@ -58,12 +71,14 @@ function outputLimit(requested: number | undefined, config: VlmConfig): number {
 export function generation(ctx: WorkspaceContext, binding: BoundModel, config: VlmConfig): Generation {
   return async (messages, options = {}) => {
     const max = outputLimit(options.maxTokens, config)
-    const input = await authorizeInput(ctx,messages,max)
+    const { input, units } = await authorizeInput(ctx, messages, max)
     // The async authorizeInput return is itself a yield. This check and the
     // binding call must stay in the same Workspace turn.
     ctx.assertActive?.()
+    const release = admitGeneration(ctx, config, units)
     let output: unknown
     try { output = await modelChat(binding, config, input, max) } catch { throw unavailable() }
+    finally { release() }
     if (!isRecord(output) || typeof output.response !== 'string' || !output.response.trim() || encoder.encode(output.response).byteLength > 65_536) throw unavailable()
     const usage = isRecord(output.usage) ? output.usage : {}
     const metric = (x: unknown) => typeof x === 'number' && Number.isSafeInteger(x) && x >= 0 && x <= 1_000_000 ? x : null
@@ -76,29 +91,39 @@ export function streamGeneration(ctx: WorkspaceContext, binding: BoundModel, con
   return async (messages, options = {}) => {
     const max = outputLimit(options.maxTokens, config)
     options.signal?.throwIfAborted()
-    const input = await authorizeInput(ctx, messages, max, options.signal)
+    const { input, units } = await authorizeInput(ctx, messages, max, options.signal)
     ctx.assertActive?.()
     options.signal?.throwIfAborted()
+    const external = binding.kind === 'openai'
+    const release = admitGeneration(ctx, config, units)
+    return openGenerationStream(ctx, external, external ? Math.ceil((config.timeout ?? 20) * 1000) : 45_000,
+      options.signal, signal => modelChatStream(binding, config, input, max, signal), release)
+  }
+}
+
+export async function openGenerationStream(ctx: WorkspaceContext, external: boolean, timeout: number, parent: AbortSignal | undefined,
+  open: (signal: AbortSignal) => Promise<unknown>, release: () => void): Promise<ReadableStream<Uint8Array>> {
+    if (parent?.aborted) { release(); throw parent.reason }
     const lifecycle = new AbortController(), { signal } = lifecycle
-    const timeout = binding.kind === 'openai' ? Math.ceil((config.timeout ?? 20) * 1000) : 45_000
     const started = Date.now()
-    const forwardAbort = () => lifecycle.abort(options.signal?.reason)
+    const forwardAbort = () => lifecycle.abort(parent?.reason)
     const timer = setTimeout(() => lifecycle.abort(new ApiError(504, 'DEADLINE_EXCEEDED', 'Generation stream expired.')), timeout)
-    options.signal?.addEventListener('abort', forwardAbort, { once: true })
-    const cleanup = () => { clearTimeout(timer); options.signal?.removeEventListener('abort', forwardAbort) }
+    parent?.addEventListener('abort', forwardAbort, { once: true })
+    const cleanup = () => { clearTimeout(timer); parent?.removeEventListener('abort', forwardAbort); release() }
     let reader: ReadableStreamDefaultReader<unknown>
     try {
-      const provider = await modelChatStream(binding, config, input, max, signal)
+      const provider = await open(signal)
       if (!(provider instanceof ReadableStream) || provider.locked) throw unavailable()
       if (signal.aborted) {
         void provider.cancel().catch(() => {})
         throw signal.reason
       }
       reader = provider.getReader()
-    } catch {
+    } catch (error) {
       cleanup()
       if (signal.aborted) throw signal.reason
-      if (binding.kind === 'openai') throw new ApiError(502, 'UPSTREAM_ERROR', 'The configured streaming provider did not open an SSE response.')
+      if (error instanceof ApiError) throw error
+      if (external) throw new ApiError(502, 'UPSTREAM_ERROR', 'The configured streaming provider did not open an SSE response.')
       throw unavailable()
     }
     let lastCheck = started, bytes = 0, terminated = false
@@ -112,7 +137,7 @@ export function streamGeneration(ctx: WorkspaceContext, binding: BoundModel, con
       cleanup()
       signal.removeEventListener('abort', aborted)
       // Abort the HTTP request and release pending reads without holding the slot.
-      if (binding.kind === 'openai') lifecycle.abort()
+      if (external) lifecycle.abort()
       void reader.cancel().catch(() => {}).finally(() => { try { reader.releaseLock() } catch { /* Already closed. */ } })
     }
     return new ReadableStream<Uint8Array>({
@@ -137,5 +162,4 @@ export function streamGeneration(ctx: WorkspaceContext, binding: BoundModel, con
       },
       cancel() { close() },
     }, { highWaterMark: 0 })
-  }
 }

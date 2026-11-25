@@ -108,6 +108,34 @@ function argumentsFor(command, args) {
   return { opts, issuesKey, mutation: issuesKey || Boolean(opts.apply), method: post ? 'POST' : 'GET', url: new URL(path, originOf(opts.url)), payload }
 }
 
+const providerNames = ['workers_ai', 'openai', 'openai-compatible', 'ollama']
+const reasoningEfforts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
+const formats = ['float', 'base64']
+const modelPattern = /^[A-Za-z0-9_@][A-Za-z0-9_.:@/-]{0,127}$/u
+const basePattern = /^https:\/\/[a-z0-9.-]+(?:\/[A-Za-z0-9_-]+)*\/?$/u
+const bool = value => typeof value === 'boolean'
+const finite = Number.isFinite
+const integer = Number.isSafeInteger
+const nullable = check => value => value === null || check(value)
+const inList = values => value => values.includes(value)
+const inputOptions = (value, fields) => record(value) &&
+  Object.keys(value).every(key => Object.hasOwn(fields, key) && fields[key](value[key]))
+const vlmOptions = { temperature: nullable(finite), max_tokens: nullable(integer), timeout: finite,
+  reasoning_effort: nullable(inList(reasoningEfforts)), top_p: nullable(finite), max_concurrent: integer }
+const embeddingOptions = { dimension: integer, input: value => value === 'text', batch_size: integer, encoding_format: inList(formats) }
+const retrievalOptions = { enable_intent: bool, session_context_messages: integer, session_context_chars: integer }
+const rankOptions = { timeout: finite, threshold: finite, max_input_tokens: integer }
+const autoOptions = { enabled: bool, message_count_threshold: integer, pending_token_threshold: integer }
+const memoryOptions = { extraction_enabled: bool, edge_context_token_budget: integer, edge_extraction_max_tokens: integer }
+
+function profile(value, options, rerank = false) {
+  return inputOptions(value, { provider: inList(rerank ? ['openai'] : providerNames),
+    ...(!rerank && { backend: inList(providerNames) }),
+    model: name => typeof name === 'string' && modelPattern.test(name),
+    api_base: url => typeof url === 'string' && basePattern.test(url), ...options }) &&
+    typeof value.model === 'string' && (rerank ? value.provider === 'openai' && typeof value.api_base === 'string' : !!(value.provider ?? value.backend))
+}
+
 async function readConfiguration(path) {
   let file
   try {
@@ -124,17 +152,14 @@ async function readConfiguration(path) {
     if (size > configFileLimit) throw usage('Configuration file exceeds 16 KiB.')
     const data = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, size)))
     // Send only the Edge projection, never an unfiltered upstream startup file.
-    const keys = (value, allowed) => record(value) && Object.keys(value).every(key => allowed.includes(key))
-    const profile = (value, numbers, other = []) => keys(value, ['provider', 'model', 'api_base', ...numbers, ...other]) &&
-      ['workers_ai', 'openai', 'openai-compatible', 'ollama'].includes(value.provider) &&
-      typeof value.model === 'string' && /^[A-Za-z0-9_@][A-Za-z0-9_.:@/-]{0,127}$/u.test(value.model) &&
-      (value.api_base === undefined || (typeof value.api_base === 'string' && /^https:\/\/[a-z0-9.-]+(?:\/[A-Za-z0-9_-]+)*\/?$/u.test(value.api_base))) &&
-      numbers.every(key => value[key] === undefined || Number.isFinite(value[key]))
-    if (!keys(data, ['vlm', 'embedding', 'default_search_limit']) || !Object.keys(data).length ||
-        (data.vlm != null && !profile(data.vlm, ['temperature', 'max_tokens', 'timeout'])) ||
-        (data.embedding != null && (!keys(data.embedding, ['dense']) || !profile(data.embedding.dense, ['dimension'], ['input']) ||
-          (data.embedding.dense.input !== undefined && data.embedding.dense.input !== 'text'))) ||
-        (data.default_search_limit != null && !Number.isFinite(data.default_search_limit))) {
+    if (!inputOptions(data, {
+      vlm: nullable(value => profile(value, vlmOptions)),
+      embedding: nullable(value => inputOptions(value, { dense: dense => profile(dense, embeddingOptions) }) && Object.hasOwn(value, 'dense')),
+      default_search_limit: nullable(integer), default_search_score_threshold: nullable(finite),
+      retrieval: nullable(value => inputOptions(value, retrievalOptions)),
+      rerank: nullable(value => profile(value, rankOptions, true)),
+      memory: nullable(value => inputOptions(value, { ...memoryOptions, session_auto_commit: policy => inputOptions(policy, autoOptions) })),
+    }) || !Object.keys(data).length) {
       throw usage('Use only supported Edge fields; do not include provider keys or a full startup file.')
     }
     return data
@@ -277,16 +302,30 @@ function configReceipt(data, credential, operation) {
   if (!record(data) || !Number.isSafeInteger(data.revision) || data.revision < 0 ||
       data.dry_run !== Boolean(operation.opts['dry-run']) || !record(data.effective) ||
       !Number.isSafeInteger(data.effective.default_search_limit)) throw invalid()
-  const model = (value, optionalNumbers) => {
-    if (!record(value) || typeof value.model !== 'string' || !/^[A-Za-z0-9_@][A-Za-z0-9_.:@/-]{0,127}$/u.test(value.model) ||
-        !['workers_ai', 'openai'].includes(value.provider) || typeof value.configured !== 'boolean') throw invalid()
-    return { provider: value.provider, model: value.model, configured: value.configured,
-      ...Object.fromEntries(optionalNumbers.filter(key => Number.isFinite(value[key])).map(key => [key, value[key]])) }
+  const project = (value, fields) => {
+    if (!record(value)) throw invalid()
+    return Object.fromEntries(Object.entries(fields).flatMap(([key, check]) => {
+      if (!Object.hasOwn(value, key)) return []
+      if (!check(value[key])) throw invalid()
+      return [[key, value[key]]]
+    }))
   }
+  const model = (value, options) => {
+    if (!record(value) || typeof value.model !== 'string' || !modelPattern.test(value.model) ||
+        !['workers_ai', 'openai'].includes(value.provider) || typeof value.configured !== 'boolean') throw invalid()
+    return { provider: value.provider, model: value.model, configured: value.configured, ...project(value, options) }
+  }
+  const { vlm, embedding, rerank, retrieval, memory, default_search_score_threshold } = data.effective
   const view = JSON.stringify({ revision: data.revision, dry_run: data.dry_run,
-    vlm: data.effective.vlm === null ? null : model(data.effective.vlm, ['temperature', 'max_tokens', 'timeout']),
-    default_embedding: model(data.effective.embedding, ['dimension']),
-    default_search_limit: data.effective.default_search_limit }, null, 2)
+    vlm: vlm === null ? null : model(vlm, vlmOptions), default_embedding: model(embedding, embeddingOptions),
+    default_search_limit: data.effective.default_search_limit,
+    ...project({ ...(default_search_score_threshold !== undefined && { default_search_score_threshold }) }, { default_search_score_threshold: finite }),
+    ...(rerank !== undefined && { rerank: rerank === null ? null : model(rerank, rankOptions) }),
+    ...(retrieval !== undefined && { retrieval: project(retrieval, { use_session_context: bool, intent_planner: bool,
+      session_context_messages: integer, session_context_chars: integer }) }),
+    ...(memory !== undefined && { memory: { ...project(memory, { ...memoryOptions, edge_context_token_budget: nullable(integer) }),
+      session_auto_commit: project(memory.session_auto_commit, autoOptions) } }),
+  }, null, 2)
   if (view.includes(credential)) throw invalid()
   return view
 }

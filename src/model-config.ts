@@ -1,20 +1,33 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { ApiError, isRecord } from './http.js'
+import { isProviderCredential } from './provider-credential.js'
 
 export const generationModel = '@cf/meta/llama-3.1-8b-instruct'
 export const embeddingModel = '@cf/baai/bge-base-en-v1.5'
 export const embeddingDimensions = 768
 export const configFileLimit = 16 * 1024
 export const maxGenerationTokens = 2048
+export const embeddingBatchLimit = 32
 export const edgeSearchDefaults = { limit: 10, score: 0.1, sessionContext: true } as const
+export const searchSessionLimits = { messages: 4, chars: 1024, perMessageChars: 256 } as const
+export const edgeSessionDefaults = { contextTokens: 128_000, extractionTokens: 1536, messageThreshold: 100, pendingTokenThreshold: 150_000 } as const
 const reasoningEfforts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'] as const
 type ReasoningEffort = typeof reasoningEfforts[number]
 
 type Selection = { provider: 'workers_ai'; model: string } | { provider: 'openai'; model: string; api_base: string }
-export type VlmConfig = Selection & { temperature?: number; max_tokens?: number; timeout?: number; reasoning_effort?: ReasoningEffort }
-export type EmbeddingConfig = Selection & { dimension: number; input: 'text' }
+export type VlmConfig = Selection & { temperature?: number; max_tokens?: number; timeout?: number; reasoning_effort?: ReasoningEffort;
+  top_p?: number; max_concurrent?: number }
+export type EmbeddingConfig = Selection & { dimension: number; input: 'text'; batch_size?: number; encoding_format?: 'float' | 'base64' }
+export type RerankConfig = { provider: 'openai'; model: string; api_base: string; timeout: number; threshold: number; max_input_tokens: number }
+export type RetrievalSettings = { enable_intent?: false; session_context_messages?: number; session_context_chars?: number }
+export type MemorySettings = {
+  extraction_enabled?: boolean
+  edge_context_token_budget?: number
+  edge_extraction_max_tokens?: number
+  session_auto_commit?: { enabled: boolean; message_count_threshold?: number; pending_token_threshold?: number }
+}
 export type ModelSettings = { vlm?: VlmConfig; embedding?: { dense: EmbeddingConfig }; default_search_limit?: number;
-  default_search_score_threshold?: number; retrieval?: { enable_intent: false } }
+  default_search_score_threshold?: number; retrieval?: RetrievalSettings; rerank?: RerankConfig; memory?: MemorySettings }
 export type ModelEnv = { AI?: Ai; OPENVIKING_EDGE_GENERATION?: string; OPENVIKING_EDGE_PROVIDERS?: string }
 export type BoundModel = { kind: 'workers_ai'; ai: Ai } | { kind: 'openai'; base: string; key: string }
 
@@ -50,7 +63,7 @@ function providerKey(env: ModelEnv, base: string): string | undefined {
     for (const entry of entries) {
       if (!isRecord(entry) || Object.keys(entry).length !== 2) return
       const admitted = baseURL(entry.api_base)
-      if (!admitted || keys.has(admitted) || typeof entry.api_key !== 'string' || !/^[A-Za-z0-9._~+/=-]{16,2048}$/.test(entry.api_key)) return
+      if (!admitted || keys.has(admitted) || !isProviderCredential(entry.api_key)) return
       keys.set(admitted, entry.api_key)
     }
     return keys.get(base)
@@ -63,14 +76,23 @@ export function bindModel(env: ModelEnv, model: Selection): BoundModel | undefin
   return key ? { kind: 'openai', base: model.api_base, key } : undefined
 }
 
+export function bindReranker(env: ModelEnv, config: RerankConfig): { endpoint: string; key: string } | undefined {
+  const key = providerKey(env, config.api_base)
+  return key ? { endpoint: config.api_base, key } : undefined
+}
+
 export function selectedVlm(env: ModelEnv, settings: ModelSettings): VlmConfig | undefined {
   return settings.vlm ?? (env.OPENVIKING_EDGE_GENERATION === '1' ? legacyVlm : undefined)
 }
 
-function selection(value: Record<string, unknown>, env: ModelEnv): Selection {
-  const { provider, model, api_base } = value
+function modelName(model: unknown): string {
   if (typeof model !== 'string' || !/^[A-Za-z0-9_@][A-Za-z0-9_.:@/-]{0,127}$/.test(model) ||
       model.includes('//') || model.split('/').some(part => part === '.' || part === '..')) throw bad('A valid model name is required.')
+  return model
+}
+
+function selection(value: Record<string, unknown>, env: ModelEnv): Selection {
+  const { provider, api_base } = value, model = modelName(value.model)
   let selected: Selection
   if (provider === 'workers_ai') {
     if (!/^@cf\/[a-z0-9-]+\/[A-Za-z0-9._-]+$/.test(model) || api_base !== undefined) throw bad('Workers AI requires an @cf model and no api_base.')
@@ -84,6 +106,11 @@ function selection(value: Record<string, unknown>, env: ModelEnv): Selection {
   return selected
 }
 
+function selectProfile(value: Record<string, unknown>, env: ModelEnv, name: string): Selection {
+  if (value.backend !== undefined && value.provider !== undefined && value.backend !== value.provider) throw bad(`${name}.backend and ${name}.provider must match.`)
+  return selection({ ...value, provider: value.provider ?? value.backend }, env)
+}
+
 function bounded(value: unknown, min: number, max: number, name: string, integer: boolean): number {
   if (typeof value !== 'number' || !Number.isFinite(value) || value < min || value > max || integer && !Number.isSafeInteger(value)) {
     throw bad(`${name} must be ${integer ? 'an integer' : 'a number'} between ${min} and ${max}.`)
@@ -91,15 +118,46 @@ function bounded(value: unknown, min: number, max: number, name: string, integer
   return value
 }
 
+function memorySettings(raw: unknown): MemorySettings {
+  const value = object(raw, ['extraction_enabled', 'edge_context_token_budget', 'edge_extraction_max_tokens', 'session_auto_commit'], 'memory')
+  if (!Object.keys(value).length) throw bad('Use memory:null to reset memory settings.')
+  const result: MemorySettings = {}
+  if (value.extraction_enabled !== undefined) {
+    if (typeof value.extraction_enabled !== 'boolean') throw bad('memory.extraction_enabled must be a boolean.')
+    result.extraction_enabled = value.extraction_enabled
+  }
+  if (value.edge_context_token_budget !== undefined) result.edge_context_token_budget =
+    bounded(value.edge_context_token_budget, 0, edgeSessionDefaults.contextTokens, 'memory.edge_context_token_budget', true)
+  if (value.edge_extraction_max_tokens !== undefined) result.edge_extraction_max_tokens =
+    bounded(value.edge_extraction_max_tokens, 1, edgeSessionDefaults.extractionTokens, 'memory.edge_extraction_max_tokens', true)
+  if (value.session_auto_commit !== undefined) {
+    const section = 'memory.session_auto_commit'
+    const auto = object(value.session_auto_commit, ['enabled', 'message_count_threshold', 'pending_token_threshold'], section)
+    if (typeof auto.enabled !== 'boolean') throw bad(`${section}.enabled must be a boolean.`)
+    const policy: NonNullable<MemorySettings['session_auto_commit']> = { enabled: auto.enabled }
+    if (auto.message_count_threshold !== undefined) policy.message_count_threshold =
+      bounded(auto.message_count_threshold, 0, edgeSessionDefaults.messageThreshold, `${section}.message_count_threshold`, true)
+    if (auto.pending_token_threshold !== undefined) policy.pending_token_threshold =
+      bounded(auto.pending_token_threshold, 0, edgeSessionDefaults.pendingTokenThreshold, `${section}.pending_token_threshold`, true)
+    if ((!auto.enabled && Object.keys(policy).length > 1) || (policy.message_count_threshold === 0 && policy.pending_token_threshold === 0)) {
+      throw bad(`${section}: thresholds require an enabled policy with at least one active trigger.`)
+    }
+    result.session_auto_commit = policy
+  }
+  if (result.extraction_enabled === false && result.edge_extraction_max_tokens !== undefined) {
+    throw bad('An extraction token budget requires extraction to be enabled.')
+  }
+  return result
+}
+
 export function patchModels(current: ModelSettings, body: Record<string, unknown>, env: ModelEnv): ModelSettings {
-  object(body, ['vlm', 'embedding', 'default_search_limit', 'default_search_score_threshold', 'retrieval'], 'the configuration file')
+  object(body, ['vlm', 'embedding', 'default_search_limit', 'default_search_score_threshold', 'retrieval', 'rerank', 'memory'], 'the configuration file')
   if (!Object.keys(body).length) throw bad('The configuration file is empty.')
   const result = { ...current }
   if (body.vlm === null) delete result.vlm
   else if (body.vlm !== undefined) {
-    const value = object(body.vlm, ['provider', 'backend', 'model', 'api_base', 'temperature', 'max_tokens', 'timeout', 'reasoning_effort'], 'vlm')
-    if (value.backend !== undefined && value.provider !== undefined && value.backend !== value.provider) throw bad('vlm.backend and vlm.provider must match.')
-    const model: VlmConfig = selection({ ...value, provider: value.provider ?? value.backend }, env)
+    const value = object(body.vlm, ['provider', 'backend', 'model', 'api_base', 'temperature', 'max_tokens', 'timeout', 'reasoning_effort', 'top_p', 'max_concurrent'], 'vlm')
+    const model: VlmConfig = selectProfile(value, env, 'vlm')
     if (value.temperature != null) model.temperature = bounded(value.temperature, 0, 2, 'vlm.temperature', false)
     if (value.max_tokens != null) model.max_tokens = bounded(value.max_tokens, 1, maxGenerationTokens, 'vlm.max_tokens', true)
     if (value.timeout !== undefined) {
@@ -111,20 +169,34 @@ export function patchModels(current: ModelSettings, body: Record<string, unknown
       if (!reasoningEfforts.includes(value.reasoning_effort as ReasoningEffort)) throw bad('Unsupported vlm.reasoning_effort value.')
       model.reasoning_effort = value.reasoning_effort as ReasoningEffort
     }
+    if (value.top_p != null) {
+      if (model.provider !== 'openai') throw unsupported('vlm.top_p requires a compatible HTTP chat model.')
+      model.top_p = bounded(value.top_p, 0, 1, 'vlm.top_p', false)
+    }
+    if (value.max_concurrent !== undefined) model.max_concurrent = bounded(value.max_concurrent, 1, 8, 'vlm.max_concurrent', true)
     result.vlm = model
   }
   if (body.embedding === null) delete result.embedding
   else if (body.embedding !== undefined) {
     const { dense } = object(body.embedding, ['dense'], 'embedding')
-    const value = object(dense, ['provider', 'model', 'api_base', 'dimension', 'input'], 'embedding.dense')
+    const value = object(dense, ['provider', 'backend', 'model', 'api_base', 'dimension', 'input', 'batch_size', 'encoding_format'], 'embedding.dense')
     if (value.input !== undefined && value.input !== 'text') throw unsupported('Only text embeddings are available on Edge.')
-    const model = selection(value, env)
+    const model = selectProfile(value, env, 'embedding.dense')
     const dimension = bounded(value.dimension, 1, 2048, 'embedding.dense.dimension', true)
     if (model.provider === 'workers_ai' && model.model === embeddingModel && dimension !== embeddingDimensions) throw bad('The default BGE model emits 768 coordinates.')
     if (model.provider === 'openai' && model.api_base === openAIBase && model.model === 'text-embedding-ada-002' && dimension !== 1536) {
       throw bad('This OpenAI embedding model emits 1536 coordinates.')
     }
-    result.embedding = { dense: { ...model, dimension, input: 'text' } }
+    const selected: EmbeddingConfig = { ...model, dimension, input: 'text' }
+    if (value.batch_size !== undefined || value.encoding_format !== undefined) {
+      if (model.provider !== 'openai') throw unsupported('Embedding batch_size and encoding_format require compatible HTTP embeddings.')
+      if (value.batch_size !== undefined) selected.batch_size = bounded(value.batch_size, 1, embeddingBatchLimit, 'embedding.dense.batch_size', true)
+      if (value.encoding_format !== undefined) {
+        if (value.encoding_format !== 'float' && value.encoding_format !== 'base64') throw bad('embedding.dense.encoding_format must be float or base64.')
+        selected.encoding_format = value.encoding_format
+      }
+    }
+    result.embedding = { dense: selected }
   }
   if (body.default_search_limit === null) delete result.default_search_limit
   else if (body.default_search_limit !== undefined) result.default_search_limit = bounded(body.default_search_limit, 1, 50, 'default_search_limit', true)
@@ -134,10 +206,37 @@ export function patchModels(current: ModelSettings, body: Record<string, unknown
   }
   if (body.retrieval === null) delete result.retrieval
   else if (body.retrieval !== undefined) {
-    const value = object(body.retrieval, ['enable_intent'], 'retrieval')
-    if (typeof value.enable_intent !== 'boolean') throw bad('retrieval.enable_intent must be a boolean.')
+    const value = object(body.retrieval, ['enable_intent', 'session_context_messages', 'session_context_chars'], 'retrieval')
+    if (!Object.keys(value).length) throw bad('Use retrieval:null to reset retrieval settings.')
+    if (value.enable_intent !== undefined && typeof value.enable_intent !== 'boolean') throw bad('retrieval.enable_intent must be a boolean.')
     if (value.enable_intent) throw unsupported('Edge does not run the upstream LLM intent planner. Use false or reset retrieval to null for local session context.')
-    result.retrieval = { enable_intent: false }
+    const retrieval: RetrievalSettings = {}
+    if (value.enable_intent === false) retrieval.enable_intent = false
+    if (value.session_context_messages !== undefined) retrieval.session_context_messages =
+      bounded(value.session_context_messages, 1, searchSessionLimits.messages, 'retrieval.session_context_messages', true)
+    if (value.session_context_chars !== undefined) retrieval.session_context_chars =
+      bounded(value.session_context_chars, 64, searchSessionLimits.chars, 'retrieval.session_context_chars', true)
+    if (retrieval.enable_intent === false && Object.keys(retrieval).length > 1) {
+      throw bad('Session context budgets require local session context, not raw-query mode.')
+    }
+    result.retrieval = retrieval
+  }
+  if (body.memory === null) delete result.memory
+  else if (body.memory !== undefined) result.memory = memorySettings(body.memory)
+  if (body.rerank === null) delete result.rerank
+  else if (body.rerank !== undefined) {
+    const value = object(body.rerank, ['provider', 'model', 'api_base', 'timeout', 'threshold', 'max_input_tokens'], 'rerank')
+    if (value.provider !== 'openai') throw unsupported('Reranking requires the compatible HTTP rank protocol.')
+    const api_base = baseURL(value.api_base)
+    if (!api_base || new URL(api_base).pathname === '/') throw bad('rerank.api_base must be the full approved HTTPS endpoint.')
+    const config: RerankConfig = { provider: 'openai', model: modelName(value.model), api_base,
+      timeout: value.timeout === undefined ? 3 : bounded(value.timeout, 0.1, 10, 'rerank.timeout', false),
+      threshold: value.threshold === undefined ? 0.1 : bounded(value.threshold, 0, 1, 'rerank.threshold', false),
+      max_input_tokens: value.max_input_tokens === undefined || value.max_input_tokens === 0 ? 0 :
+        bounded(value.max_input_tokens, 128, 1024, 'rerank.max_input_tokens', true),
+    }
+    if (!bindReranker(env, config)) throw new ApiError(412, 'PROVIDER_NOT_CONFIGURED', 'Register the exact rerank endpoint in the Workers provider secret.')
+    result.rerank = config
   }
   return result
 }

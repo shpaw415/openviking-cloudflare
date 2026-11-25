@@ -6,7 +6,7 @@ import { encoder, fail, forbidden, invalid, quota } from './common.js'
 import { ownerId, strictJson, topology } from './backup-codec.js'
 import { ZIP_BYTES } from './zip.js'
 
-const accountId = /^[A-Za-z0-9_-]{1,48}$/
+export const backupAccountId = /^[A-Za-z0-9_-]{1,48}$/
 const hex64 = /^[a-f0-9]{64}$/
 const permitMs = 30_000
 export const approvalMs = 5 * 60_000
@@ -18,8 +18,7 @@ export type Scope = { account: string; realm: string; users: string[]; sessionOw
 const disabled = (): never => forbidden('This operation requires a private operator binding and a named backup opt-in.')
 const badConfig = (): never => fail(503, 'BACKUP_POLICY_UNAVAILABLE', 'The backup authority is not configured correctly.')
 
-export function scopeFor(env: Env, target: unknown): Scope {
-  if (typeof target !== 'string' || !accountId.test(target)) return invalid('A backup target must be one explicit account ID.')
+export function backupOptIns(env: Env): Map<string, string> {
   if (!env.OPENVIKING_EDGE_BACKUP_POLICY) return disabled()
   const { OPENVIKING_EDGE_BACKUP_KEY: key } = env
   if (env.OPENVIKING_EDGE_BACKUP_POLICY.length > 8192 || !key || !hex64.test(key)) return badConfig()
@@ -28,12 +27,18 @@ export function scopeFor(env: Env, target: unknown): Scope {
   if (!Array.isArray(policy) || policy.length > 32) return badConfig()
   const realms = new Map<string, string>(), realmIds = new Set<string>()
   for (const rule of policy) {
-    if (!isRecord(rule) || Object.keys(rule).length !== 2 || typeof rule.account_id !== 'string' || !accountId.test(rule.account_id) ||
+    if (!isRecord(rule) || Object.keys(rule).length !== 2 || typeof rule.account_id !== 'string' || !backupAccountId.test(rule.account_id) ||
         typeof rule.scope_id !== 'string' || !/^[a-f0-9]{32}$/.test(rule.scope_id) || realms.has(rule.account_id) || realmIds.has(rule.scope_id)) return badConfig()
     realms.set(rule.account_id, rule.scope_id); realmIds.add(rule.scope_id)
   }
-  const realm = realms.get(target)
+  return realms
+}
+
+export function scopeFor(env: Env, target: unknown): Scope {
+  if (typeof target !== 'string' || !backupAccountId.test(target)) return invalid('A backup target must be one explicit account ID.')
+  const realm = backupOptIns(env).get(target)
   if (!realm) return disabled()
+  const key = env.OPENVIKING_EDGE_BACKUP_KEY!
   const principals = configuredPrincipals(env)
   if (principals.some(p => p.key === key)) return badConfig()
   const locals = principals.filter(p => p.caller.accountId === target && p.caller.role !== 'root')
@@ -54,14 +59,15 @@ export async function assertFixedDirectory(env: Env, scope: Scope): Promise<void
 
 const bytesOf = (hex: string) => Uint8Array.from(hex.match(/../g)!, pair => Number.parseInt(pair, 16))
 export const hexOf = (bytes: Uint8Array) => Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('')
-async function signature(scope: Scope, label: string, payload: readonly unknown[], mac?: string): Promise<string | boolean> {
+type SigningScope = Pick<Scope, 'account' | 'realm' | 'key'>
+async function signature(scope: SigningScope, label: string, payload: readonly unknown[], mac?: string): Promise<string | boolean> {
   const key = await crypto.subtle.importKey('raw', bytesOf(scope.key), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify'])
   const data = encoder.encode(JSON.stringify(['openviking:backup:v1', label, scope.account, scope.realm, ...payload]))
   if (mac !== undefined) return hex64.test(mac) && crypto.subtle.verify('HMAC', key, bytesOf(mac), data)
   return hexOf(new Uint8Array(await crypto.subtle.sign('HMAC', key, data)))
 }
-export const sign = (scope: Scope, label: string, ...payload: unknown[]) => signature(scope, label, payload) as Promise<string>
-export const verifies = (scope: Scope, label: string, mac: string, ...payload: unknown[]) => signature(scope, label, payload, mac) as Promise<boolean>
+export const sign = (scope: SigningScope, label: string, ...payload: unknown[]) => signature(scope, label, payload) as Promise<string>
+export const verifies = (scope: SigningScope, label: string, mac: string, ...payload: unknown[]) => signature(scope, label, payload, mac) as Promise<boolean>
 
 function timedMac(value: unknown, period: number): Approval | undefined {
   if (!isRecord(value) || typeof value.mac !== 'string' || !hex64.test(value.mac) || typeof value.expires_at !== 'number' ||

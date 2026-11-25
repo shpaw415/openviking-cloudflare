@@ -15,6 +15,7 @@ import { summaryNames } from './analysis.js'
 import { admitsFileLevels, prepareLevels, publishFileLevels } from './file-levels.js'
 import { ensureParentPlan, nextResourceLeaf } from './import-target.js'
 import { importUrl, isOneShotUrlImport } from './url-import.js'
+import { importWeb, webImportMode } from './web-import.js'
 
 const UPLOAD_TTL = 30 * 60 * 1000
 const TEMP_SLOTS = 16
@@ -234,6 +235,8 @@ export async function publishResourceTransfer(fs: Filesystem, transfer: Resource
 
 export async function addResource(fs: Filesystem, request: Request): Promise<Response> {
   const body = await readJson(request, JSON_LIMIT)
+  const webMode = webImportMode(body)
+  if (webMode) return importWeb(fs, body, webMode)
   if (typeof body.path === 'string' && /^https?:\/\//i.test(body.path)) {
     if (body.temp_file_id != null) invalid('Supply a URL or a staged upload, not both.')
     if (isOneShotUrlImport(body)) return importUrl(fs, body)

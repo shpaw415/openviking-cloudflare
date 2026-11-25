@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { WorkspaceContext } from './context.js'
 import { ApiError, ok, readJson } from './http.js'
+import { edgeSessionDefaults } from './model-config.js'
 import { acceptedArchive, bindRetryTask, commitArchive, commitAnchor, prepareRetry, readArchive, retryArchive, rotateArchive, runSealedArchive, sessionContent } from './session/archives.js'
 import { assertIdle, currentFlight, initFlights, keyFor, ownerFor } from './session/flight.js'
 import { setAutoPolicy, validateAutoPolicy } from './session/auto-policy.js'
@@ -48,6 +49,13 @@ function configInput(body: Record<string, unknown>, ctx: WorkspaceContext) {
   return { tags: eventTags(body.memory_extraction_config, 'events'), auto }
 }
 
+function newSessionPolicy(ctx: WorkspaceContext) {
+  const policy = ctx.memorySettings?.session_auto_commit
+  if (!ctx.jobs || !policy?.enabled) return undefined
+  const { enabled: _enabled, ...thresholds } = policy
+  return thresholds
+}
+
 export async function routeSessions(request: Request, url: URL, ctx: WorkspaceContext): Promise<Response | undefined> {
   const path = url.pathname.replace(/\/$/, '')
   if (path === '/api/v1/content/read') return sessionContent(request, url, ctx)
@@ -76,7 +84,8 @@ export async function routeSessions(request: Request, url: URL, ctx: WorkspaceCo
       if (getSession(sql, key)) throw new ApiError(409, 'ALREADY_EXISTS', 'Session already exists.')
       insertSession(sql, key, new Date().toISOString(), policy)
       if (tags) setSessionTags(sql, key, tags)
-      if (auto !== undefined) setAutoPolicy(sql, key, auto)
+      const initial = auto === undefined ? newSessionPolicy(ctx) : auto
+      if (initial !== undefined) setAutoPolicy(sql, key, initial)
       return { session_id: id, uri: sessionUri(owner[1], id), user: identity(owner), ...sessionConfig(sql, key) }
     }))
   }
@@ -87,7 +96,14 @@ export async function routeSessions(request: Request, url: URL, ctx: WorkspaceCo
     requireMethod(request.method, 'GET', 'DELETE')
     if (request.method === 'DELETE') { deleteSession(ctx, key); return ok({ session_id: id }) }
     const session = request.method === 'GET' && queryBool(url, 'auto_create', false)
-      ? storage.transactionSync(() => getSession(sql, key) ?? insertSession(sql, key, new Date().toISOString(), null))
+      ? storage.transactionSync(() => {
+        const existing = getSession(sql, key)
+        if (existing) return existing
+        const created = insertSession(sql, key, new Date().toISOString(), null)
+        const initial = newSessionPolicy(ctx)
+        if (initial) setAutoPolicy(sql, key, initial)
+        return created
+      })
       : requireSession(sql, key)
     return ok(sessionDetail(sql, key, session))
   }
@@ -100,8 +116,11 @@ export async function routeSessions(request: Request, url: URL, ctx: WorkspaceCo
       // A sealed archive is immutable: native writes can safely append to the
       // active suffix while its semantic phase awaits the provider, not during chat.
       if (currentFlight(ctx, key)?.kind === 'bot') assertIdle(ctx, key)
-      const seq = results.length ? getSession(sql, key)?.total_message_count ?? 0 : 0
+      const existing = getSession(sql, key)
+      const seq = results.length ? existing?.total_message_count ?? 0 : 0
       const result = appendRows(sql, key, input, batch)
+      const initial = !existing ? newSessionPolicy(ctx) : undefined
+      if (initial) setAutoPolicy(sql, key, initial)
       insertToolResults(sql, key, seq, results)
       return result
     })
@@ -110,7 +129,8 @@ export async function routeSessions(request: Request, url: URL, ctx: WorkspaceCo
   }
   if (tail.length === 1 && tail[0] === 'context') {
     requireMethod(request.method, 'GET')
-    return ok(sessionContext(ctx, key, queryInt(url, 'token_budget', 128_000)))
+    const cap = ctx.memorySettings?.edge_context_token_budget
+    return ok(sessionContext(ctx, key, Math.min(queryInt(url, 'token_budget', edgeSessionDefaults.contextTokens), cap ?? Infinity)))
   }
   if (tail.length === 1 && tail[0] === 'commit') {
     requireMethod(request.method, 'POST')

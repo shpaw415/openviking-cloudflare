@@ -7,6 +7,9 @@ import { ApiError, isRecord } from '../http.js'
 import { GatewayError, bytes, displayName, fields, integer, invalidConfig, maxOutputBytes, modelId, protocols,
   record, unconfigured, unsupported, within } from './contract.js'
 import type { Protocol } from './contract.js'
+import type { ReadGatewayAttachment } from './media.js'
+import type { RichOperator } from './operator-rich.js'
+import type { TextFilter } from './sse-source.js'
 
 // Trusted deployment-side interface. Do not construct it from request data.
 export interface GatewayProvider {
@@ -15,7 +18,8 @@ export interface GatewayProvider {
   responseScope?: string
   generate(model: string, messages: ModelMessage[], options: { maxTokens: number }): ReturnType<Generation>
   generateStream?(model: string, messages: ModelMessage[], options: StreamGenerationOptions): ReturnType<GenerationStream>
-  streamTextFilter?(): (delta: string, final?: boolean) => string
+  streamTextFilter?(): TextFilter
+  rich?: RichOperator
   countTokens?(model: string, messages: ModelMessage[]): Promise<number>
 }
 
@@ -26,6 +30,8 @@ export interface GatewayContext extends WorkspaceContext {
   gatewayCredentialRevision?: AuthorityRevision
   assertGatewayMount?: () => void
   gatewayProvider?: GatewayProvider
+  /** Optional binding supplied by the private-attachment owner, never an HTTP fetch. */
+  readPrivateGatewayAttachment?: ReadGatewayAttachment
   workersAIModel?: string
   /** Text generation configured on the operator adapter is not a Workers AI route. */
   externalGeneration?: boolean

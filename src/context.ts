@@ -3,6 +3,8 @@ import type { Workspace } from './worker.js'
 import type { JobAccess } from './tasks.js'
 import type { AuthorityRevision, DataAuthority, DataAuthorityGrant } from './data-authority.js'
 import type { UrlSource } from './url-source.js'
+import type { WebSources } from './web/catalog.js'
+import type { MemorySettings, RetrievalSettings } from './model-config.js'
 
 export interface Caller {
   accountId: string
@@ -39,6 +41,7 @@ export interface Env {
   OPENVIKING_EDGE_GENERATION?: string
   OPENVIKING_EDGE_PROVIDERS?: string
   OPENVIKING_EDGE_OPERATOR_STREAMING?: string
+  OPENVIKING_EDGE_GATEWAY_CAPABILITIES?: string
   OPENVIKING_EDGE_AUDIT?: string
   OPENVIKING_EDGE_TEXT_SOURCES?: string
   OPENVIKING_EDGE_MCP?: string
@@ -47,8 +50,13 @@ export interface Env {
   OPENVIKING_EDGE_GATEWAY_TRANSFER_SECRET?: string
   OPENVIKING_EDGE_BACKUP_POLICY?: string
   OPENVIKING_EDGE_BACKUP_KEY?: string
+  OPENVIKING_EDGE_INSTANCE_BACKUP?: string
+  OPENVIKING_EDGE_INSTANCE_BACKUP_KEY?: string
   /** Optional operator-curated fetcher for admitted document URLs. */
   TEXT_SOURCE?: Fetcher
+  /** Private, read-only service for pinned documentary snapshots. */
+  WEB_SOURCE?: Fetcher
+  OPENVIKING_EDGE_WEB_CATALOG?: string
   AI?: Ai
 }
 
@@ -67,8 +75,14 @@ export interface WorkspaceContext {
   defaultSearchLimit?: number
   defaultSearchScore?: number
   useSearchSessionContext?: boolean
+  retrievalSettings?: RetrievalSettings
+  memorySettings?: MemorySettings
+  /** Check the policy snapshot in the same transaction that seals a new archive. */
+  assertArchiveSettingsCurrent?: () => void
+  searchReranker?: { threshold: number; score: (query: string, documents: string[], signal: AbortSignal) => Promise<number[]> }
   remoteText?: { allows: (url: string) => boolean; read: (url: string) => Promise<string> }
   urlSource?: UrlSource
+  webSources?: WebSources
   registerWatch?: (body: Record<string, unknown>) => Promise<Response | undefined>
   mcpMode?: string
   compileExampleSkills?: readonly { name:string; description:string; content:string; uri?:string }[]
