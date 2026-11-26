@@ -169,7 +169,7 @@ export function backupSkillTree(fs: Filesystem, uri: string, content: string, fi
 }
 
 /** Produce the same manifest as the normal Skills façade without provider I/O. */
-export async function prepareBackupSkill(fs: Filesystem, prepared: ReturnType<typeof backupSkillTree>) {
+export async function prepareBackupSkill(fs: Filesystem, prepared: ReturnType<typeof backupSkillTree>, source: 'backup'|'compile' = 'backup') {
   const { path, definition, tree } = prepared
   const manifest = await Promise.all(tree.nodes.map(async node => ({ name: nameOf(node.path.uri), path: node.rel, uri: node.path.uri,
     kind: node.kind, is_dir: node.content === undefined, ...(node.content !== undefined && {
@@ -178,7 +178,7 @@ export async function prepareBackupSkill(fs: Filesystem, prepared: ReturnType<ty
   const revision = await sha256(JSON.stringify(manifest.map(item => [item.path, item.is_dir, item.size, item.sha256])))
   return { tree, path, fs, publish: () => {
     if (fs.entry(path) || skillRow(fs, path)) conflict('A recovered skill cannot replace another package or its history.')
-    publishSkill(fs, path, undefined, definition, tree, manifest, revision, { tracked: false, type: 'backup' })
+    publishSkill(fs, path, undefined, definition, tree, manifest, revision, { tracked: false, type: source })
   } }
 }
 

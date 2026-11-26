@@ -82,7 +82,7 @@ async function* parse(read: () => Promise<ReadableStreamReadResult<Uint8Array>>)
 
 export type Finish = 'stop' | 'length' | 'content_filter' | 'tool_calls' | null
 export type Usage = { inputTokens: number | null; outputTokens: number | null }
-export type Piece = { delta: string } | { calls: Call[]; text: string } | { finish: Finish; usage: Usage; text: string; calls: Call[] }
+export type Piece = { delta: string } | { calls: Call[]; text: string } | { finish: Finish; usage: Usage; text: string; calls: Call[]; stopSequence?: string }
 export type StreamTools = { rules: ToolRules; ids: ReadonlySet<string>; secret: (value: string) => void }
 export type TextFilter = (delta: string, final?: boolean) => string[]
 
@@ -171,6 +171,15 @@ export function protectStreamText(secret: string): TextFilter {
   }
 }
 
+export type PieceSource = (reader: ReadableStreamDefaultReader<Uint8Array>, wait: <T>(task: Promise<T>) => Promise<T>) => AsyncGenerator<Piece>
+
+export function sourceFrames(reader: ReadableStreamDefaultReader<Uint8Array>, wait: <T>(task: Promise<T>) => Promise<T>) {
+  return parse(async () => {
+    try { return await within(12_000, () => wait(reader.read()), streamTimeout) }
+    catch (error) { throw translateStreamFailure(error) }
+  })
+}
+
 export async function* generationPieces(reader: ReadableStreamDefaultReader<Uint8Array>, wait: <T>(task: Promise<T>) => Promise<T>,
   external = false, filter?: TextFilter, tools?: StreamTools): AsyncGenerator<Piece> {
   const chunks: string[] = []
@@ -179,11 +188,7 @@ export async function* generationPieces(reader: ReadableStreamDefaultReader<Uint
   let calls: Call[] = []
   let filterClosed = false
   const usage: Usage = { inputTokens: null, outputTokens: null }
-  const read = async () => {
-    try { return await within(12_000, () => wait(reader.read()), streamTimeout) }
-    catch (error) { throw translateStreamFailure(error) }
-  }
-  for await (const frame of parse(read)) {
+  for await (const frame of sourceFrames(reader, wait)) {
     if (frame.event === 'error') throw failed()
     if (frame.data.trim() === '[DONE]') {
       if ((!hasText && !calls.length) || (external && finish === null)) throw incomplete()

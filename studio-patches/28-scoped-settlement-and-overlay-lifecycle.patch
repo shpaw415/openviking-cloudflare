@@ -1,0 +1,314 @@
+diff --git a/src/features/admin/gateway/components/keys-issue-dialog.tsx b/src/features/admin/gateway/components/keys-issue-dialog.tsx
+--- a/src/features/admin/gateway/components/keys-issue-dialog.tsx
++++ b/src/features/admin/gateway/components/keys-issue-dialog.tsx
+@@ -401,8 +401,10 @@
+     }
+     // When the directory resolves after Base UI chose its opening target,
+     // run the transfer after that queued frame, not before it.
+-    const frame = window.requestAnimationFrame(focusPaste)
+-    return () => window.cancelAnimationFrame(frame)
++    const frameWindow = popupRef.current?.ownerDocument.defaultView
++    if (!frameWindow) return
++    const frame = frameWindow.requestAnimationFrame(focusPaste)
++    return () => frameWindow.cancelAnimationFrame(frame)
+   }, [focusField, open, pending, workspaceOnly])
+ 
+   function switchMode(next: 'user' | 'key') {
+diff --git a/src/features/admin/gateway/components/keys-page.tsx b/src/features/admin/gateway/components/keys-page.tsx
+--- a/src/features/admin/gateway/components/keys-page.tsx
++++ b/src/features/admin/gateway/components/keys-page.tsx
+@@ -113,6 +113,9 @@
+   const [issueOpen, setIssueOpen] = React.useState(false)
+   // Remounts the issue form with empty fields each time it opens.
+   const [issueSession, setIssueSession] = React.useState(0)
++  const generation = React.useRef(0)
++  const [secretSession, setSecretSession] = React.useState(0)
++  const [closedSession, setClosedSession] = React.useState(0)
+   const [issued, setIssued] = React.useState<IssuedKey | null>(null)
+   const [secretOpen, setSecretOpen] = React.useState(false)
+   const viewRef = React.useRef<HTMLDivElement>(null)
+@@ -187,16 +190,27 @@
+       opener.current = event.currentTarget
+       handoff.current = false
+     }
+-    setIssueSession((session) => session + 1)
++    generation.current += 1
++    setIssueSession(generation.current)
+     setIssueOpen(true)
+   }
+ 
+-  function returnToKeys() {
++  React.useLayoutEffect(() => {
++    if (!EDGE_STUDIO || !closedSession || issueSession || secretSession) return
++    if (closedSession !== generation.current) return
+     const view = viewRef.current
+-    if (!present() || !view?.isConnected) return false
+-    return [opener.current, currentIssueButton.current, refreshButton.current].find((button) =>
++    if (!view?.isConnected) return
++    // Restore once in the commit that removes the closing overlay. Don't
++    // move focus away from an independent control reached in the meantime.
++    const doc = view.ownerDocument
++    const previous = opener.current
++    opener.current = null
++    const active = doc.activeElement
++    if (active && active !== doc.body && active !== doc.documentElement && active !== view) return
++    const target = [previous, currentIssueButton.current, refreshButton.current].find((button) =>
+       button && view.contains(button) && !button.matches(':disabled, [aria-disabled="true"]')) ?? view
+-  }
++    target.focus({ preventScroll: true })
++  }, [closedSession, issueSession, secretSession])
+ 
+   function refresh() {
+     void keysQuery.refetch()
+@@ -378,12 +392,19 @@
+         workspaceOnly={EDGE_STUDIO}
+         open={issueOpen}
+         onOpenChange={setIssueOpen}
+-        finalFocus={EDGE_STUDIO ? () => !issueOpen && !handoff.current && returnToKeys() : undefined}
+-        onClosed={EDGE_STUDIO ? () => setIssueSession(0) : undefined}
++        finalFocus={EDGE_STUDIO ? false : undefined}
++        onClosed={EDGE_STUDIO ? () => {
++          if (issueOpen || issueSession !== generation.current) return
++          setIssueSession(0)
++          if (!handoff.current) setClosedSession(issueSession)
++        } : undefined}
+         profiles={profiles}
+         upstreams={upstreams}
+         onIssued={(key) => {
+-          if (EDGE_STUDIO) handoff.current = true
++          if (EDGE_STUDIO) {
++            handoff.current = true
++            setSecretSession(issueSession)
++          }
+           setIssueOpen(false)
+           setIssued(key)
+           setSecretOpen(true)
+@@ -392,7 +413,7 @@
+ 
+       <KeysSecretDialog
+         workspaceOnly={EDGE_STUDIO}
+-        finalFocus={EDGE_STUDIO ? () => !secretOpen && returnToKeys() : undefined}
++        finalFocus={EDGE_STUDIO ? false : undefined}
+         open={secretOpen}
+         issued={issued}
+         baseUrl={connectionQuery.data?.base_url ?? ''}
+@@ -404,7 +425,14 @@
+           if (EDGE_STUDIO) setIssued(null)
+           setSecretOpen(false)
+         }}
+-        onClosed={() => setIssued(null)}
++        onClosed={() => {
++          if (EDGE_STUDIO) {
++            if (secretOpen || secretSession !== generation.current) return
++            setSecretSession(0)
++            setClosedSession(secretSession)
++          }
++          setIssued(null)
++        }}
+       />
+ 
+       <ConfirmDialog
+diff --git a/src/features/admin/gateway/components/upstreams-page.tsx b/src/features/admin/gateway/components/upstreams-page.tsx
+--- a/src/features/admin/gateway/components/upstreams-page.tsx
++++ b/src/features/admin/gateway/components/upstreams-page.tsx
+@@ -101,6 +101,9 @@
+   const queryClient = useQueryClient()
+   const queryKey = gatewayQueryKey(scope, 'upstreams')
+   const mutationKey = [...queryKey, 'toggle']
++  // The list can paint a rollback before the mutation observer notifies.
++  // Once the server has refused this save, unlock that row in the same paint.
++  const rolledBack = React.useRef(new WeakSet<ToggleVariables>())
+   const setEnabled = (id: string, enabled: boolean) =>
+     queryClient.setQueryData<Upstream[]>(queryKey, (list) =>
+       list?.map((item) => (item.id === id ? { ...item, enabled } : item)),
+@@ -116,7 +119,9 @@
+       await queryClient.cancelQueries({ queryKey })
+       setEnabled(upstream.id, enabled)
+     },
+-    onError: (error, { upstream }) => {
++    onError: (error, variables) => {
++      const { upstream } = variables
++      rolledBack.current.add(variables)
+       // `upstream` is the row as it was before the switch was flipped.
+       setEnabled(upstream.id, upstream.enabled)
+       toastGatewayError(t, error)
+@@ -130,10 +135,9 @@
+   })
+   const pending = useMutationState({
+     filters: { mutationKey, status: 'pending' },
+-    select: (mutation) =>
+-      (mutation.state.variables as ToggleVariables).upstream.id,
++    select: (mutation) => mutation.state.variables as ToggleVariables,
+   })
+-  return { toggle: mutate, pending: new Set(pending) }
++  return { toggle: mutate, pending: new Set(pending.filter(value => !rolledBack.current.has(value)).map(value => value.upstream.id)) }
+ }
+ 
+ /**
+diff --git a/src/features/admin/gateway/lib/use-gateway.ts b/src/features/admin/gateway/lib/use-gateway.ts
+--- a/src/features/admin/gateway/lib/use-gateway.ts
++++ b/src/features/admin/gateway/lib/use-gateway.ts
+@@ -161,7 +161,8 @@
+     },
+     enabled,
+   })
+-  useQuerySettlement(queryKey, resource === 'logs' && enabled)
++  useQuerySettlement(queryKey, enabled && (resource === 'logs' || resource === 'access' ||
++    resource === 'profiles' || resource === 'upstreams'))
+   return query
+ }
+ 
+@@ -269,13 +270,11 @@
+   const { allowed, connection, scope } = useGatewayConnection()
+   const queryClient = useQueryClient()
+   const queryKey = gatewayQueryKey(scope, 'users')
+-  return useQuery<KeyUser[], GatewayError>({
++  const enabled = open && allowed && (accessQuery.isPending ||
++    (accessQuery.isSuccess && keyOwnerPermission(accessQuery.data) === true))
++  const query = useQuery<KeyUser[], GatewayError>({
+     queryKey,
+-    enabled:
+-      open &&
+-      allowed &&
+-      (accessQuery.isPending ||
+-        (accessQuery.isSuccess && keyOwnerPermission(accessQuery.data) === true)),
++    enabled,
+     queryFn: async ({ signal }) => {
+       if (!allowed) throw new Error(i18n.t('studio:errors.gatewayUnavailable'))
+       // Join the existing access request/cache for the same account and keys.
+@@ -299,4 +298,6 @@
+       return listKeyUsers(connection)
+     },
+   })
+-}
++  useQuerySettlement(queryKey, enabled)
++  return query
++}
+diff --git a/src/features/resource-acl/components/permissions-page.tsx b/src/features/resource-acl/components/permissions-page.tsx
+--- a/src/features/resource-acl/components/permissions-page.tsx
++++ b/src/features/resource-acl/components/permissions-page.tsx
+@@ -18,6 +18,7 @@
+   TableRow,
+ } from '#/shared/ui/table'
+ import { useQuery, useQueryClient } from '@tanstack/react-query'
++import { useQuerySettlement } from '#/shared/hooks/use-query-settlement'
+ import {
+   ArrowLeftIcon,
+   ChevronRightIcon,
+@@ -61,8 +62,10 @@
+   const { t } = useTranslation('settings')
+   const [currentUri, setCurrentUri] = useState(root)
+   const [editingUri, setEditingUri] = useState('')
++  const directoryKey = ['acl-directory-list', state.aclIdentityScopeKey, currentUri]
++  const canList = state.allowed && state.hasDataIdentity
+   const directories = useQuery({
+-    queryKey: ['acl-directory-list', state.aclIdentityScopeKey, currentUri],
++    queryKey: directoryKey,
+     queryFn: async () => {
+       const result = await state.api.listDirectory(currentUri)
+       return normalizeFsEntries(result, currentUri).filter(
+@@ -72,9 +75,10 @@
+           parentUri(entry.uri) === currentUri,
+       )
+     },
+-    enabled: state.allowed && state.hasDataIdentity,
++    enabled: canList,
+     retry: false,
+   })
++  useQuerySettlement(directoryKey, canList)
+   const pathParts = currentUri.slice(root.length).split('/').filter(Boolean)
+   const breadcrumbs = [
+     { label: 'resources', uri: root },
+diff --git a/src/features/workbench/compile/tasks/$taskId.tsx b/src/features/workbench/compile/tasks/$taskId.tsx
+--- a/src/features/workbench/compile/tasks/$taskId.tsx
++++ b/src/features/workbench/compile/tasks/$taskId.tsx
+@@ -19,6 +19,7 @@
+ import { TaskExecutionEvents } from '#/features/workbench/tasks/components/task-execution-events'
+ import { Button } from '#/shared/ui/button'
+ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
++import { useQuerySettlement } from '#/shared/hooks/use-query-settlement'
+ import { getRouteApi, Link } from '@tanstack/react-router'
+ import {
+   Activity,
+@@ -49,6 +50,7 @@
+     queryFn: ({ signal }) => fetchCompileTask(taskId, signal),
+     refetchInterval: (q) => (active(q.state.data?.status) ? 5000 : false),
+   })
++  useQuerySettlement(key, true)
+   const stop = useMutation({
+     mutationFn: () => cancelCompile(taskId),
+     onSuccess: (task) => {
+diff --git a/src/features/workbench/sessions/components/composer.tsx b/src/features/workbench/sessions/components/composer.tsx
+--- a/src/features/workbench/sessions/components/composer.tsx
++++ b/src/features/workbench/sessions/components/composer.tsx
+@@ -1,5 +1,5 @@
+ import { ArrowUpIcon, SquareIcon } from 'lucide-react'
+-import { useCallback, useRef, useState } from 'react'
++import { useCallback, useLayoutEffect, useRef, useState } from 'react'
+ import { useTranslation } from 'react-i18next'
+ 
+ import { cn } from '#/shared/lib/utils'
+@@ -20,9 +20,10 @@
+   const { t } = useTranslation('sessions')
+   const [value, setValue] = useState('')
+   const [isSubmitting, setIsSubmitting] = useState(false)
+-  const submittingRef = useRef(false)
++  const submission = useRef<object | null>(null)
+   const textareaRef = useRef<HTMLTextAreaElement>(null)
+   const isCompact = variant === 'compact'
++  useLayoutEffect(() => () => { submission.current = null }, [])
+ 
+   const resize = useCallback(() => {
+     const el = textareaRef.current
+@@ -31,21 +32,31 @@
+     el.style.height = `${Math.min(el.scrollHeight, 200)}px`
+   }, [])
+ 
+-  const handleSend = useCallback(async () => {
++  const handleSend = useCallback(() => {
+     const trimmed = value.trim()
+-    if (!trimmed || submittingRef.current) return
+-    submittingRef.current = true
+-    setIsSubmitting(true)
++    if (!trimmed || submission.current) return
++    const owner = {}
++    submission.current = owner
++    const settle = (accepted: void | boolean, async: boolean) => {
++      if (submission.current !== owner) return
++      submission.current = null
++      if (accepted !== false) {
++        // Do not erase text edited while the submission was pending.
++        setValue((current) => (current === value ? '' : current))
++      }
++      if (async) setIsSubmitting(false)
++    }
+     try {
+-      const accepted = await onSend(trimmed)
+-      if (accepted === false) return
+-      // Do not erase text edited while the submission was pending.
+-      setValue((current) => (current === value ? '' : current))
++      const result = onSend(trimmed)
++      if (result && typeof result === 'object') {
++        if (submission.current === owner) setIsSubmitting(true)
++        void result.then(accepted => settle(accepted, true), () => settle(false, true))
++      } else {
++        settle(result, false)
++      }
+     } catch {
+       // The caller owns error reporting; keep the input available for retry.
+-    } finally {
+-      submittingRef.current = false
+-      setIsSubmitting(false)
++      settle(false, false)
+     }
+   }, [value, onSend])
+ 
+@@ -56,7 +67,7 @@
+ 
+       if (e.key === 'Enter' && !e.shiftKey) {
+         e.preventDefault()
+-        void handleSend()
++        handleSend()
+       }
+     },
+     [handleSend],

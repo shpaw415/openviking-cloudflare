@@ -25,12 +25,15 @@ function normalize(value: unknown): Float32Array<ArrayBuffer> {
   return Float32Array.from(value, coordinate => coordinate / peak / norm)
 }
 
-async function embed(ctx: WorkspaceContext, texts: string[]): Promise<Float32Array<ArrayBuffer>[]> {
+async function embed(ctx: WorkspaceContext, texts: string[], signal?: AbortSignal): Promise<Float32Array<ArrayBuffer>[]> {
   try {
-    const response: unknown = await ctx.embed(texts)
+    signal?.throwIfAborted()
+    const response: unknown = await ctx.embed(texts, signal)
+    signal?.throwIfAborted()
     if (!Array.isArray(response) || response.length !== texts.length) throw embeddingUnavailable()
     return Array.from(response, normalize)
   } catch (error) {
+    signal?.throwIfAborted()
     if (error instanceof ApiError && error.status === 429 && error.code === 'RATE_LIMITED') throw error
     if (ctx.dataAuthority && error instanceof ApiError && ([401, 403, 409].includes(error.status) || error.code === 'AUTH_UNAVAILABLE')) throw error
     throw embeddingUnavailable()
@@ -61,9 +64,9 @@ export async function documentIndex(ctx: WorkspaceContext, text: string): Promis
   return { dimensions, vectors: packed.buffer }
 }
 
-export async function queryVector(ctx: WorkspaceContext, query: string, context = '') {
-  if (!context) return (await embed(ctx, [query]))[0]
-  const [raw, qualified] = await embed(ctx, [query, `Recent user context:\n${context}\n\nCurrent query:\n${query}`])
+export async function queryVector(ctx: WorkspaceContext, query: string, context = '', signal?: AbortSignal) {
+  if (!context) return (await embed(ctx, [query], signal))[0]
+  const [raw, qualified] = await embed(ctx, [query, `Recent user context:\n${context}\n\nCurrent query:\n${query}`], signal)
   if (raw.length !== qualified.length) throw embeddingUnavailable()
   // Keep the request primary; recent history can disambiguate it but cannot
   // replace it with a new retrieval plan or select targets/provenance fields.

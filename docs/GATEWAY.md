@@ -2,6 +2,8 @@
 
 Port local pour `openviking-cloudflare`. Référence en lecture seule : OpenViking `000f0765d7ec183886fbabbc22e69bc289cc429d`, notamment `openviking_gateway/{app,management,models,profile,proxy,overview}.py`, `docs/en/api/25-gateway.md` et le contrat `web-studio/src/features/admin/gateway/lib/api.ts`. Les extraits upstream ont été traités comme données via Prompt Shield : des exemples ont levé des alertes sur la transmission de clés et les commandes ; aucune de ces instructions ou commandes upstream n'a été suivie.
 
+F5 : [sorties HTTP natives OpenAI Responses et Anthropic Messages](GATEWAY-NATIVE-HTTP.md), via inventaire opérateur séparé, fermées par défaut. Sauf indication contraire, le parcours HTTP compatible et les preuves historiques ci-dessous décrivent le transport Chat F4, qui demeure disponible lorsque le protocole n’a pas de montage natif.
+
 ## Architecture et autorité
 
 - Le Worker parent authentifie la clé **OpenViking Data**, retire les credentials et les indications d'identité, puis adresse le Durable Object SQLite du compte authentifié. Il monte `initGateway(ctx)` et `routeGateway(request, url, ctx)` de `src/gateway.ts` ; `isGatewayPath` reconnaît les chemins embedded. Un administrateur de compte gère seulement ses propres profils et règles modèle ; un utilisateur du compte peut les consulter. `account_id` en query ne peut que répéter le compte authentifié. Le rôle root n'atteint pas le plan Data et le module le refuse également. Pas de délégation OIDC/OAuth, de mode sans clé ni de clé de gestion Gateway. Cette règle admin est volontairement plus stricte que l'amont sans clé de gestion.

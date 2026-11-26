@@ -15,6 +15,7 @@ const allowed=new Map([
 ])
 const bad=()=>new ApiError(415,'UNSUPPORTED_MEDIA_TYPE','The uploaded document does not match its admitted file type.')
 const failed=()=>new ApiError(503,'CONVERSION_UNAVAILABLE','Document conversion did not complete.')
+export const documentInputType = (name: string) => allowed.get(name.split('.').at(-1)?.toLowerCase().replace(/^jpg$/,'jpeg') ?? '')?.mime
 
 export function initDocuments(sql:SqlStorage) {
   sql.exec(`CREATE TABLE IF NOT EXISTS ov_doc_budget (subject TEXT PRIMARY KEY, day INTEGER NOT NULL, n INTEGER NOT NULL, bytes INTEGER NOT NULL)`)
@@ -45,6 +46,7 @@ export function converter(ctx:WorkspaceContext,ai:Ai): NonNullable<WorkspaceCont
     const lead=new Uint8Array(await file.slice(0,rule.magic.length).arrayBuffer())
     if(lead.length!==rule.magic.length||rule.magic.some((value,i)=>lead[i]!==value))throw bad()
     await ctx.reauthorize?.()
+    ctx.assertActive?.()
     admitBudget(ctx,file.size)
     let result:ConversionResponse
     // Bindings use the approved media type; never let document bytes select a target or credentials.
@@ -53,6 +55,7 @@ export function converter(ctx:WorkspaceContext,ai:Ai): NonNullable<WorkspaceCont
     if(encoder.encode(result.data).byteLength>outputLimit)throw new ApiError(413,'RESOURCE_EXHAUSTED','Converted Markdown exceeds the storage limit.')
     if(result.data.includes('\0'))throw failed()
     await ctx.reauthorize?.()
+    ctx.assertActive?.()
     return {filename:`${file.name.slice(0,dot)}.md`,content:result.data}
   }
 }

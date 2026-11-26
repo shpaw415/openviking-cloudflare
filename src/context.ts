@@ -20,7 +20,9 @@ export interface ModelMessage {
   content: string
 }
 
-export type Generation = (messages: ModelMessage[], options?: { maxTokens?: number }) => Promise<{
+export type Generation = (messages: ModelMessage[], options?: {
+  maxTokens?: number; signal?: AbortSignal; reasoningEffort?: import('./model-config.js').ReasoningEffort
+}) => Promise<{
   text: string
   inputTokens: number | null
   outputTokens: number | null
@@ -41,10 +43,16 @@ export interface Env {
   OPENVIKING_EDGE_GENERATION?: string
   OPENVIKING_EDGE_PROVIDERS?: string
   OPENVIKING_EDGE_OPERATOR_STREAMING?: string
+  OPENVIKING_EDGE_GATEWAY_NATIVE?: string
   OPENVIKING_EDGE_GATEWAY_CAPABILITIES?: string
   OPENVIKING_EDGE_AUDIT?: string
   OPENVIKING_EDGE_TEXT_SOURCES?: string
   OPENVIKING_EDGE_MCP?: string
+  OPENVIKING_EDGE_SESSION_RUNTIME?: string
+  OPENVIKING_EDGE_PRIVACY_SCAN?: string
+  OPENVIKING_EDGE_MCP_LIVE?: string
+  OPENVIKING_EDGE_MEMORY_COMPILE?: string
+  OPENVIKING_EDGE_COMPILE_SCHEDULES?: string
   OPENVIKING_EDGE_DOCUMENT_CONVERSION?: string
   OPENVIKING_EDGE_GATEWAY_TRANSFERS?: string
   OPENVIKING_EDGE_GATEWAY_TRANSFER_SECRET?: string
@@ -57,6 +65,8 @@ export interface Env {
   /** Private, read-only service for pinned documentary snapshots. */
   WEB_SOURCE?: Fetcher
   OPENVIKING_EDGE_WEB_CATALOG?: string
+  WEB_NATIVE_SOURCE?: Fetcher
+  OPENVIKING_EDGE_WEB_NATIVE_CATALOG?: string
   AI?: Ai
 }
 
@@ -64,7 +74,7 @@ export interface WorkspaceContext {
   sql: SqlStorage
   storage: DurableObjectStorage
   caller: Caller
-  embed: (texts: string[]) => Promise<number[][]>
+  embed: (texts: string[], signal?: AbortSignal) => Promise<number[][]>
   generate?: Generation
   generateStream?: GenerationStream
   groups?: readonly string[]
@@ -80,11 +90,31 @@ export interface WorkspaceContext {
   /** Check the policy snapshot in the same transaction that seals a new archive. */
   assertArchiveSettingsCurrent?: () => void
   searchReranker?: { threshold: number; score: (query: string, documents: string[], signal: AbortSignal) => Promise<number[]> }
+  /** Explicitly configured VLM, lazily fenced; context planning passes only the caller's query. */
+  searchQueryGeneration?: (query: string, signal?: AbortSignal) => Promise<string | undefined>
+  /** Operator-permitted digest, with a last-effect guard on exactly the selected bytes. */
+  searchDigestGeneration?: (data: { query: string; rendered: string; max_bullets: number }, maxTokens: number,
+    checkSelection: () => void, signal?: AbortSignal) => ReturnType<Generation> | Promise<undefined>
   remoteText?: { allows: (url: string) => boolean; read: (url: string) => Promise<string> }
   urlSource?: UrlSource
   webSources?: WebSources
   registerWatch?: (body: Record<string, unknown>) => Promise<Response | undefined>
   mcpMode?: string
+  sessionRuntime?: boolean
+  sessionReasoning?: boolean
+  sessionIdleCredential?: string
+  privacyScan?: boolean
+  mcpLive?: boolean
+  /** Same cancellation lifecycle as the authenticated incoming dispatch. */
+  requestSignal?: AbortSignal
+  /** Lazily reconstruct search mounts under the same authenticated direct identity. */
+  prepareMcpSearch?: () => Promise<WorkspaceContext>
+  /** Internal Data-to-MCP handoff: stage publication on the derived scope only. */
+  deferSearchPublication?: (finish: () => void) => void
+  /** Installed after the MCP tool result is successfully formatted. */
+  publishMcpSearch?: () => void
+  memoryCompile?: boolean
+  compileAdvancedSchedule?: boolean
   compileExampleSkills?: readonly { name:string; description:string; content:string; uri?:string }[]
   compileScheduleCredential?: string
   sessionSearchContext?: (id:string)=>{text:string,usedMessages:number}

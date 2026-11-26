@@ -3,6 +3,7 @@ import type { Caller } from '../context.js'
 import { filename } from '../fs/contract.js'
 import { ApiError } from '../http.js'
 import { ensureAlarm } from '../tasks.js'
+import { decodePlainDocument } from './media.js'
 
 export const maxAttachmentBytes = 1024 * 1024 // Below the SQLite row limit, including metadata.
 export const maxAttachmentRetention = 7 * 86_400
@@ -20,6 +21,7 @@ const ascii = (bytes: Uint8Array, text: string, offset = 0) =>
 const prefix = (bytes: Uint8Array, ...signature: number[]) => signature.every((byte, i) => bytes[i] === byte)
 // A shallow format admission check, not a decoder, safety scan or decompressor.
 const formats = new Map<string, Format>([
+  ['text/plain', { extensions: ['txt'], matches: b => decodePlainDocument(b) !== undefined }],
   ['image/png', { extensions: ['png'], matches: b => prefix(b, 137, 80, 78, 71, 13, 10, 26, 10) }],
   ['image/jpeg', { extensions: ['jpg', 'jpeg'], matches: b => prefix(b, 255, 216, 255) }],
   ['image/gif', { extensions: ['gif'], matches: b => ascii(b, 'GIF87a') || ascii(b, 'GIF89a') }],

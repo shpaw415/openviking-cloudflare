@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { textSize } from '../fs/contract.js'
 import { htmlUrl } from './catalog.js'
+import { exactPublicUrl } from './native-catalog.js'
 
 const invisible = 'head,script,style,template,noscript,iframe,frame,frameset,object,embed,svg,math,form,input,button,select,textarea,xmp,plaintext,[hidden],[inert],[aria-hidden="true"]'
 const block = 'address,article,aside,blockquote,br,div,dl,dt,dd,footer,h1,h2,h3,h4,h5,h6,header,hr,li,main,nav,p,pre,section,td,th,tr'
@@ -15,19 +16,19 @@ function textEntities(text: string): string {
   })
 }
 
-function hrefFor(raw: string, page: URL): string | undefined {
+function hrefFor(raw: string, page: URL, native: boolean): string | undefined {
   // Ignore arbitrary protocols, queries, fragments, <base>, dotted traversal,
   // and network-path references. Only the exact catalogue key can authorize it.
   const path = raw.startsWith('./') ? raw.slice(2) : raw
   if (path.length > 1000 || !/^(?:https:\/\/)?[A-Za-z0-9_./-]+$/.test(path) ||
       path.startsWith('//') || path.split('/').some(part => part === '.' || part === '..')) return
   try {
-    const link = htmlUrl(path.startsWith('https://') ? path : new URL(path, page).href)
+    const link = (native ? exactPublicUrl : htmlUrl)(path.startsWith('https://') ? path : new URL(path, page).href)
     if (link?.origin === page.origin) return link.href
   } catch { /* An invalid link is not an import destination. */ }
 }
 
-export async function extractHtml(input: string, url: string, approved: ReadonlySet<string>) {
+export async function extractHtml(input: string, url: string, approved: ReadonlySet<string>, native = false) {
   // The intermediate response is never served. A separate extraction pass
   // makes omitted descendants unavailable even to document-level callbacks.
   const pruned = new HTMLRewriter().on(invisible, { element: el => { el.remove() } })
@@ -40,7 +41,7 @@ export async function extractHtml(input: string, url: string, approved: Readonly
     .on(block, { element(el) { newLine(); if (!['br', 'hr'].includes(el.tagName)) el.onEndTag(newLine) } })
     .on('a[href]', { element(el) {
       if (!approved.size || el.hasAttribute('download')) return
-      const link = hrefFor(el.getAttribute('href') ?? '', page)
+      const link = hrefFor(el.getAttribute('href') ?? '', page, native)
       if (link && approved.has(link)) links.add(link)
     } })
     .onDocument({ text: chunk => { chunks.push(chunk.text) } })

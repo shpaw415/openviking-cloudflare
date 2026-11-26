@@ -6,7 +6,7 @@ import type { Protocol } from './contract.js'
 import { credentialChanged, modelChanged } from './model-authority.js'
 import type { Metrics } from './store.js'
 import { generationPieces, streamTimeout, translateStreamFailure } from './sse-source.js'
-import type { Piece, StreamTools, TextFilter } from './sse-source.js'
+import type { Piece, PieceSource, StreamTools, TextFilter } from './sse-source.js'
 import { sseWire } from './sse-wire.js'
 import type { ResponseMeta } from './wire.js'
 
@@ -161,6 +161,7 @@ type StreamOptions = {
   protocol: Protocol; model: string; note: string; includeUsage: boolean; metrics: Metrics
   source: (options: StreamGenerationOptions) => Promise<ReadableStream<Uint8Array>>; external: boolean
   textFilter?: TextFilter
+  pieces?: PieceSource
   tools?: StreamTools
   response?: ResponseMeta
   modelRevision?: number
@@ -255,8 +256,8 @@ export async function streamTurn(options: StreamOptions): Promise<Response> {
     fence()
   }
 
-  const emitSuccess = (out: ReadableStreamDefaultController<Uint8Array>, { text, finish: reason, usage, calls }: Extract<Piece, { finish: unknown }>) => {
-    out.enqueue(encoder.encode(wire.finish(text, reason, usage, calls)))
+  const emitSuccess = (out: ReadableStreamDefaultController<Uint8Array>, { text, finish: reason, usage, calls, stopSequence }: Extract<Piece, { finish: unknown }>) => {
+    out.enqueue(encoder.encode(wire.finish(text, reason, usage, calls, stopSequence)))
     out.close()
     finish()
   }
@@ -273,7 +274,7 @@ export async function streamTurn(options: StreamOptions): Promise<Response> {
     } catch (error) { throw translateStreamFailure(error) }
     if (!(source instanceof ReadableStream) || source.locked) throw new GatewayError(503, 'generation_unavailable', 'The generation binding did not supply a readable stream.')
     reader = source.getReader()
-    const pieces = generationPieces(reader, wait, options.external, options.textFilter, options.tools)
+    const pieces = options.pieces ? options.pieces(reader, wait) : generationPieces(reader, wait, options.external, options.textFilter, options.tools)
     const first = await pieces.next()
     if (first.done || 'finish' in first.value) throw new GatewayError(502, 'stream_incomplete', 'The generation stream supplied no safe output.')
     await reauthorize(true)

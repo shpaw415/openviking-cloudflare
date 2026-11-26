@@ -4,8 +4,12 @@ import { ApiError, ok, readJson } from './http.js'
 import { edgeSessionDefaults } from './model-config.js'
 import { acceptedArchive, bindRetryTask, commitArchive, commitAnchor, prepareRetry, readArchive, retryArchive, rotateArchive, runSealedArchive, sessionContent } from './session/archives.js'
 import { assertIdle, currentFlight, initFlights, keyFor, ownerFor } from './session/flight.js'
-import { setAutoPolicy, validateAutoPolicy } from './session/auto-policy.js'
+import { autoState, setAutoPolicy, validateAutoPolicy } from './session/auto-policy.js'
+import type { AutoPolicy } from './session/auto-policy.js'
 import { maybeQueueAuto } from './session/auto-commit.js'
+import { bindIdle } from './session/idle.js'
+import { ensureAlarm } from './tasks.js'
+import { planRetention } from './session/retention.js'
 import { commitOptions, decodeSegment, encodeMessages, eventTags, invalid, isRecord, memoryPolicy, noTelemetry, optionalJson, unsupported } from './session/protocol.js'
 import { memoryStats, sessionStats } from './session/stats.js'
 import {
@@ -33,8 +37,9 @@ export async function runSessionCommit(payload: Record<string, unknown>, ctx: Wo
   if (payload.op === 'retry' && typeof payload.archive_id === 'string') {
     return retryArchive(ctx, key, payload.archive_id, payload.body, typeof payload.job_id === 'string' ? payload.job_id : '')
   }
-  if ((payload.op !== 'commit' && payload.op !== 'auto') || typeof payload.anchor !== 'string') invalid('Invalid commit job.')
-  return commitArchive(ctx, key, commitOptions(payload.body), payload.anchor, payload.op === 'auto')
+  if ((payload.op !== 'commit' && payload.op !== 'auto' && payload.op !== 'idle') || typeof payload.anchor !== 'string') invalid('Invalid commit job.')
+  if (payload.op === 'idle' && !ctx.sessionIdleCredential) unsupported('Idle commit is not mounted.')
+  return commitArchive(ctx, key, commitOptions(payload.body), payload.anchor, payload.op === 'idle' ? 'idle' : payload.op === 'auto')
 }
 
 function syncRequested(url: URL, body: Record<string, unknown>, defaultWait = false): boolean {
@@ -44,12 +49,12 @@ function syncRequested(url: URL, body: Record<string, unknown>, defaultWait = fa
 
 function configInput(body: Record<string, unknown>, ctx: WorkspaceContext) {
   noTelemetry(body.telemetry)
-  const auto = validateAutoPolicy(body.auto_commit_policy)
+  const auto = validateAutoPolicy(body.auto_commit_policy, ctx.sessionRuntime)
   if (auto && !ctx.jobs) unsupported('Automatic threshold commits require the durable job consumer.')
   return { tags: eventTags(body.memory_extraction_config, 'events'), auto }
 }
 
-function newSessionPolicy(ctx: WorkspaceContext) {
+function newSessionPolicy(ctx: WorkspaceContext): Partial<AutoPolicy> | undefined {
   const policy = ctx.memorySettings?.session_auto_commit
   if (!ctx.jobs || !policy?.enabled) return undefined
   const { enabled: _enabled, ...thresholds } = policy
@@ -80,12 +85,15 @@ export async function routeSessions(request: Request, url: URL, ctx: WorkspaceCo
     const policy = memoryPolicy(body.memory_policy)
     const id = body.session_id == null || body.session_id === '' ? newSessionId() : sessionId(body.session_id)
     const key = keyFor(ctx, id)
+    if (auto?.idle_timeout_seconds) await ensureAlarm(storage, Date.now() + 1000)
+    await ctx.reauthorize?.()
     return ok(storage.transactionSync(() => {
       if (getSession(sql, key)) throw new ApiError(409, 'ALREADY_EXISTS', 'Session already exists.')
       insertSession(sql, key, new Date().toISOString(), policy)
       if (tags) setSessionTags(sql, key, tags)
       const initial = auto === undefined ? newSessionPolicy(ctx) : auto
       if (initial !== undefined) setAutoPolicy(sql, key, initial)
+      if (initial?.idle_timeout_seconds) bindIdle(ctx, key)
       return { session_id: id, uri: sessionUri(owner[1], id), user: identity(owner), ...sessionConfig(sql, key) }
     }))
   }
@@ -112,6 +120,8 @@ export async function routeSessions(request: Request, url: URL, ctx: WorkspaceCo
     const batch = tail.length === 2
     const input = encodeMessages(await readJson(request, 512 * 1024), batch, caller.userId)
     const results = await prepareToolResults(input)
+    if (ctx.sessionRuntime && autoState(sql, key).policy?.idle_timeout_seconds) await ensureAlarm(storage, Date.now() + 1000)
+    await ctx.reauthorize?.()
     const result = storage.transactionSync(() => {
       // A sealed archive is immutable: native writes can safely append to the
       // active suffix while its semantic phase awaits the provider, not during chat.
@@ -134,16 +144,19 @@ export async function routeSessions(request: Request, url: URL, ctx: WorkspaceCo
   }
   if (tail.length === 1 && tail[0] === 'commit') {
     requireMethod(request.method, 'POST')
-    const body = await optionalJson(request), opts = commitOptions(body)
+    const body = await optionalJson(request), opts = commitOptions(body, ctx.sessionRuntime)
     await ctx.reauthorize?.()
     if (syncRequested(url, body)) return ok(await commitArchive(ctx, key, opts))
     assertIdle(ctx, key)
     const session = requireSession(sql, key)
-    if (session.message_count <= opts.keep) return ok(await commitArchive(ctx, key, opts))
+    const keep = opts.retention ? planRetention(sql, key, opts.retention).keep : opts.keep
+    if (session.message_count <= keep) return ok(await commitArchive(ctx, key, opts))
     if (!ctx.jobs) unsupported('The durable session task consumer is not mounted.')
     const archive = session.commit_count + 1, anchor = commitAnchor(sql, key, session)
     const task = await ctx.jobs.enqueue('session_commit', id, { session_id: id, op: 'sealed', archive_no: archive, anchor,
-      options: { keep: opts.keep, reset: opts.reset, working: opts.working ?? null, tags: opts.tags ?? null } }, {
+       options: { keep, reset: opts.reset, working: opts.working ?? null, tags: opts.tags ?? null,
+         ...(opts.retention && { retention: opts.retention }), ...(opts.summaryTokens!==undefined && {summaryTokens:opts.summaryTokens}),
+         ...(opts.reasoningEffort!==undefined&&{reasoningEffort:opts.reasoningEffort}) } }, {
       meta: { session_id: id }, idempotencyKey: request.headers.get('idempotency-key') ?? undefined,
       onAccepted: owner => { rotateArchive(ctx, key, opts, anchor, false, owner.task_id) },
     })
@@ -173,11 +186,16 @@ export async function routeSessions(request: Request, url: URL, ctx: WorkspaceCo
     const body = await optionalJson(request)
     if (Object.keys(body).some(key => !['auto_commit_policy', 'memory_extraction_config', 'telemetry'].includes(key))) invalid('Unknown session setting.')
     const { tags, auto } = configInput(body, ctx)
+    if (ctx.sessionRuntime && auto !== undefined) await ensureAlarm(storage, Date.now() + 1000)
+    await ctx.reauthorize?.()
     return ok(storage.transactionSync(() => {
       requireSession(sql, key)
       assertIdle(ctx, key)
       if (tags) setSessionTags(sql, key, tags)
-      if (auto !== undefined) setAutoPolicy(sql, key, auto)
+      if (auto !== undefined) {
+        setAutoPolicy(sql, key, auto)
+        if (ctx.sessionRuntime || auto === null || auto.idle_timeout_seconds === 0) bindIdle(ctx, key)
+      }
       return { session_id: id, ...sessionConfig(sql, key) }
     }))
   }

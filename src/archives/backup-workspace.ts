@@ -17,6 +17,7 @@ import { captureDomains, decodeEdge, edgeFilename, encodeEdge, planDomains } fro
 import { armGatewayAttachmentPurge } from '../gateway/attachments.js'
 import { attachmentsExpired, captureAttachments, publishAttachments, unwrapAttachments, wrapAttachments } from './instance-attachments.js'
 import type { AttachmentSeats } from './instance-attachments.js'
+import { capturePortableState, checkPortableHashes, preparePortableState, unwrapPortableState, wrapPortableState } from './instance-portable-state.js'
 
 const privateHeaders = { 'cache-control': 'private, no-store' }
 const entryPrefix = 'viking://'
@@ -55,6 +56,7 @@ function assertPortableTopology(sql: SqlStorage, account: string, edge: boolean)
   for (const [table, filter, name] of [
     ['privacy_targets', '', 'privacy settings'],
     ['ov_edge_mcp_registry', " AND scope GLOB 'user:*'", 'private tools'],
+    ['ov_mcp_live', '', 'private Live Context mounts'],
     ...(!edge ? [['ov_sessions', '', 'sessions'], ['ov_edge_user_add_settings', '', 'user add locations'],
       ['ov_edge_fs_skill', " AND uri GLOB 'viking://user/*' AND current_revision IS NOT NULL", 'private skills']] : []),
   ]) if (hasTable(sql, table) && sql.exec(`SELECT 1 FROM ${table} WHERE account_id=?${filter} LIMIT 1`, account).toArray().length) {
@@ -247,7 +249,7 @@ function domainContext(storage: DurableObjectStorage, scope: Scope, fs: BackupFi
 }
 
 type Sealer = { key: string; label: string }
-type InstanceScope = { seal: Sealer; live: () => void; seats?: AttachmentSeats }
+type InstanceScope = { seal: Sealer; live: () => void; seats?: AttachmentSeats; portable?: boolean }
 type InstanceCapture = InstanceScope & { check: () => void }
 type InstanceRestore = InstanceScope & { cold: () => void; plan?: string; commit: (attachmentDeadline: number | null, attachmentCount: number) => string }
 
@@ -258,16 +260,21 @@ export async function captureBackup(storage: DurableObjectStorage, env: Env, sco
   const live = instance?.live ?? (() => assertPermitLive(permit!))
   if (!instance) await assertFixedDirectory(env, scope)
   live()
-  const { entries, ceiling, domains, attachments } = storage.transactionSync(() => {
+  const { entries, ceiling, domains, attachments, portable } = storage.transactionSync(() => {
     instance?.check()
     const fs = new BackupFilesystem(storage, scope)
-    const domains = format === 'edge-v1' ? captureDomains(domainContext(storage, scope, fs)) : undefined
+    const domain = domainContext(storage, scope, fs)
+    const domains = format === 'edge-v1' ? captureDomains(domain) : undefined
     const snapshot = fs.capture(domains?.skills.owned)
-    return { ...snapshot, domains, attachments: instance?.seats && captureAttachments(storage.sql, instance.seats) }
+    const portable = instance?.portable ? capturePortableState(domain) : undefined
+    if (portable) preparePortableState(domain, portable, snapshot.entries, instance!.seats!)
+    return { ...snapshot, domains, portable, attachments: instance?.seats && captureAttachments(storage.sql, instance.seats) }
   })
   const content = await encodeBackup(entries)
   const edge = domains ? await encodeEdge(content, domains) : content
-  const zip = attachments ? await wrapAttachments(edge, attachments) : edge
+  const workspace = attachments ? await wrapAttachments(edge, attachments) : edge
+  if (portable) await checkPortableHashes(portable)
+  const zip = portable ? await wrapPortableState(workspace, portable) : workspace
   const sha256 = await digest(zip)
   const seal = await sign(instance ? { ...scope, key: instance.seal.key } : scope, instance?.seal.label ?? 'archive', sha256, ceiling)
   live()
@@ -289,7 +296,9 @@ export async function restoreBackup(storage: DurableObjectStorage, env: Env, wor
     fail(403, 'BACKUP_SEAL_INVALID', 'The backup bytes are not sealed for the named workspace.')
   }
   const fs = new BackupFilesystem(storage, scope), domain = domainContext(storage, scope, fs)
-  const pieces = instance?.seats ? await unwrapAttachments(zip, instance.seats) : undefined
+  const portable = instance?.portable ? await unwrapPortableState(zip) : undefined
+  if (portable) await checkPortableHashes(portable.state)
+  const pieces = instance?.seats ? await unwrapAttachments(portable?.workspace ?? zip, instance.seats) : undefined
   const checkDeadline = () => { if (pieces?.deadline != null && pieces.deadline <= Date.now()) attachmentsExpired() }
   const incoming = format === 'edge-v1' ? await decodeEdge(domain, pieces?.edge ?? zip) : undefined
   const entries = incoming?.entries ?? await decodeBackup(zip)
@@ -305,7 +314,11 @@ export async function restoreBackup(storage: DurableObjectStorage, env: Env, wor
     // Both dry-run and the final transaction resolve destination grants from
     // SQLite. The authenticated ceiling is immutable; the ACL stamp is CAS-bound.
     const files = fs.plan(entries, policy, allowsOverwrite, state, domains?.growth)
-    return { files, domains, stamp: JSON.stringify([files.stamp, domains?.stamp]), outcome: domains?.changed ? 'ready' : files.outcome }
+    const statePlan = portable && preparePortableState(domain, portable.state, entries, instance!.seats!)
+    // The plan HMAC binds the member digest; its portable state has no live
+    // merge and the final transaction rechecks the same empty destination.
+    return { files, domains, statePlan, stamp: JSON.stringify([files.stamp, domains?.stamp]),
+      outcome: domains?.changed || statePlan?.changed ? 'ready' : files.outcome }
   }
   const plan = storage.transactionSync(prepare)
   const conditions: unknown[] = [workspaceId, format, policy, sha256, mac, plan.stamp, plan.files.counts, plan.domains?.counts, plan.outcome]
@@ -350,6 +363,7 @@ export async function restoreBackup(storage: DurableObjectStorage, env: Env, wor
       latest.domains.publish()
     }
     if (pieces && instance?.seats) publishAttachments(storage.sql, instance.seats, pieces.items)
+    latest.statePlan?.publish()
     checkDeadline()
     return instance?.commit(pieces?.deadline ?? null, pieces?.items.length ?? 0)
   })

@@ -141,7 +141,7 @@ export class CompileState {
     const trigger = config?.last_run === null ? 'initial' : slot === null ? 'manual' : 'scheduled'
     db.exec(`INSERT INTO ov_edge_compile_run(account_id,user_id,agent_id,task_id,config_name,target,params,status,trigger,created,intent,request_key,meta)
       VALUES(?,?,?,?,?,?,?,'queued',?,?,?,?,?)`, ...this.actor, task.task_id, name ?? '', inputs.to, JSON.stringify(inputs),
-    trigger, task.created_at, intent, key, slot === null ? null : JSON.stringify({ scheduled_slot: slotIso(slot) }))
+     trigger, task.created_at, intent, key, slot === null ? null : JSON.stringify({ scheduled_slot: slotIso(slot,inputs.update_schedule?.timezone) }))
     if (name && config && (config.last_run === null || config.last_run < task.created_at)) {
       db.exec(`UPDATE ov_edge_compile_config SET last_run=? WHERE ${local} AND name=?`, task.created_at, ...this.actor, name)
     }
@@ -173,7 +173,8 @@ export class CompileState {
     const running = !!run && ['queued', 'running', 'cancelling'].includes(run.status)
     const initialized = !!this.latest(config.name)?.baseline
     const clock = this.clock(config.name)
-    return { status: run?.status ?? 'configured', initialized, running, next_run_at: slotIso(clock?.next_slot ?? null),
+    const zone=(JSON.parse(config.inputs) as Inputs).update_schedule?.timezone
+    return { status: run?.status ?? 'configured', initialized, running, next_run_at: slotIso(clock?.next_slot ?? null,zone),
       last_error: clock?.error ?? run?.error ?? null, last_run: run }
   }
 
@@ -247,6 +248,6 @@ export function configView(row: Config, redact = false, clock?: Clock) {
   return { compile_name: row.name,
     ...(redact ? { ...inputs, from: [], to: null, skill: null, instruction: null, args: {} } : inputs),
     task_first_create_time: row.created, last_run_time: row.last_run,
-    last_triggered_slot: slotIso(clock?.last_slot ?? null), next_triggered_slot: slotIso(clock?.next_slot ?? null),
+    last_triggered_slot: slotIso(clock?.last_slot ?? null,inputs.update_schedule?.timezone), next_triggered_slot: slotIso(clock?.next_slot ?? null,inputs.update_schedule?.timezone),
     ...(clock?.error && { schedule_error: clock.error }) }
 }

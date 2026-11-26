@@ -2,17 +2,18 @@
 import { byteLimits, mediaHeader, mediaTypes, receiptHeader, snapshotOrigin, snapshotRoute } from './catalog.js'
 import type { SnapshotKind } from './catalog.js'
 
-/** Optional private service entrypoint. The bucket is dedicated to approved
- * snapshots and is provisioned out of band. This service has no network client. */
+/** Optional private service entrypoint. Dedicated stores are provisioned out
+ * of band; only live HTML has a separate, mutable document channel. */
 export default {
-  async fetch(request: Request, env: { WEB_SNAPSHOTS: Pick<R2Bucket, 'get'> }): Promise<Response> {
+  async fetch(request: Request, env: { WEB_SNAPSHOTS?: Pick<R2Bucket, 'get'>; WEB_LIVE_DOCUMENTS?: Pick<R2Bucket, 'get'> }): Promise<Response> {
     const target = new URL(request.url)
     const match = snapshotRoute.exec(target.pathname)
     const refused = () => new Response(null, { status: 404 })
     if (request.method !== 'GET' || target.href !== snapshotOrigin + target.pathname || !match) return refused()
     const kind = match[1] as SnapshotKind
     if (request.headers.get('accept') !== mediaTypes[kind]) return refused()
-    const object = await env.WEB_SNAPSHOTS.get(`${kind}/${match[2]}`)
+    const store = kind === 'live-html' ? env.WEB_LIVE_DOCUMENTS : env.WEB_SNAPSHOTS
+    const object = await store?.get(`${kind}/${match[2]}`)
     if (!object) return refused()
     const url = object.customMetadata?.sourceUrl
     if (!url || !/^https:\/\/[\x21-\x7e]{1,1000}$/.test(url) || object.size > byteLimits[kind]) {

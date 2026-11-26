@@ -8,8 +8,8 @@ export type Clock = { last_slot: number | null; next_slot: number | null; error:
 export type Candidate = Clock & { account_id: string; user_id: string; agent_id: string; name: string; revision: string;
   credential: string; next_slot: number; wake_at: number; failures: number }
 type Plan = { revision: string; credential: string | null; last_slot: number | null; next_slot: number | null }
-type ResolvedSchedule = { frequency: 'daily'; hour: number; minute: number } |
-  { frequency: 'weekly'; weekday: number; hour: number; minute: number }
+type ResolvedSchedule = ({ frequency: 'daily'; hour: number; minute: number } |
+  { frequency: 'weekly'; weekday: number; hour: number; minute: number }) & Pick<Schedule,'timezone'|'weekdays'>
 type Subject = readonly [string, string, string]
 type AlarmStore = Pick<DurableObjectTransaction, 'getAlarm' | 'setAlarm'>
 
@@ -36,7 +36,8 @@ function stableSeed(value: string) {
 
 export function resolveSchedule(plan: Schedule, subject: Subject, name: string): ResolvedSchedule {
   const seed = JSON.stringify([...subject, name]); const spread = stableSeed(seed) % 240
-  const times = { hour: plan.hour ?? (plan.minute !== undefined ? 0 : Math.floor(spread / 60)), minute: plan.minute ?? spread % 60 }
+  const times = { hour: plan.hour ?? (plan.minute !== undefined ? 0 : Math.floor(spread / 60)), minute: plan.minute ?? spread % 60,
+    ...(plan.timezone&&{timezone:plan.timezone}),...(plan.weekdays&&{weekdays:plan.weekdays}) }
   return plan.frequency === 'weekly' ? { frequency: 'weekly', weekday: plan.weekday ?? 1 + stableSeed('weekday:' + seed) % 7, ...times }
     : { frequency: 'daily', ...times }
 }
@@ -50,6 +51,7 @@ function complete(plan: Schedule): ResolvedSchedule {
 
 export function dueSlot(value: Schedule, now: number): number {
   const plan = complete(value)
+  if (plan.timezone) return zonedSlot(plan,now,false)
   let localDay = Math.floor((now + offset) / day)
   if (plan.frequency === 'weekly') {
     const weekday = new Date(localDay * day).getUTCDay() || 7
@@ -60,11 +62,31 @@ export function dueSlot(value: Schedule, now: number): number {
 }
 
 export function futureSlot(value: Schedule, now: number): number {
+  if (value.timezone) return zonedSlot(complete(value),now,true)
   return dueSlot(value, now) + day * (value.frequency === 'weekly' ? 7 : 1)
 }
 
-export function slotIso(value: number | null): string | null {
-  return value === null ? null : new Date(value + offset).toISOString().slice(0, 19) + '+08:00'
+function zonedSlot(plan:ResolvedSchedule,now:number,future:boolean):number {
+  const formatter=new Intl.DateTimeFormat('en-CA',{timeZone:plan.timezone,year:'numeric',month:'numeric',day:'numeric',hour:'numeric',minute:'numeric',hourCycle:'h23'})
+  const wall=(instant:number)=>{
+    const p=Object.fromEntries(formatter.formatToParts(instant).map(({type,value})=>[type,Number(value)]))
+    return Date.UTC(p.year,p.month-1,p.day,p.hour,p.minute)
+  }
+  const midnight=Math.floor(wall(now)/day)*day
+  for(let i=0;i<16;i++) {
+    const d=midnight+(future?i:-i)*day, weekday=new Date(d).getUTCDay()||7
+    if(plan.frequency==='weekly'&&!(plan.weekdays??[plan.weekday]).includes(weekday)) continue
+    const target=d+plan.hour*hour+plan.minute*minute
+    const offsets=[target-2*day,target,target+2*day].map(probe=>wall(probe)-probe)
+    const matches=offsets.map(off=>target-off).filter(utc=>wall(utc)===target)
+    const first=Math.min(...matches)
+    if(Number.isFinite(first)&&(future?first>now:first<=now)) return first
+  }
+  return invalid('No eligible upcoming slot within the bounded calendar horizon.')
+}
+
+export function slotIso(value: number | null, zone?:string): string | null {
+  return value === null ? null : zone ? new Date(value).toISOString() : new Date(value + offset).toISOString().slice(0, 19) + '+08:00'
 }
 
 export async function armEarlier(store: AlarmStore, time: number) {

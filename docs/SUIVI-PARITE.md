@@ -2,6 +2,28 @@
 
 Objectif : continuer jusqu’à la parité native du Worker et du Web Studio d’origine, avec les tests originaux. Un palier validé ne clôt pas le projet. L’amont reste en lecture seule au SHA `000f0765d7ec183886fbabbc22e69bc289cc429d`. Ne pas lancer de déploiement, publier ou déplacer de données réelles pour obtenir un test vert.
 
+## Incrément F5
+
+La complétion de ce palier est décrite dans [les contrats Edge et leurs montages](FEATURES-EDGE.md).
+Les chiffres de réception des paragraphes historiques ci-dessous ne sont **pas** des résultats du nouveau gel.
+
+- [Imports web](WEB-IMPORT.md) : flux RSS/Atom, collections GitHub épinglées et lots d’archives documentaires. Le HTML courant est fourni par une liaison privée, pas par un robot de crawl public. Feishu/TOS ne sont pas des connecteurs natifs. Studio indique un site tronqué par les limites de parcours ; les nouveaux types de source sont accessibles par l’API.
+- [Gateway](GATEWAY-NATIVE-HTTP.md) : transports sortants OpenAI Responses et Anthropic Messages, sur activation opérateur. Pas d’exécuteur d’outils, d’audio natif ni de stockage chez les fournisseurs.
+- [Sauvegarde d’instance](INSTANCE-BACKUP.md) : profil v3 pour snapshots et certaines définitions Compile privées inactives. Pas d’export des identités, autorisations ou paramètres de fournisseur.
+- [Recherche](SEARCH-CONTEXT.md) : contexte assemblé selon budget, résultats autorisés et reformulation facultative, sans digest ou suivi inter-tours.
+- [Clients](CLIENT-QUALIFICATION.md) : la CLI stock et les sondes SDK TypeScript/Python se vérifient sur un même bundle Workerd. Les résultats des anciens gels cités ci-dessous restent historiques.
+
+## Complétion du palier natif
+
+- [Connecteurs natifs](WEB-NATIVE.md) : lecture actuelle de sites et flux approuvés, GitHub Contents épinglé, Feishu documentaire avec permissions, collections TOS signées, conversion binaire explicitement montée et veilles durables.
+- [Gateway](GATEWAY-NATIVE-HTTP.md) : documents privés, JSON structuré validé, sampling, séquences d'arrêt, WAV Chat, comptage Messages et une lecture locale consentie, sans exécuteur arbitraire.
+- [Contexte](SEARCH-CONTEXT.md) : digest facultatif autorisé, registre durable par session et source, mots-clés, reranking contextuel, approfondissement par budget et compatibilité recall.
+- [Runtime](RUNTIME-F5.md) : commits d'inactivité et checkpoints, consolidation/Skill inerte par le fournisseur configuré, récurrences bornées, contexte MCP local et Privacy scan/réparation/réindexation.
+- MCP peut également appeler la recherche en contexte/mots-clés et importer les sources montées dans le même espace avec `OPENVIKING_EDGE_MCP_LIVE=1`. Les nouveaux modèles de requête et l'autorité sont construits à la demande, sans endpoint ni identité fournis par un outil. Le défaut read/read-write reste indépendant ; le mode lecture seule n'autorise pas d'import.
+- Une politique uniforme réserve les commits de snapshots partagés à l'admin du compte, sans tester devant un membre si une branche masquée importée existe. Les branches privées et les restaurations autorisées restent disponibles.
+
+Les restrictions de sécurité et les dépendances natives non équivalentes restent explicitement documentées. Une fonction dépendant d'un provider absent n'est pas annoncée comme montée ; aucune validation avec un fournisseur distant n'est déduite des recettes Workerd synthétiques.
+
 ## Preuves acquises à ce palier
 
 | Périmètre | Résultat et portée |

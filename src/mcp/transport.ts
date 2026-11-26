@@ -42,6 +42,8 @@ function negotiation(request: Request): 'json' | 'sse' | undefined {
 }
 
 export async function routeTransport(request: Request, ctx: McpContext): Promise<Response> {
+  const signal = ctx.requestSignal ?? request.signal
+  signal.throwIfAborted()
   if (!mcpEnabled(ctx)) return error(null, -32003, 'MCP is not enabled by the deployment policy.', 503)
   if (request.method !== 'POST') return respond(null, { error: { code: -32600, message: 'MCP is stateless; use POST.' } }, 405, { headers: { Allow: 'POST' } })
   const format = negotiation(request)
@@ -54,11 +56,12 @@ export async function routeTransport(request: Request, ctx: McpContext): Promise
   if (requestedVersion !== null && !protocolVersions.includes(requestedVersion)) return error(null, -32600, 'Unsupported MCP protocol version.', 400)
 
   let bytes: Uint8Array
-  try { bytes = await readBytes(request, WRITE_LIMIT + 16 * 1024) }
+  try { bytes = await readBytes(request, WRITE_LIMIT + 16 * 1024, signal) }
   catch (cause) {
     if (cause instanceof ApiError) return error(null, -32600, cause.message, cause.status)
     throw cause
   }
+  signal.throwIfAborted()
   let message: unknown
   try { message = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(bytes)) }
   catch { return error(null, -32700, 'Invalid JSON.', 400) }
@@ -93,8 +96,13 @@ export async function routeTransport(request: Request, ctx: McpContext): Promise
     case 'tools/call': {
       if (typeof params.name !== 'string' || params.name.length > 128 || !params.name ||
           (params.arguments !== undefined && !isRecord(params.arguments))) return invalidParams()
-      try { return reply(await callTool(ctx, params.name, (params.arguments as Data | undefined) ?? {})) }
+      try {
+        const result = await callTool(ctx, params.name, (params.arguments as Data | undefined) ?? {})
+        signal.throwIfAborted()
+        return reply(result)
+      }
       catch (cause) {
+        signal.throwIfAborted()
         if (!(cause instanceof ApiError)) return error(id, -32603, 'The data operation failed.', 200, sse)
         return reply(toolError(cause))
       }

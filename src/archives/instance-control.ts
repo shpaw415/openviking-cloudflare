@@ -7,7 +7,7 @@ import type { Scope } from './backup-authority.js'
 import { hasTable } from './backup-domain.js'
 import { attachment, digest, fail, invalid } from './common.js'
 import { admitInstancePermit, captureProfile, hashId, instanceId, instanceMode, instanceMount, instancePermit, instanceScopes, offline,
-  refused, rosterTag, signInstance, unsupported, verifyInstance, withAttachments, workspaceName, wrongStage } from './instance-authority.js'
+  refused, rosterTag, signInstance, unsupported, verifyInstance, workspaceName, wrongStage } from './instance-authority.js'
 import type { ControlCommand, InstanceProfile, MemberCall, Mount } from './instance-authority.js'
 import { decodeInstance, encodeInstance, instanceFilename, memberLimit, zipInput } from './instance-codec.js'
 import type { Member } from './instance-codec.js'
@@ -89,7 +89,7 @@ export class InstanceRecovery {
     const members: Member[] = []
     for (const scope of scopes) {
       live()
-      const response = await this.member(mount, { op: 'capture', account: scope.account, capture, ...(profile === withAttachments && { profile }) })
+      const response = await this.member(mount, { op: 'capture', account: scope.account, capture, ...(profile !== 'edge-v1' && { profile }) })
       const bytes = await readBytes(response, memberLimit(profile))
       const seal = response.headers.get('x-ovpack-seal')
       aclSeal(seal, scope.users.length)
@@ -121,7 +121,7 @@ export class InstanceRecovery {
         if (command === 'capture') return await this.capture(mount, scopes, live, captureProfile(argument))
         const pack = await decodeInstance(this.env, mount, scopes, zipInput(archive))
         const { capture, job, accounts, profile } = pack
-        const extra: Pick<MemberCall, 'profile'> = profile === withAttachments ? { profile } : {}
+        const extra: Pick<MemberCall, 'profile'> = profile !== 'edge-v1' ? { profile } : {}
         const config = readInstanceSettings(pack.settings, scopes)
         const row = this.state()
         if (row && (row.destination !== mount.local.id || row.job !== job)) return wrongStage()
@@ -136,7 +136,7 @@ export class InstanceRecovery {
             const response = await this.member(mount, { op: 'evaluate', account, capture, job, sha256, ...extra }, bytes.slice().buffer, seal)
             const { result } = await readJson(response, 2048)
             if (!isRecord(result) || result.dry_run !== true || !hashId(result.plan)) return unsupported()
-            if (profile === withAttachments) {
+            if (extra.profile) {
               const { attachment_count: count, attachment_deadline: deadline } = result
               if (typeof count !== 'number' || !Number.isSafeInteger(count) || count < 0 || count > attachmentCountLimit ||
                   (count === 0 ? deadline !== null : typeof deadline !== 'number' || !Number.isSafeInteger(deadline) || deadline < 1)) return unsupported()
@@ -150,7 +150,7 @@ export class InstanceRecovery {
             const mac = await signInstance(mount, 'approve', job, plans, expires_at)
             live()
             requireLivePlans(plans)
-            return ok({ dry_run: true, job, accounts: plans.length, approval: { expires_at, mac }, ...(profile === withAttachments && {
+            return ok({ dry_run: true, job, accounts: plans.length, approval: { expires_at, mac }, ...(extra.profile && {
               attachment_count: plans.reduce((sum, p) => sum + (typeof p === 'string' ? 0 : p[1]), 0),
             }) })
           }
@@ -169,7 +169,7 @@ export class InstanceRecovery {
           if (!row) return wrongStage()
           const plans = JSON.parse(row.plans) as Plan[], receipts = JSON.parse(row.receipts) as string[]
           if (plans.length !== accounts.length || receipts.length > plans.length || !plans.every(p =>
-            profile === withAttachments ? Array.isArray(p) && hashId(p[0]) : hashId(p))) return wrongStage()
+             extra.profile ? Array.isArray(p) && hashId(p[0]) : hashId(p))) return wrongStage()
           if (!row.released) requireLivePlans(plans)
           if (command === 'step') {
             if (typeof argument !== 'number' || !Number.isSafeInteger(argument) || argument < 0 || argument >= plans.length || argument > receipts.length) return wrongStage()

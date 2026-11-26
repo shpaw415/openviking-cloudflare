@@ -2,6 +2,9 @@
 import { ApiError, readBytes } from '../http.js'
 import { parseTags } from '../fs/contract.js'
 import { byteLength } from './generation.js'
+import { commitRatio, retentionOptions } from './retention.js'
+import { reasoningEfforts } from '../model-config.js'
+import type { ReasoningEffort } from '../model-config.js'
 
 export function invalid(message: string): never {
   throw new ApiError(400, 'INVALID_ARGUMENT', message)
@@ -87,7 +90,7 @@ export function eventTags(value: unknown, key: 'event' | 'events'): string[] | u
   return parseTags(tags)
 }
 
-export function commitOptions(body: Record<string, unknown>) {
+export function commitOptions(body: Record<string, unknown>, turnBudget = false) {
   noTelemetry(body.telemetry)
   const tags = eventTags(body.extraction_metadata, 'event')
   const keep = body.keep_recent_count === undefined ? 0 : body.keep_recent_count
@@ -100,11 +103,20 @@ export function commitOptions(body: Record<string, unknown>) {
     invalid('enable_working_memory must be a boolean or null.')
   }
   if (reset && (keep !== 0 || body.retention_mode != null)) invalid('reset_context requires keep_recent_count=0 and no retention_mode.')
-  if ([
-    'memory_policy', 'retention_mode', 'keep_recent_turn_count', 'retained_message_token_budget', 'min_raw_tail_steps',
-    'session_window_context', 'summary_token_ratio', 'retained_token_ratio', 'reasoning_effort',
-  ].some(name => body[name] != null)) unsupported('Turn-budget and model-specific retention options are not available on Workers.')
-  return { keep, reset, tags, working: body.enable_working_memory as boolean | null | undefined }
+  if (body.memory_policy != null) unsupported('Use the owner policy saved at session creation.')
+  const effort=body.reasoning_effort as ReasoningEffort|null|undefined
+  if (effort!=null && !turnBudget) unsupported('Reasoning options require the session runtime mount.')
+  if (effort!=null && !reasoningEfforts.includes(effort)) invalid('Invalid reasoning_effort.')
+  const hasWindow = ['session_window_context','summary_token_ratio','retained_token_ratio'].some(key=>body[key]!=null)
+  if (hasWindow && !turnBudget) unsupported('Model window budgets require the session runtime mount.')
+  const window = body.session_window_context
+  if (window!=null && (typeof window!=='number' || !Number.isSafeInteger(window) || window<1 || window>1_000_000)) invalid('Invalid session_window_context.')
+  const summary = commitRatio(body.summary_token_ratio,'summary_token_ratio')
+  if (summary!==undefined && window==null) invalid('summary_token_ratio requires session_window_context.')
+  if (body.retained_token_ratio!=null && body.retention_mode!=='turn_budget') invalid('retained_token_ratio requires turn_budget.')
+  return { keep, reset, tags, working: body.enable_working_memory as boolean | null | undefined,
+    reasoningEffort:effort??undefined, retention: retentionOptions(body, turnBudget),
+    summaryTokens:summary===undefined?undefined:Math.max(1,Math.min(512,Math.floor(Number(window)*summary))) }
 }
 
 function string(value: unknown, field: string): string {

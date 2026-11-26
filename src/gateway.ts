@@ -5,7 +5,7 @@ import { GatewayError, body, bytes, digest, fields, forbidden, gatewayError, gat
 import { publishTurn } from './gateway/capture.js'
 import { disabledKeys, inspectKey, invalidGatewayKey, issueKey, keySpec, listKeys, resetKeyCapture, revokeKey } from './gateway/keys.js'
 import { parseProfile, resolveProfile } from './gateway/profiles.js'
-import { countTokens, generate, generationConfigured, isBound, listModels, parseUpstream, resolveTarget, routedModel, streamSource,
+import { canStream, countTokens, generate, generationConfigured, isBound, listModels, nativeRoute, parseUpstream, resolveTarget, routedModel, streamSource,
   viewUpstream } from './gateway/providers.js'
 import type { GatewayContext } from './gateway/providers.js'
 import { augment, recallNote } from './gateway/recall.js'
@@ -16,6 +16,8 @@ import type { Metrics } from './gateway/store.js'
 import { checkStreamAdmission, invalidateGatewayRouting, streamTurn, withCancellableGatewayCall } from './gateway/stream.js'
 import { modelEndpoint, normalizeTurn, protocolFor, render, renderRich } from './gateway/wire.js'
 import type { Turn } from './gateway/wire.js'
+import { emptyNativeInput } from './gateway/native-operator.js'
+import { consentRead, localReadHeader, localReadUnavailable } from './gateway/local-read.js'
 
 export type { GatewayContext, GatewayProvider } from './gateway/providers.js'
 export type { GatewayStreamActor } from './gateway/stream.js'
@@ -69,7 +71,7 @@ async function manage(request: Request, url: URL, parts: string[], ctx: GatewayC
           can_issue_for_others: !!keyAdmin && ctx.caller.role === 'admin', role: ctx.caller.role, account_id: ctx.caller.accountId, user_id: ctx.caller.userId,
           warnings: available ? [] : ['generation_unavailable'],
           edge: { version: gatewayVersion, generation_configured: available, dedicated_gateway_keys: !!keyAdmin, tools: false,
-             streaming: upstreamList(ctx).some(rule => rule.enabled && rule.models.some(model => !!streamSource(ctx, { rule, model }))),
+             streaming: upstreamList(ctx).some(rule => rule.enabled && rule.models.some(model => canStream(ctx, { rule, model }))),
             capture: true, recall: ctx.hasEmbedding !== false, logs: ctx.auditEnabled !== false } })
       case 'guides':
         requireMethod(method, 'GET')
@@ -139,7 +141,7 @@ async function manage(request: Request, url: URL, parts: string[], ctx: GatewayC
     fields(parsed, ['model'], invalidConfig)
     const rule = upstreamList(ctx).find(item => item.id === identifier)
     if (!rule) throw missing()
-    if (!isBound(ctx, rule.binding)) throw unconfigured()
+    if (!isBound(ctx, rule.binding, rule.protocol)) throw unconfigured()
     if (parsed.model === undefined) throw unsupported('This binding has no connection-only probe. Specify a model for a bounded generation test.', 'connection_test_unavailable')
     if (!modelId(parsed.model)) throw invalidConfig('Invalid model identifier.')
     const model = routedModel(ctx, rule, parsed.model)
@@ -147,11 +149,18 @@ async function manage(request: Request, url: URL, parts: string[], ctx: GatewayC
     if (!rule.enabled) throw new GatewayError(409, 'upstream_disabled', 'Enable this route before testing it.')
     const admission = enter(ctx, null), configStillCurrent = configGuard(ctx, epoch(ctx))
     try {
-      const guard = () => { admission.guard(); configStillCurrent() }
+      const guard = () => { admission.guard(); configStillCurrent(); ctx.assertGatewayMount?.() }
       await ctx.reauthorize?.()
       guard()
       reserve(ctx, 256)
-      await generate(ctx, { rule, model }, [{ role: 'user', content: 'Reply with the single word ready.' }], 16, guard)
+      const messages = [{ role: 'user' as const, content: 'Reply with the single word ready.' }]
+      const native = nativeRoute(ctx, rule.binding, rule.protocol)
+      if (native) {
+        const reply = await native.generate(model, emptyNativeInput(messages, guard), 16, request.signal, guard)
+        await ctx.reauthorize?.()
+        guard()
+        if (reply.finish !== 'stop') throw new GatewayError(502, 'upstream_error', 'The generation binding did not finish the test.')
+      } else await generate(ctx, { rule, model }, messages, 16, guard)
       return json({ ok: true, kind: 'model', status: 200, reason: 'passed', url: viewUpstream(ctx, rule).base_url })
     } finally { admission.done() }
   }
@@ -232,8 +241,10 @@ async function modelRoute(request: Request, endpoint: string, ctx: GatewayContex
   let plain: Turn | undefined, refusal: GatewayError | undefined
   try { plain = normalizeTurn(raw, kind) }
   catch (error) {
-    if (!(error instanceof GatewayError) || !['tools_unsupported', 'non_text_input_unsupported'].includes(error.code) ||
-        binding || kind === 'count_tokens' || !modelId(raw.model) || !ctx.gatewayProvider?.rich || !ctx.assertGatewayMount) throw error
+    const candidate = nativeRoute(ctx, 'operator', protocolFor(kind))
+    if (!(error instanceof GatewayError) || !['tools_unsupported', 'non_text_input_unsupported', 'native_option_unsupported', 'audio_output_unsupported'].includes(error.code) ||
+        binding || !modelId(raw.model) || !ctx.assertGatewayMount ||
+        (kind === 'count_tokens' ? !candidate?.count : !(ctx.gatewayProvider?.rich || candidate))) throw error
     refusal = error
   }
   const model = plain?.model ?? raw.model as string
@@ -244,15 +255,30 @@ async function modelRoute(request: Request, endpoint: string, ctx: GatewayContex
   const protocol = protocolFor(kind)
   const target = resolveTarget(ctx, upstreams(), protocol, model)
   // Added modalities cannot create a route or modify the winner's capabilities.
-  const adapter = !plain && target.rule.binding === 'operator' && ctx.gatewayProvider?.rich?.model === target.model ? ctx.gatewayProvider.rich : undefined
-  if (!plain && !adapter) throw refusal!
-  const turn = plain ?? normalizeTurn(raw, kind, adapter!.capabilities, !!ctx.readPrivateGatewayAttachment)
+  const native = nativeRoute(ctx, target.rule.binding, protocol) ?? undefined
+  const adapter = target.rule.binding === 'operator' ? native ??
+    (ctx.gatewayProvider?.rich?.model === target.model ? ctx.gatewayProvider.rich : undefined) : undefined
+  if (!plain && (!adapter || kind === 'count_tokens' && !native?.count)) throw refusal!
+  let turn = plain
+  if (native && (!plain || kind !== 'count_tokens')) {
+    try { turn = normalizeTurn(raw, kind, undefined, false, native.capabilities) } catch (error) {
+      if (!(error instanceof GatewayError) || !['tools_unsupported', 'non_text_input_unsupported'].includes(error.code)) throw error
+    }
+  }
+  turn ??= normalizeTurn(raw, kind, adapter!.capabilities, !!ctx.readPrivateGatewayAttachment, native?.capabilities)
   const source = turn.stream && !turn.rich ? streamSource(ctx, target) : undefined
-  if (turn.stream && !(turn.rich ? adapter?.stream : source)) {
+  if (turn.stream && !(turn.rich ? adapter?.stream : native?.stream || source)) {
     throw unsupported('The selected model binding has no native streaming contract.', 'streaming_unavailable')
   }
-  if (turn.stream || turn.rich) checkStreamAdmission(ctx.storage, metrics.request_id, ctx.caller)
+  if (turn.stream || turn.rich || native) checkStreamAdmission(ctx.storage, metrics.request_id, ctx.caller)
   const { policy, keys, provenance } = currentProfile()
+  const consentUri = request.headers.get(localReadHeader)
+  if (consentUri !== null && (!native?.capabilities.has('local_read') || !ctx.loadDataAuthority || kind === 'count_tokens' || turn.rich ||
+      turn.options?.format || turn.response?.store || turn.response?.previous_response_id || policy.capture || policy.profile || policy.recall ||
+      raw.tools !== undefined || raw.tool_choice !== undefined || raw.parallel_tool_calls !== undefined)) throw localReadUnavailable()
+  if (turn.options?.format && (policy.profile || policy.recall || policy.capture)) {
+    throw unsupported('Structured output requires a profile without automatic context or capture.', 'rich_context_unsupported')
+  }
   if (turn.rich && (turn.response?.store || turn.response?.previous_response_id || policy.capture)) {
     throw unsupported('Inline media and client tool turns cannot use capture or retained Responses history.', 'rich_persistence_unsupported')
   }
@@ -268,12 +294,77 @@ async function modelRoute(request: Request, endpoint: string, ctx: GatewayContex
   metrics.protocol = protocol
   if (keys.length) metrics.context_override = keys
   const configStillCurrent = configGuard(ctx, epoch(ctx))
+  const localRead = consentUri !== null ? await consentRead(ctx, consentUri) : undefined
   const admission = enter(ctx, session === null ? null : `${ctx.caller.agentId}:${protocol}:${session}`)
   // The bound generation closure calls ctx.assertActive itself; don't recurse via that public field.
   const parentGuard = ctx.assertActive
   const lease = () => { admission.guard(); configStillCurrent(); parentGuard?.() }
   let transferred = false
   try {
+    if (localRead && native && !turn.rich) {
+      const guard = () => { lease(); localRead.check() }
+      const input = { ...emptyNativeInput(turn.messages, guard), rules: localRead.rules }
+      metrics.capture_status = 'disabled'
+      metrics.capture_reason = 'rich_turn_not_retained'
+      metrics.recall_reason = 'disabled'
+      // One small, hidden tool-selection call and one answer on the exact same binding.
+      const prepare = async (signal: AbortSignal) => {
+        await ctx.reauthorize?.()
+        signal.throwIfAborted(); guard()
+        const toolLimit = Math.min(turn.maxTokens, 256)
+        reserve(ctx, input.inputBytes + bytes(JSON.stringify(input.rules)) + toolLimit * 4)
+        metrics.upstream_attempted = true
+        const reply = await native.generate(target.model, input, toolLimit, signal, guard)
+        await ctx.reauthorize?.()
+        signal.throwIfAborted(); guard()
+        const next = { ...localRead.continue(input, reply), options: turn.options }
+        reserve(ctx, next.inputBytes + bytes(JSON.stringify(next.rules)) + turn.maxTokens * 4)
+        return next
+      }
+      if (turn.stream) {
+        const response = await streamTurn({ ctx, request, protocol, model: turn.model, note: '', response: turn.response,
+          includeUsage: turn.includeUsage, maxTokens: turn.maxTokens, metrics, guard, publish: async () => {}, external: true,
+          modelRevision: ctx.gatewayModelRevision, credentialRevision: ctx.gatewayCredentialRevision,
+          pieces: native.pieces({ rules: { tools: [] }, ids: new Set(), options: turn.options }),
+          source: async ({ signal }) => native.stream!(target.model, await prepare(signal!), turn.maxTokens, signal!, guard),
+          release() { if (admission.deleted()) metrics.error_reason = 'gateway_state_deleted'; admission.done(); recordLog() } })
+        transferred = true
+        deferLog()
+        return response
+      }
+      return await withCancellableGatewayCall(ctx, request, metrics.request_id, ctx.gatewayModelRevision, ctx.gatewayCredentialRevision, async signal => {
+        const started = Date.now(), next = await prepare(signal)
+        const reply = await native.generate(target.model, next, turn.maxTokens, signal, guard)
+        await ctx.reauthorize?.()
+        signal.throwIfAborted(); guard()
+        metrics.duration_ms = Date.now() - started
+        metrics.upstream_status = 200
+        if (reply.inputTokens !== null) metrics.input_tokens = reply.inputTokens
+        if (reply.outputTokens !== null) metrics.output_tokens = reply.outputTokens
+        return json(renderRich(protocol, turn.model, reply, metrics.request_id, turn.response),
+          { ...requestHeaders, 'x-openviking-recall': 'disabled', 'x-openviking-capture': 'disabled' })
+      })
+    }
+    if (kind === 'count_tokens' && native?.count) {
+      if (raw.tool_choice !== undefined || raw.stream !== undefined && raw.stream !== false) throw invalid('Invalid count_tokens input.')
+      const count = native.count
+      return await withCancellableGatewayCall(ctx, request, metrics.request_id, ctx.gatewayModelRevision, ctx.gatewayCredentialRevision, async signal => {
+        const guard = () => { signal.throwIfAborted(); lease() }
+        const input = turn.rich ? await within(8_000, () => turn.rich.resolve(ctx.readPrivateGatewayAttachment, guard),
+          () => new GatewayError(504, 'attachment_timeout', 'The private attachment did not become available in time.')) : emptyNativeInput(turn.messages, guard)
+        const current = () => { guard(); input.assertCurrent() }
+        await ctx.reauthorize?.()
+        current()
+        reserve(ctx, input.inputBytes)
+        metrics.upstream_attempted = true
+        const amount = await count(target.model, input, signal, current)
+        await ctx.reauthorize?.()
+        current()
+        metrics.input_tokens = amount
+        metrics.upstream_status = 200
+        return json({ input_tokens: amount }, requestHeaders)
+      })
+    }
     if (turn.rich && adapter) {
       const started = Date.now()
       const rich = turn.rich
@@ -282,12 +373,12 @@ async function modelRoute(request: Request, endpoint: string, ctx: GatewayContex
       metrics.capture_reason = 'rich_turn_not_retained'
       const prepare = (signal: AbortSignal) => {
         let live = true
-        return within(8_000, () => rich.resolve(ctx.readPrivateGatewayAttachment, () => {
+        return within(8_000, async () => ({ ...await rich.resolve(ctx.readPrivateGatewayAttachment, () => {
           signal.throwIfAborted()
           if (!live) throw new GatewayError(504, 'attachment_timeout', 'The private attachment did not become available in time.')
           lease()
           if (turn.stream) checkStreamAdmission(ctx.storage, metrics.request_id, ctx.caller)
-        }), () => {
+        }), options: turn.options, audio: turn.audio }), () => {
           live = false
           return new GatewayError(504, 'attachment_timeout', 'The private attachment did not become available in time.')
         })
@@ -305,7 +396,7 @@ async function modelRoute(request: Request, endpoint: string, ctx: GatewayContex
           source: ({ signal }) => {
             metrics.upstream_attempted = true
             return adapter.stream!(target.model, input, turn.maxTokens, signal!, guard)
-          }, external: true, textFilter: ctx.gatewayProvider!.streamTextFilter!(),
+           }, external: true, textFilter: native ? undefined : ctx.gatewayProvider!.streamTextFilter!(), pieces: native?.pieces(input),
           tools: { rules: input.rules, ids: input.ids, secret: adapter.secretGuard }, release() {
             if (admission.deleted()) metrics.error_reason = 'gateway_state_deleted'
             admission.done()
@@ -336,7 +427,7 @@ async function modelRoute(request: Request, endpoint: string, ctx: GatewayContex
     }
     if (turn.rich) throw refusal!
     if (kind === 'count_tokens') {
-      if (target.rule.binding !== 'operator' || !ctx.gatewayProvider?.countTokens) {
+      if (native || target.rule.binding !== 'operator' || !ctx.gatewayProvider?.countTokens) {
         throw unsupported('No exact input tokenizer is available for this binding.', 'token_count_unavailable')
       }
       reserve(ctx, turn.inputBytes)
@@ -365,12 +456,14 @@ async function modelRoute(request: Request, endpoint: string, ctx: GatewayContex
       return publishTurn(ctx, policy, { protocol, name: session, user: turn.userText,
         assistant: text, recallCost: inbound.spent }, metrics, activeGuard)
     }
-    if (source) {
+    if (source || (native?.stream && turn.stream)) {
       const external = target.rule.binding === 'operator'
+      const input = native && emptyNativeInput(inbound.input, guard, turn.options)
       const response = await streamTurn({ ctx, request, protocol, model: turn.model, note: recallNote(policy, metrics), response: turn.response,
         includeUsage: turn.includeUsage, maxTokens: turn.maxTokens, metrics, guard, publish, modelRevision: ctx.gatewayModelRevision,
-        source: options => source(inbound.input, options), external, credentialRevision: ctx.gatewayCredentialRevision,
-        textFilter: external ? ctx.gatewayProvider?.streamTextFilter?.() : undefined,
+        source: options => native ? native.stream!(target.model, input!, turn.maxTokens, options.signal!, guard) : source!(inbound.input, options),
+        external, credentialRevision: ctx.gatewayCredentialRevision, pieces: native?.pieces(input!),
+        textFilter: external && !native ? ctx.gatewayProvider?.streamTextFilter?.() : undefined,
         release() {
           if (admission.deleted()) metrics.error_reason = 'gateway_state_deleted'
           admission.done()
@@ -380,6 +473,26 @@ async function modelRoute(request: Request, endpoint: string, ctx: GatewayContex
       deferLog()
       return response
     }
+    if (native) return await withCancellableGatewayCall(ctx, request, metrics.request_id, ctx.gatewayModelRevision,
+      ctx.gatewayCredentialRevision, async signal => {
+        const current = () => { signal.throwIfAborted(); guard() }
+        const reply = await native.generate(target.model, emptyNativeInput(inbound.input, current, turn.options), turn.maxTokens, signal, current)
+        await ctx.reauthorize?.()
+        current()
+        metrics.duration_ms = Date.now() - started
+        metrics.upstream_status = 200
+        if (reply.inputTokens !== null) metrics.input_tokens = reply.inputTokens
+        if (reply.outputTokens !== null) metrics.output_tokens = reply.outputTokens
+        const rendered = renderRich(protocol, turn.model, reply, metrics.request_id, turn.response, recallNote(policy, metrics))
+        let capture = 'disabled'
+        if (reply.finish === 'stop') capture = await publish(reply.text, current, rendered)
+        else { metrics.capture_status = 'disabled'; metrics.capture_reason = 'provider_incomplete' }
+        await ctx.reauthorize?.()
+        current()
+        const headers = new Headers({ ...requestHeaders, 'x-openviking-recall': metrics.recall_reason ?? 'disabled', 'x-openviking-capture': capture })
+        if (metrics.openviking_session) headers.set('x-openviking-captured-session', metrics.openviking_session)
+        return json(rendered, headers)
+      })
     const reply = await generate(ctx, target, inbound.input, turn.maxTokens, guard)
     metrics.duration_ms = Date.now() - started
     metrics.upstream_status = 200

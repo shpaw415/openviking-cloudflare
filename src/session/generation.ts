@@ -50,10 +50,10 @@ export async function beforeDeadline<T>(start: () => Promise<T>, deadline: numbe
 }
 
 export async function generateText(ctx: WorkspaceContext, messages: GenerationMessage[], maxTokens: number,
-  maxBytes: number, deadline: number, signal?: AbortSignal): Promise<Generation> {
+  maxBytes: number, deadline: number, signal?: AbortSignal, reasoningEffort?: import('../model-config.js').ReasoningEffort): Promise<Generation> {
   const generate = requireGenerator(ctx)
   const result = await beforeDeadline(async () => {
-    try { return await generate(messages, { maxTokens }) }
+    try { return await generate(messages, { maxTokens,...(reasoningEffort!==undefined&&{reasoningEffort}) }) }
     catch (error) {
       if (error instanceof ApiError) throw error
       throw new ApiError(503, 'GENERATION_UNAVAILABLE', 'Text generation failed.')

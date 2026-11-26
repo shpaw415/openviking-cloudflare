@@ -3,14 +3,15 @@ import type { ModelMessage } from '../context.js'
 import { GatewayError, bytes, fields, invalid, maxInputBytes, maxMessages, record, unsupported } from './contract.js'
 import type { Protocol } from './contract.js'
 import { mediaReader } from './media.js'
-import type { Capability, ChatPart, MediaPart, ReadGatewayAttachment } from './media.js'
+import type { AudioRequest, Capability, ResolvedPart, MediaPart, ReadGatewayAttachment } from './media.js'
+import type { NativeOptions } from './native-options.js'
 import { badHistory, callId, chatCall, maxCalls, maxToolPayload, readCall, toolRules, toolsUnsupported, wellFormed } from './tool-dto.js'
 import type { Call, ToolRules } from './tool-dto.js'
 
-type ToolMessage = { role: 'tool'; tool_call_id: string; content: string }
+type ToolMessage = { role: 'tool'; tool_call_id: string; content: string; nativeResult?: { text: string; isError?: boolean } }
 type CallMessage = { role: 'assistant'; content: string | null; tool_calls: ReturnType<typeof chatCall>[] }
-type ChatMessage<T> = ModelMessage | { role: 'user'; content: T[] } | ToolMessage | CallMessage
-export type RichInput = { messages: ChatMessage<ChatPart>[]; rules: ToolRules; ids: ReadonlySet<string>; inputBytes: number; assertCurrent(): void }
+type ChatMessage<T> = (ModelMessage & { gatewayRole?: 'instructions' | 'developer' }) | { role: 'user'; content: T[] } | ToolMessage | CallMessage
+export type RichInput = { messages: ChatMessage<ResolvedPart>[]; rules: ToolRules; ids: ReadonlySet<string>; inputBytes: number; options?: NativeOptions; audio?: AudioRequest; assertCurrent(): void }
 export type RichHistory = { resolve(read: ReadGatewayAttachment | undefined, guard: () => void): Promise<RichInput> }
 
 export function inputText(value: unknown): string {
@@ -19,7 +20,7 @@ export function inputText(value: unknown): string {
 }
 
 export function richHistory(raw: Record<string, unknown>, protocol: Protocol, input: unknown, system: string | undefined,
-  capabilities: ReadonlySet<Capability>, localReferences: boolean): RichHistory {
+  capabilities: ReadonlySet<Capability>, localReferences: boolean, native = false): RichHistory {
   const rules = toolRules(raw, protocol, capabilities.has('tools'))
   const media = mediaReader(protocol, capabilities, localReferences)
   const messages: ChatMessage<MediaPart>[] = []
@@ -79,18 +80,18 @@ export function richHistory(raw: Record<string, unknown>, protocol: Protocol, in
     const length = bytes(content)
     if (length > 8 * 1024) throw new GatewayError(413, 'tool_limit', 'A function result exceeds its payload budget.')
     payload(length)
-    add({ role: 'tool', tool_call_id: id, content })
+    add({ role: 'tool', tool_call_id: id, content, ...(native && { nativeResult: { text: value, isError } }) })
     canCall = awaiting.size === 0
   }
   function ordinary(entry: Record<string, unknown>, role: ModelMessage['role']) {
     if (awaiting.size) throw badHistory()
     const content = readContent(entry.content, role)
     if (role === 'user' && Array.isArray(content)) add({ role, content })
-    else if (typeof content === 'string') add({ role, content })
+    else if (typeof content === 'string') add({ role, content, ...(native && entry.role === 'developer' && { gatewayRole: 'developer' }) })
     else throw badHistory()
     canCall = role === 'user'
   }
-  if (system !== undefined) add({ role: 'system', content: text(system) })
+  if (system !== undefined) add({ role: 'system', content: text(system), ...(native && protocol === 'responses' && { gatewayRole: 'instructions' }) })
   const entries = typeof input === 'string' && protocol === 'responses' ? [{ role: 'user', content: input }] : input
   if (!Array.isArray(entries) || !entries.length || entries.length > maxMessages) throw invalid('Expected 1–48 messages or input items.')
   const rows = entries.map(item => record(item))
@@ -187,10 +188,10 @@ export function richHistory(raw: Record<string, unknown>, protocol: Protocol, in
     const ready: RichInput['messages'] = []
     for (const entry of messages) {
       if (entry.role === 'user' && Array.isArray(entry.content)) {
-        const parts: ChatPart[] = []
+        const parts: ResolvedPart[] = []
         for (const part of entry.content) parts.push(part.type === 'attachment' ? await media.resolve(part, read, guard) : part)
         ready.push({ role: 'user', content: parts })
-      } else ready.push(entry as ChatMessage<ChatPart>)
+      } else ready.push(entry as ChatMessage<ResolvedPart>)
     }
     const outboundBytes = bytes(JSON.stringify(ready)) + bytes(JSON.stringify(rules))
     if (outboundBytes > 288 * 1024) throw new GatewayError(413, 'body_too_large', 'The projected Gateway turn exceeds its wire budget.')

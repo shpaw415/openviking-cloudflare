@@ -1,4 +1,4 @@
-# Sauvegarde applicative d’instance Edge v1
+# Sauvegarde applicative d’instance Edge
 
 Cette sauvegarde est distincte du [backup par compte](ARCHIVES.md) et d'un dump
 Cloudflare/SQLite. Elle compose les archives Edge-v1 des Workspaces de **tous**
@@ -57,8 +57,9 @@ fixes), sans router de trafic ni appeler `/ready` avant de monter `standby`.
 `openviking-instance-backup.zip`, ZIP32 STORE. `capture()` reste le profil
 `edge-v1` (version 1, au plus 12 090 112 octets) et garde son refus des espaces
 avec des lignes de pièces Gateway. L’appel privé
-`capture('edge-v1-attachments')` utilise la version 2 ci-dessous. Les anciens
-paquets v1 et leurs journaux restent lisibles; aucun changement au backup F3
+`capture('edge-v1-attachments')` utilise la version 2 ci-dessous;
+`capture('edge-v1-portable-state')` sélectionne explicitement la version 3.
+Les anciens paquets v1/v2 et leurs journaux restent lisibles; aucun changement au backup F3
 par compte ni aux formats intérieurs OVPack v3 et Edge-v1.
 
 | Membre | Contenu |
@@ -92,13 +93,63 @@ aucun octet d’un compte voisin n’est lu. Les tickets, staging et révisions
 source sont absents; l’insertion recrée une révision à la destination et le
 téléchargement exige un nouveau ticket via le Gateway normalement autorisé.
 
-**Refus explicites :** pièces Gateway dans le profil v1 (`INSTANCE_BACKUP_ATTACHMENTS_UNSUPPORTED`),
-pièces hors siège, quota, type ou intégrité en v2, révisions/préférences de
-snapshots, autres montes dont `agent`, watches,
-définitions/jobs Compile, outils MCP, configurations/états Gateway applicatifs,
-travail en vol, templates Control personnalisés, et domaines non portables F3
-(privacy, bots, sessions non textuelles/autres agents, archives sémantiques,
-skills à capacités, etc.). Les sorties temporaires de protocole, tickets/staging,
+**État portable v3.** L'inventaire porte `format_version: 3`, `profile:
+edge-v1-portable-state`. Chaque compte contient exactement `workspace.zip`
+(le membre v2 inchangé, avec les mêmes limites et échéances de pièces) et
+`portable-state.json` (≤ 512 Kio, y compris les blobs texte). Le sceau de
+membre est séparé (`v3:portable-state`) et couvre les deux membres. Le JSON
+contient `kind: openviking.edge-portable-state`, `version: 1`,
+`shared_history: admin-only`, `ignore`, `commits`, `heads`, `blobs`, `compile`.
+
+- La préférence `snapshot/ignore` est restaurée par compte, sans créer de
+  fichier de travail. Les OID de révision, parents, têtes, auteurs, dates, arbres
+  et octets des blobs sont conservés. Un fichier historique n'a pas besoin
+  d'exister en live; il doit garder une URI texte canonique dans sa même
+  monte portable. Parents, têtes et blobs doivent être présents dans la même
+  monte, sans cycle, doublon ni objet orphelin; les empreintes arbre/blob sont
+  revérifiées. Limites : 512 révisions, 96 par auteur, 512 têtes, 2 048 blobs,
+  256 fichiers/2 Mio par arbre, ignore ≤ 64 Kio. Les grandes histoires sont
+  refusées, jamais tronquées.
+- Les incarnations historiques sont des alias sans identifiant source. Les
+  historiques partagés sont **réservés aux administrateurs du compte**, y
+  compris leurs métadonnées, branches vides et accès par préfixe d'OID. Le
+  plafond transféré est zéro pour tout non-admin; aucun ACL ni groupe
+  historique n'est copié. Les nouveaux grants rendus à des objets live à la
+   destination ne rouvrent pas ces révisions. `snapshot/commit` sur la monte
+   partagée est réservé aux administrateurs, y compris sur `main` et dans un
+   compte sans sauvegarde restaurée. Pour un membre, le refus `403` précède
+   toute lecture de tête et ne dépend pas de l'existence de la branche. Cette
+   règle ne change ni les droits sur les fichiers live, ni les contrôles
+   de `snapshot/restore` (qui ne crée pas de branche). L'historique privé garde sa monte
+  propriétaire; un premier commit après reprise peut constater la nouvelle
+  incarnation d'un fichier même si ses octets sont restés identiques.
+- Compile porte au plus 256 définitions privées, au même siège provisionné,
+  jamais exécutées ni planifiées, avec `auto_update=false`, sans échéancier,
+  instruction libre, args ou skill installé. Seulement une recette système
+  embarquée, sources et cible privées présentes dans le membre, cible marquée
+  `compile_target=true` et sans chevauchement avec une autre définition.
+  Aucun job, run, planification, credential, signature de config source ni
+  provenance d'artefact n'est transféré. On peut lire/modifier une définition
+  par les API normales après release; une exécution ultérieure nécessite une
+  nouvelle demande et les gardes Compile ordinaires.
+
+**Inventaire des refus.** v1 refuse `ov_edge_gateway_attachment`; v1/v2
+refusent `ov_edge_snapshot_{commit,head,blob,ignore,portable_hidden}` et
+`ov_edge_compile_config` s'ils ne sont pas vides. v3 refuse toute ligne de
+`ov_edge_compile_run` ou `ov_edge_compile_schedule`, même dormante, et les
+définitions hors sous-ensemble. Tous profils refusent un échéancier actif,
+`ov_watches`, `ov_edge_compiled_rule`, `ov_edge_compile_artifact`,
+`ov_gateway_objects`, `ov_gateway_state`, `ov_edge_mcp_registry`, les montes
+`ov_edge_fs_entry` hors `shared`/utilisateur et `ov_jobs` pending/running/cancelling.
+Les gardes héritées refusent `privacy_targets`, les réservations actives
+`ov_edge_fs_pending` rattachées à un job, `ov_session_flights`,
+`ov_session_semantic_archives`, `ov_session_tool_results`,
+`ov_session_auto_commit` avec politique, `ov_bot_threads`, les sessions et
+skills hors profil Edge et `ov_control_templates` côté source. La destination
+refuse tout schéma applicatif Workspace préexistant et toute ligne dans les
+tables Control énumérées dans `assertColdControl` (`instance-settings.ts`).
+Les pièces hors siège ou hors type/TTL/quota restent refusées. Les sorties
+temporaires de protocole, tickets/staging,
 historiques techniques/audit/usage, compteurs, index/vecteurs dérivés, crédits
 d'auth, registres et grants OAuth, secrets et paramètres de fournisseurs **ne
 sont pas des domaines du contrat**. Aucun octet de fichier OS, page SQLite,
@@ -145,13 +196,13 @@ préserver les preuves et préparer un nouveau secours/une nouvelle paire avec
 l'opérateur. Pas de remise à zéro du journal, pas de réutilisation comme cible de
 récupération du même annuaire. La bascule réseau/DNS demeure hors contrat.
 
-Pour v2, aucune alarme n’est armée à blanc. La prochaine échéance absolue est
+Pour v2/v3, aucune alarme n’est armée à blanc. La prochaine échéance absolue est
 armée sur l’alarme Workspace **existante** avant la transaction; pièces, autres
 domaines et reçu sont ensuite commis ensemble. Un acquittement perdu relit
 le même reçu et réarme sans recréer de révision. Une échéance atteinte avant
 `release` vaut `INSTANCE_BACKUP_ATTACHMENT_EXPIRED` (409), `status` expose
 `phase: expired`; aucune mise en service partielle ni prolongation du TTL.
 Le secours scellé ne consomme aucun travail d’application : seule la purge
-du compte détenteur d’un reçu v2 est autorisée dans sa branche d’alarme fermée.
+du compte détenteur d’un reçu avec pièces est autorisée dans sa branche d’alarme fermée.
 Une fois publié, le statut reste historique et l’expiration ordinaire des
 pièces continue; les tickets et paramètres du Gateway ne sont pas importés.

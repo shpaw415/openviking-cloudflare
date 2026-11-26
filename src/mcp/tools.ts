@@ -28,9 +28,12 @@ function define(name: string, description: string, properties: Record<string, Pr
 
 export function toolCatalog(mutations = false): Tool[] {
   return [...defs.values()].map(({ tool }) => tool).filter(tool => mutations || tool.annotations.readOnlyHint)
+    .map(tool => tool.name === 'search' && mutations ? { ...tool,
+      annotations: { ...tool.annotations, readOnlyHint: false, idempotentHint: false } } : tool)
 }
 
 export async function callTool(ctx: McpContext, name: string, args: Data, allowMutation = ctx.mcpMode === 'read-write'): Promise<ToolResult> {
+  ctx.requestSignal?.throwIfAborted()
   const item = defs.get(name)
   if (!item) throw new ApiError(404, 'NOT_FOUND', 'This tool is not available on the edge.')
   if (!item.tool.annotations.readOnlyHint && (!allowMutation || ctx.mcpMode !== 'read-write')) {
@@ -38,6 +41,9 @@ export async function callTool(ctx: McpContext, name: string, args: Data, allowM
   }
   onlyKeys(args, Object.keys(item.tool.inputSchema.properties).join(' '))
   if (item.tool.inputSchema.required.some(key => !Object.hasOwn(args, key))) invalid('A required tool argument is missing.')
+  if (name === 'search' && int(args.dedup_turns ?? undefined, 'dedup_turns', 0, 0, 100) > 0 && (!allowMutation || ctx.mcpMode !== 'read-write')) {
+    throw new ApiError(403, 'PERMISSION_DENIED', 'MCP recall ledger updates require read-write policy.')
+  }
   return item.run(ctx, args)
 }
 
@@ -135,25 +141,50 @@ type SearchResult = { memories: Hit[]; resources: Hit[]; skills: Hit[] }
 
 function retrieval(search: boolean): Run {
   return async (ctx, args) => {
-    const { min_score, search_type, mode, session_id, ...common } = args
+    const { min_score, search_type, mode, session_id, detail_by_category, ...common } = args
     if (search && (search_type != null && search_type !== 'semantic' || mode != null && mode !== 'list' || session_id)) {
-      unsupported('Only semantic results in list mode without a session are provided by MCP on the edge.')
+      if (!ctx.mcpLive || !ctx.prepareMcpSearch) unsupported('Advanced MCP search is not enabled by the operator.')
+      const scoped = await ctx.prepareMcpSearch()
+      let finish: (() => void) | undefined
+      scoped.deferSearchPublication = callback => { finish = callback }
+      if (args.target_uri != null) common.target_uri = str(args.target_uri, 'target_uri')
+      const { value } = await filesystem<SearchResult | Data>(scoped, 'POST /api/v1/search/search', {
+        ...common, search_type, mode, session_id, score_threshold: min_score,
+        ...(detail_by_category != null && { detail: asObject(detail_by_category, 'detail_by_category') }),
+        ...(args.rewrite === 'off' && { rewrite: false }),
+      })
+      const formatted = mode === 'context' ? toolResult(value as Data) : formatSearch(value as SearchResult)
+      ctx.publishMcpSearch = () => {
+        ctx.requestSignal?.throwIfAborted()
+        scoped.assertActive?.()
+        scoped.dataAuthority?.assertCurrent()
+        finish?.()
+      }
+      return formatted
     }
+    if (detail_by_category != null) invalid('detail_by_category requires context mode.')
     if (args.target_uri != null) common.target_uri = str(args.target_uri, 'target_uri')
     const { value } = await filesystem<SearchResult>(ctx, search ? 'POST /api/v1/search/search' : 'POST /api/v1/search/find', {
       ...common, score_threshold: min_score ?? (search ? undefined : 0.35),
     })
+    return formatSearch(value)
+  }
+}
+
+function formatSearch(value: SearchResult): ToolResult {
     const hits = [...value.memories, ...value.resources, ...value.skills].sort((a, b) => b.score - a.score)
     if (!hits.length) return toolResult('No matching context found.')
     const text = hits.map(hit => `- [${hit.context_type} ${Math.round(hit.score * 100)}%] ${hit.uri}${tagText(hit.tags)}\n    ${hit.abstract}${
       hit.content !== undefined ? `\n\n    ${hit.content}` : ''}`)
     return toolResult(`Found ${hits.length} item(s):\n\n${text.join('\n')}`)
-  }
 }
 
 define('find', 'Find ranked Viking text by similarity without a session.', searchProperties, ['query'], retrieval(false))
-define('search', 'Search readable Viking text in semantic list mode; no session, model tools, or external calls from stored nodes.', {
+define('search', 'Search authorized Viking text. Operator-mounted context search reuses Data budgets and authority. Positive dedup_turns updates the recall ledger and requires read-write policy.', {
   ...searchProperties, search_type: string, mode: string, session_id: string,
+  query_expansion: string, max_tokens: integer, quotas: object, purpose: string, detail: string,
+  detail_by_category: object, dedup_turns: integer, exclude_uris: array(string), peer_scope: string,
+  other_peer_penalty: number, rewrite: string, rewrite_max_bullets: integer,
 }, ['query'], retrieval(true))
 
 define('health', 'Check the authenticated workspace SQLite runtime.', {}, [], ctx => {
@@ -247,21 +278,23 @@ define('forget', 'Delete an exact Viking URI. Confirm with the user before sendi
   return toolResult(`Deleted: ${path.uri}`)
 }, false)
 
-define('add_resource', 'Import a staged UTF-8 upload from the same identity. No paths, remote sources, or watches.', {
+define('add_resource', 'Import the same identity\'s staged upload or an operator-approved mounted source. No arbitrary network destinations.', {
   temp_file_id: string, to: string, parent: string, description: string, processing_mode: string,
   tags: array(string), tag_mode: string, args: object, acl: object, path: string, watch_interval: number, add_type: string,
 }, [], async (ctx, args) => {
   const { path, watch_interval, add_type, description, to, parent, ...upload } = args
-  if (path != null && path !== '' || add_type != null && add_type !== '' || watch_interval != null && watch_interval !== 0) {
+  const remote = path != null && path !== '' || add_type != null && add_type !== '' || watch_interval != null && watch_interval !== 0
+  if (remote && !ctx.mcpLive) {
     unsupported('The MCP edge can only import an authenticated, staged text upload by temp_file_id.')
   }
   const explicitTo = str(to ?? undefined, 'to', '')
   const explicitParent = str(parent ?? undefined, 'parent', '')
-  if (!upload.temp_file_id) invalid('Supply a temp_file_id obtained from the authenticated upload endpoint.')
+  if (!remote && !upload.temp_file_id) invalid('Supply a temp_file_id obtained from the authenticated upload endpoint.')
   // If visibility has not been chosen, use the caller's private root rather than implicitly publishing to the tenant.
   const target = explicitTo ? explicitParent : explicitParent || addLocations(ctx).resource_uri || 'viking://~/resources'
   const result = await filesystem<{ root_uri: string; warnings?: string[] }>(ctx, 'POST /api/v1/resources', {
     ...upload, ...(explicitTo && { to: explicitTo }), ...(target && { parent: target }),
+    ...(remote && { path, add_type, watch_interval }),
     reason: str(description ?? undefined, 'description', '', 512), create_parent: !!explicitParent, wait: true,
   })
   return toolResult(`Resource added: ${result.value.root_uri}${result.value.warnings?.length ? `\n${result.value.warnings.join(' ')}` : ''}`)

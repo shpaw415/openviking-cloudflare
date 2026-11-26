@@ -8,6 +8,8 @@ import type { Generation } from './generation.js'
 import { estimateText, invalid, quota, userUriPart } from './protocol.js'
 import type { encodeMessages, StoredMessage } from './protocol.js'
 import { autoState, initAutoPolicy } from './auto-policy.js'
+import { activeCheckpoint, initRetention, retentionState } from './retention.js'
+import { initIdle, lastIdleAccepted } from './idle.js'
 
 const accountQuota = { sessions: 2_048, messages: 40_000, bytes: 32 * 1024 * 1024 }
 const userQuota = { sessions: 512, messages: 12_000, bytes: 12 * 1024 * 1024 }
@@ -88,6 +90,8 @@ export function initStore({ sql }: WorkspaceContext): void {
       REFERENCES ov_session_semantic_archives (${sessionColumns},archive_no) ON DELETE CASCADE
   ) WITHOUT ROWID`)
   initAutoPolicy(sql)
+  initIdle(sql)
+  initRetention(sql)
 }
 
 export function sessionId(value: unknown): string {
@@ -210,8 +214,8 @@ export function sessionDetail(sql: SqlStorage, key: SessionKey, s: SessionRow) {
     llm_token_usage: { prompt_tokens: usage?.input ?? 0, completion_tokens: usage?.output ?? 0,
       total_tokens: (usage?.input ?? 0) + (usage?.output ?? 0), unknown_calls: usage?.unknown_calls ?? 0 },
     embedding_token_usage: { total_tokens: null },
-    retention_mode: '', keep_recent_turn_count: 0, retained_message_token_budget: 0, min_raw_tail_steps: 1,
-    last_auto_commit_at: autoState(sql, key).last, last_idle_commit_accepted_at: '',
+    ...retentionState(sql, key),
+    last_auto_commit_at: autoState(sql, key).last, last_idle_commit_accepted_at: lastIdleAccepted(sql,key),
     ...sessionConfig(sql, key),
   }
 }
@@ -317,6 +321,11 @@ export function sessionContext(ctx: WorkspaceContext, key: SessionKey, budget: n
       bytes += size
     }
     messages.reverse()
+    const checkpoint=activeCheckpoint(sql,key)
+    if (checkpoint && messages.length===session.message_count && session.total_message_count-session.message_count+1===checkpoint.tail_start &&
+        tokens+checkpoint.tokens<=budget && bytes+byteLength(checkpoint.anchor)+1<=responseBytes) {
+      messages.unshift(JSON.parse(checkpoint.anchor));tokens+=checkpoint.tokens
+    }
   }
   const overview = budget > tokens ? latestOverview(sql, key) : ''
   const summaryTokens = estimateText(overview)

@@ -11,15 +11,16 @@ export const embeddingBatchLimit = 32
 export const edgeSearchDefaults = { limit: 10, score: 0.1, sessionContext: true } as const
 export const searchSessionLimits = { messages: 4, chars: 1024, perMessageChars: 256 } as const
 export const edgeSessionDefaults = { contextTokens: 128_000, extractionTokens: 1536, messageThreshold: 100, pendingTokenThreshold: 150_000 } as const
-const reasoningEfforts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'] as const
-type ReasoningEffort = typeof reasoningEfforts[number]
+export const reasoningEfforts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'] as const
+export type ReasoningEffort = typeof reasoningEfforts[number]
 
 type Selection = { provider: 'workers_ai'; model: string } | { provider: 'openai'; model: string; api_base: string }
 export type VlmConfig = Selection & { temperature?: number; max_tokens?: number; timeout?: number; reasoning_effort?: ReasoningEffort;
   top_p?: number; max_concurrent?: number }
 export type EmbeddingConfig = Selection & { dimension: number; input: 'text'; batch_size?: number; encoding_format?: 'float' | 'base64' }
 export type RerankConfig = { provider: 'openai'; model: string; api_base: string; timeout: number; threshold: number; max_input_tokens: number }
-export type RetrievalSettings = { enable_intent?: false; session_context_messages?: number; session_context_chars?: number }
+export type RetrievalSettings = { enable_intent?: false; session_context_messages?: number; session_context_chars?: number;
+  edge_context_rewrite?: boolean; recall_rewrite_timeout_s?: number; apply_rerank_to_context?: boolean }
 export type MemorySettings = {
   extraction_enabled?: boolean
   edge_context_token_budget?: number
@@ -53,7 +54,7 @@ function baseURL(value: unknown): string | undefined {
   return url.href.replace(/\/$/, '')
 }
 
-function providerKey(env: ModelEnv, base: string): string | undefined {
+export function providerKey(env: ModelEnv, base: string): string | undefined {
   const raw = env.OPENVIKING_EDGE_PROVIDERS
   if (!raw || raw.length > 16_384) return
   try {
@@ -206,7 +207,8 @@ export function patchModels(current: ModelSettings, body: Record<string, unknown
   }
   if (body.retrieval === null) delete result.retrieval
   else if (body.retrieval !== undefined) {
-    const value = object(body.retrieval, ['enable_intent', 'session_context_messages', 'session_context_chars'], 'retrieval')
+    const value = object(body.retrieval, ['enable_intent', 'session_context_messages', 'session_context_chars',
+      'edge_context_rewrite', 'recall_rewrite_timeout_s', 'apply_rerank_to_context'], 'retrieval')
     if (!Object.keys(value).length) throw bad('Use retrieval:null to reset retrieval settings.')
     if (value.enable_intent !== undefined && typeof value.enable_intent !== 'boolean') throw bad('retrieval.enable_intent must be a boolean.')
     if (value.enable_intent) throw unsupported('Edge does not run the upstream LLM intent planner. Use false or reset retrieval to null for local session context.')
@@ -216,7 +218,17 @@ export function patchModels(current: ModelSettings, body: Record<string, unknown
       bounded(value.session_context_messages, 1, searchSessionLimits.messages, 'retrieval.session_context_messages', true)
     if (value.session_context_chars !== undefined) retrieval.session_context_chars =
       bounded(value.session_context_chars, 64, searchSessionLimits.chars, 'retrieval.session_context_chars', true)
-    if (retrieval.enable_intent === false && Object.keys(retrieval).length > 1) {
+    if (value.edge_context_rewrite !== undefined) {
+      if (typeof value.edge_context_rewrite !== 'boolean') throw bad('retrieval.edge_context_rewrite must be a boolean.')
+      retrieval.edge_context_rewrite = value.edge_context_rewrite
+    }
+    if (value.apply_rerank_to_context !== undefined) {
+      if (typeof value.apply_rerank_to_context !== 'boolean') throw bad('retrieval.apply_rerank_to_context must be a boolean.')
+      retrieval.apply_rerank_to_context = value.apply_rerank_to_context
+    }
+    if (value.recall_rewrite_timeout_s !== undefined) retrieval.recall_rewrite_timeout_s =
+      bounded(value.recall_rewrite_timeout_s, 0.1, 3, 'retrieval.recall_rewrite_timeout_s', false)
+    if (retrieval.enable_intent === false && (retrieval.session_context_chars !== undefined || retrieval.session_context_messages !== undefined)) {
       throw bad('Session context budgets require local session context, not raw-query mode.')
     }
     result.retrieval = retrieval

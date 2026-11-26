@@ -3,6 +3,14 @@ import type { Caller, Env, WorkspaceContext } from './context.js'
 import { Filesystem } from './filesystem.js'
 import { ApiError, ok, readBytes, readJson } from './http.js'
 import { ensureAlarm } from './tasks.js'
+import { importWeb, providerCollection, providerMode, watchSelection, webImportMode, webPlanStamp } from './fs/web-import.js'
+import { mountDataAuthority, storedAuthority } from './data-authority.js'
+import type { AuthorityRevision } from './data-authority.js'
+import { isRecord } from './http.js'
+import { bool, onlyKeys, resourcePath, transport } from './fs/contract.js'
+import { subtreeRevision } from './fs/subtree.js'
+import type { ProviderMode } from './web/native-catalog.js'
+import { folderName, textName } from './web/catalog.js'
 
 const base='/api/v1/watches'
 const limit=48, maxText=96*1024, period=60_000
@@ -15,7 +23,16 @@ const unavailable=() => new ApiError(503,'SOURCE_UNAVAILABLE','This remote text 
 const missing=() => new ApiError(404,'NOT_FOUND','Watch task not found.')
 type Watch={id:string, account:string, user_id:string, agent:string, role:Caller['role'], credential:string, source:string, uri:string,
   cadence:number, reason:string, instruction:string, active:number, created:number, due:number|null, started:number|null, last_time:number|null,
-  last_task:string|null,last_status:string|null,last_error:string|null, rev:number}
+  last_task:string|null,last_status:string|null,last_error:string|null, rev:number, provider:string|null, owned_revision:string|null}
+type Provider = { mode: ProviderMode; stamp: string; authority: AuthorityRevision }
+function provider(row: Watch): Provider | undefined {
+  if (row.provider === null) return
+  const data: unknown = JSON.parse(row.provider)
+  if (!isRecord(data) || !providerMode(data.mode) || typeof data.stamp !== 'string') throw unavailable()
+  const authority = storedAuthority(data.authority)
+  if (!authority) throw unavailable()
+  return { mode: data.mode, stamp: data.stamp, authority }
+}
 
 function allowedURL(raw: unknown): string {
   if (typeof raw!=='string' || raw.length>1000) throw bad('Invalid registered text source.')
@@ -61,13 +78,18 @@ export function initWatches(sql:SqlStorage) {
     created INTEGER NOT NULL,due INTEGER,started INTEGER,last_time INTEGER,last_task TEXT,last_status TEXT,last_error TEXT,rev INTEGER NOT NULL,
     UNIQUE(account,user_id,agent,uri)
   )`)
+  const columns = sql.exec<{name:string}>('PRAGMA table_info(ov_watches)').toArray().map(col => col.name)
+  if (!columns.includes('provider')) sql.exec('ALTER TABLE ov_watches ADD COLUMN provider TEXT')
+  if (!columns.includes('owned_revision')) sql.exec('ALTER TABLE ov_watches ADD COLUMN owned_revision TEXT')
   sql.exec('CREATE INDEX IF NOT EXISTS ov_watches_due ON ov_watches(active,due)')
 }
 
 function rowById(ctx:WorkspaceContext,id:string) { return ctx.sql.exec<Watch>(`SELECT * FROM ov_watches WHERE ${own} AND id=?`,...ids(ctx.caller),id).toArray()[0] }
 function rowByUri(ctx:WorkspaceContext,uri:string) { return ctx.sql.exec<Watch>(`SELECT * FROM ov_watches WHERE ${own} AND uri=?`,...ids(ctx.caller),uri).toArray()[0] }
 function wire(r:Watch) {
-  return {task_id:r.id,path:r.source,source_type:'url',to_uri:r.uri,parent_uri:null,reason:r.reason,instruction:r.instruction,
+  const connector = provider(r)
+  return {task_id:r.id,path:r.source,source_type:connector ? connector.mode.startsWith('feishu-') ? 'feishu' : 'tos' : 'url',
+    to_uri:r.uri,parent_uri:null,reason:r.reason,instruction:r.instruction,
     watch_interval:r.cadence,build_index:true,summarize:false,processing_mode:'full',processor_kwargs:{},created_at:time(r.created),
     last_execution_time:time(r.last_time),last_task_id:r.last_task,last_status:r.last_status,last_error:r.last_error,next_execution_time:time(r.due),
     is_active:!!r.active,account_id:r.account,user_id:r.user_id,original_role:r.role}
@@ -82,21 +104,43 @@ function small(v:unknown,k:string) {
   return v
 }
 
-function destination(ctx:WorkspaceContext, raw:unknown):string {
+function destination(ctx:WorkspaceContext, raw:unknown, collection = false):string {
   if (typeof raw!=='string') throw bad('A destination URI is required.')
   const fs=new Filesystem(ctx), path=fs.path(raw)
-  if (!/\.(?:txt|md|json|csv)$/iu.test(path.uri)) throw bad('A text-file destination is required.')
+  if (collection ? !folderName.test(path.parts.at(-1) ?? '') : !/\.(?:txt|md|json|csv)$/iu.test(path.uri)) {
+    throw bad(collection ? 'A collection folder is required.' : 'A text-file destination is required.')
+  }
   return path.uri
 }
 
 export function prepareWatchRegistrar(ctx:WorkspaceContext, credential:string): NonNullable<WorkspaceContext['registerWatch']> {
   return async body => {
     const source=body.path??body.source_url
-    if (typeof source!=='string'||!/^https?:/iu.test(source)) return undefined
-    const url=allowedURL(source)
-    if (!ctx.remoteText?.allows(url)) throw unavailable()
-    const uri=destination(ctx,body.to_uri??body.uri)
+    const actualMode = webImportMode(body), native = providerMode(actualMode)
+    if (typeof source!=='string'||!native&&!/^https?:/iu.test(source)) return undefined
     const fs=new Filesystem(ctx)
+    const url=native ? source : allowedURL(source)
+    let authorized: Provider | undefined
+    let assertLease: (() => void) | undefined
+    if (native) {
+      onlyKeys(body, 'add_type path args to to_uri uri watch_interval processing_mode reason wait strict telemetry timeout')
+      transport(body)
+      bool(body.strict, 'strict')
+      if (!isRecord(body.args) || Object.keys(body.args).length !== 1 ||
+          (body.processing_mode !== undefined && body.processing_mode !== 'vectors_only') || !ctx.hasEmbedding) throw bad('Provider watches require indexed documents and no source overrides.')
+      const selection = watchSelection(fs, actualMode, source)
+      const authority = await mountDataAuthority(ctx)
+      authorized = { mode: actualMode, authority: authority.revision, stamp: await webPlanStamp(selection) }
+      assertLease = authority.assertCurrent
+    } else if (!ctx.remoteText?.allows(url)) throw unavailable()
+    const requested = [body.to, body.to_uri, body.uri].filter(value => value != null)
+    if (native && new Set(requested).size !== 1) throw bad('A provider watch needs one exact private destination.')
+    const uri=destination(ctx,native ? requested[0] : body.to_uri??body.uri, native && providerCollection(actualMode))
+    if (native) {
+      const path = fs.path(uri)
+      resourcePath(path)
+      if (path.parts[0] !== 'user' || (!providerCollection(actualMode) && !textName.test(path.parts.at(-1)!))) throw bad('A provider watch needs a private resource destination.')
+    }
     fs.checkWriteParent(uri)
     const cadence=interval(body.watch_interval)
     if (body.summarize===true || body.build_index===false || body.auth_state!=null || body.connector_states!=null) {
@@ -107,6 +151,8 @@ export function prepareWatchRegistrar(ctx:WorkspaceContext, credential:string): 
     const now=Date.now(), due=now+cadence*period
     await ensureAlarm(ctx.storage,due)
     const row=ctx.storage.transactionSync(()=>{
+      assertLease?.()
+      if (native && (fs.checkWriteParent(uri), subtreeRevision(fs, uri) !== null)) throw new ApiError(409,'ALREADY_EXISTS','A new provider watch needs an empty destination.')
       const old=rowByUri(ctx,uri)
       if(old) throw new ApiError(409,'ALREADY_EXISTS','A watch already owns this destination for the caller.')
       if (ctx.sql.exec<{n:number}>('SELECT COUNT(*) n FROM ov_watches WHERE account=?',ctx.caller.accountId).one().n>=limit ||
@@ -114,8 +160,9 @@ export function prepareWatchRegistrar(ctx:WorkspaceContext, credential:string): 
         throw new ApiError(429,'RATE_LIMITED','Too many registered watches.')
       }
       const id=crypto.randomUUID()
-      ctx.sql.exec(`INSERT INTO ov_watches(id,account,user_id,agent,role,credential,source,uri,cadence,reason,instruction,active,created,due,rev)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,1,?,?,1)`,id,...ids(ctx.caller),ctx.caller.role,credential,url,uri,cadence,reason,instruction,now,due)
+      ctx.sql.exec(`INSERT INTO ov_watches(id,account,user_id,agent,role,credential,source,uri,cadence,reason,instruction,active,created,due,rev,provider)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,1,?,?,1,?)`,id,...ids(ctx.caller),ctx.caller.role,credential,url,uri,cadence,reason,instruction,now,due,
+        authorized ? JSON.stringify(authorized) : null)
       return rowById(ctx,id)!
     })
     // A watch is a persisted schedule. Do not claim a file was fetched at registration.
@@ -138,15 +185,31 @@ async function ingest(ctx:WorkspaceContext,source:string,uri:string) {
 
 function get(ctx:WorkspaceContext,url:URL,id?:string) {
   const input=url.searchParams.get('to_uri')
-  const uri=input===null?undefined:destination(ctx,input)
+  const uri=input===null?undefined:ctxPath(ctx,input)
   if (!id&&!uri) throw bad('Provide a watch ID or to_uri.')
   if (id&&!idPattern.test(id)) throw missing()
   const row=id?rowById(ctx,id):rowByUri(ctx,uri!)
   if (!row) throw missing()
+  if (input !== null) destination(ctx,input, !!provider(row) && providerCollection(provider(row)!.mode))
   if (uri&&row.uri!==uri) throw bad('The watch ID and URI refer to different resources.')
   const fs=new Filesystem(ctx)
   try { fs.checkWriteParent(row.uri) } catch { throw missing() }
   return row
+}
+const ctxPath = (ctx:WorkspaceContext, uri:string) => new Filesystem(ctx).path(uri).uri
+
+async function authorizeProviderWatch(ctx:WorkspaceContext,row:Watch) {
+  const config = provider(row)
+  if (!config) {
+    if (!ctx.remoteText?.allows(row.source)) throw unavailable()
+    return
+  }
+  if (!ctx.hasEmbedding) throw unavailable()
+  await mountDataAuthority(ctx, config.authority)
+  const selection = watchSelection(new Filesystem(ctx), config.mode, row.source)
+  if (await webPlanStamp(selection) !== config.stamp) throw unavailable()
+  ctx.assertActive?.()
+  return config
 }
 
 export async function routeWatches(request:Request,url:URL,ctx:WorkspaceContext):Promise<Response|undefined> {
@@ -189,10 +252,12 @@ export async function routeWatches(request:Request,url:URL,ctx:WorkspaceContext)
   }
   const old=get(ctx,url,id)
   if(method==='POST'&&trigger) {
-    if(!ctx.remoteText?.allows(old.source)||!ctx.jobs)throw unavailable()
+    if(!ctx.jobs)throw unavailable()
+    await authorizeProviderWatch(ctx,old)
     const active=ctx.jobs.get(old.last_task??'')
     if(active&&['pending','running','cancelling'].includes(active.status))return ok({task_id:old.id,to_uri:old.uri,scheduled:true,reused:true})
     await ctx.jobs.enqueue('watch_sync',old.uri,{watch_id:old.id,rev:old.rev},{onAccepted(task){
+      if (old.provider) ctx.assertActive?.()
       const fresh=rowById(ctx,old.id)
       if(!fresh||fresh.rev!==old.rev) throw new ApiError(409,'CONFLICT','Watch changed before triggering.')
       const pending=ctx.jobs?.get(fresh.last_task??'')
@@ -211,11 +276,13 @@ export async function routeWatches(request:Request,url:URL,ctx:WorkspaceContext)
     const current=get(ctx,url,id)
     if(body.is_active!=null&&typeof body.is_active!=='boolean')throw bad('is_active must be boolean.')
     const active=body.is_active==null?!!current.active:body.is_active
-    if(active&&!ctx.remoteText?.allows(current.source))throw unavailable()
+    if(active) await authorizeProviderWatch(ctx,current)
+    if (current.provider && body.instruction != null) throw bad('Provider watches do not accept ingestion instructions.')
     const cadence=body.watch_interval==null?current.cadence:interval(body.watch_interval)
     const due=active?Date.now()+cadence*period:null
     if(due)await ensureAlarm(ctx.storage,due)
     const next=ctx.storage.transactionSync(()=>{
+      ctx.assertActive?.()
       const row=get(ctx,url,id)
       if(row.rev!==current.rev)throw new ApiError(409,'CONFLICT','Watch changed while updating.')
       ctx.sql.exec(`UPDATE ov_watches SET cadence=?,active=?,due=?,reason=?,instruction=?,rev=rev+1 WHERE ${own} AND id=?`,cadence,active?1:0,due,
@@ -265,11 +332,27 @@ export async function runWatch(payload:Record<string,unknown>,ctx:WorkspaceConte
     if(current?.rev!==row.rev||current.started!==start)throw new ApiError(409,'CONFLICT','Watch changed before the import was published.')
   }})
   try {
+    if (row.provider) {
+      const config = (await authorizeProviderWatch(scoped, row))!
+      const add_type = config.mode.startsWith('feishu-') ? 'feishu' : 'tos'
+      const web_mode = providerCollection(config.mode) ? add_type === 'feishu' ? 'tree' : 'collection' : 'native'
+      const response = await importWeb(new Filesystem(scoped), { path: row.source, to: row.uri, add_type,
+        args: { web_mode }, reason: row.reason, processing_mode: 'vectors_only' }, config.mode, {
+        stamp: config.stamp, revision: row.owned_revision,
+        finish(revision, result) {
+          ctx.sql.exec("UPDATE ov_watches SET owned_revision=?,started=NULL,last_status='completed',last_time=?,last_error=NULL WHERE id=? AND rev=? AND started=?",
+            revision,Date.now(),row.id,row.rev,start)
+          ctx.finishJobInTransaction?.(result)
+        },
+      })
+      return ((await response.json()) as { result: unknown }).result
+    }
     const value=await ingest(scoped,row.source,row.uri)
     ctx.sql.exec("UPDATE ov_watches SET started=NULL,last_status='completed',last_time=?,last_error=NULL WHERE id=? AND started=?",Date.now(),row.id,start)
     return value
   } catch (error) {
-    ctx.sql.exec("UPDATE ov_watches SET started=NULL,last_status='failed',last_time=?,last_error='Text import did not complete' WHERE id=? AND started=?",Date.now(),row.id,start)
+    ctx.sql.exec('UPDATE ov_watches SET started=NULL,last_status=?,last_time=?,last_error=? WHERE id=? AND started=?',
+      'failed',Date.now(),row.provider ? 'Provider import did not complete' : 'Text import did not complete',row.id,start)
     throw error
   }
 }

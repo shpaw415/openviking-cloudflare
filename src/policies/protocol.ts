@@ -110,14 +110,14 @@ export async function activateCommand(request: Request): Promise<number> {
   return versionNumber((await body(request, ['version'])).version)
 }
 
-export async function scanCommand(request: Request): Promise<never> {
+export async function scanCommand(request: Request) {
   const { uri, fix = false, node_limit: limit = 1000 } = await body(request, ['uri', 'fix', 'node_limit'])
   if (typeof uri !== 'string' || !uri || [...uri].length > 2048) invalid('uri', 'expected 1 to 2048 characters')
   if (typeof fix !== 'boolean') invalid('fix', 'expected a boolean')
   if (typeof limit !== 'number' || !Number.isInteger(limit) || limit < 1 || limit > 1000) {
     invalid('node_limit', 'expected an integer between 1 and 1000')
   }
-  throw new ApiError(501, 'NOT_IMPLEMENTED', 'Privacy filesystem scan and repair are not ported.')
+  return { uri, fix, limit }
 }
 
 type Selector = { category: string; target: string; field?: string }

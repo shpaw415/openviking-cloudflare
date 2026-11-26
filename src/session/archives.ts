@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { noteRetention, planRetention, saveCheckpoint } from './retention.js'
 import type { WorkspaceContext } from '../context.js'
 import { ApiError, ok } from '../http.js'
 import { pathFor } from '../fs/contract.js'
@@ -16,7 +17,8 @@ import { autoDecision } from './auto-commit.js'
 import { autoState, noteAutoSuccess } from './auto-policy.js'
 
 type Flight = ReturnType<typeof acquire>
-type Options = { extract: boolean, working: boolean, tags: string[], extractMaxTokens?: number }
+type Options = { extract: boolean, working: boolean, tags: string[], extractMaxTokens?: number, summaryTokens?:number,
+  reasoningEffort?:ReturnType<typeof commitOptions>['reasoningEffort'] }
 type Plan = { overview: string, events: ReturnType<typeof parseEvents> }
 type Work = { job_id: string, flight_token: string, options: string, sealed_at: string, status: 'pending' | 'failed' | 'completed',
   failure: string | null, plan: string | null, overview: string, task_id: string | null }
@@ -84,7 +86,7 @@ export function hasActiveArchiveTask(ctx: WorkspaceContext, key: SessionKey): bo
 function archiveOptions(ctx: WorkspaceContext, key: SessionKey, policy: string | null, opts: ReturnType<typeof commitOptions>): Options {
   const configured = policy ? JSON.parse(policy) : null
   return { extract: ctx.memorySettings?.extraction_enabled !== false && (configured?.self?.enabled ?? true) && (configured?.memory_types ?? ['events']).includes('events'),
-    working: !opts.reset && (opts.working ?? configured?.working_memory?.enabled ?? false),
+    working: !opts.reset && (opts.working ?? configured?.working_memory?.enabled ?? false), summaryTokens:opts.summaryTokens,reasoningEffort:opts.reasoningEffort,
     tags: opts.tags ?? sessionConfig(ctx.sql, key).memory_extraction_config.events.tags,
     ...(ctx.memorySettings?.edge_extraction_max_tokens !== undefined && { extractMaxTokens: ctx.memorySettings.edge_extraction_max_tokens }) }
 }
@@ -99,12 +101,12 @@ export function commitAnchor(sql: SqlStorage, key: SessionKey, row: SessionRow):
 // Runs inside the same SQLite transaction as either the task admission or the
 // synchronous commit. For queued work the lease is acquired by the consumer.
 export function rotateArchive(ctx: WorkspaceContext, key: SessionKey, opts: ReturnType<typeof commitOptions>, expected?: string,
-  auto = false, acceptedTask?: string) {
+   auto: boolean | 'idle' = false, acceptedTask?: string) {
   const { sql } = ctx
     const session = requireSession(sql, key)
     ctx.assertActive?.()
     if (auto) {
-      const decision = autoDecision(sql, key, session)
+      const decision = autoDecision(sql, key, session, auto === 'idle')
       if (!decision || decision.anchor !== expected || currentFlight(ctx, key)) {
         const result = { session_id: key[3], status: 'skipped', reason: 'auto_policy_not_due_or_session_changed', archived: false }
         ctx.finishJobInTransaction?.(result)
@@ -117,7 +119,12 @@ export function rotateArchive(ctx: WorkspaceContext, key: SessionKey, opts: Retu
       throw new ApiError(409, 'CONFLICT', 'The session changed after job submission; review and submit a new commit.')
     }
     ctx.assertArchiveSettingsCurrent?.()
+    const retainedPlan = opts.retention ? planRetention(sql,key,opts.retention) : undefined
+    if (retainedPlan) opts = { ...opts, keep: retainedPlan.keep }
     const options = archiveOptions(ctx, key, session.memory_policy, opts)
+    if (options.reasoningEffort!==undefined && (!ctx.sessionReasoning||!options.working)) {
+      throw new ApiError(412,'FAILED_PRECONDITION','Reasoning effort requires enabled Working Memory and a compatible operator-configured model.')
+    }
     const now = new Date().toISOString(), retained = Math.min(opts.keep, session.message_count)
     const archived = session.message_count > retained, cutoff = session.total_message_count - retained
     let count = session.commit_count, n = 0, flight: Flight | undefined
@@ -154,6 +161,8 @@ export function rotateArchive(ctx: WorkspaceContext, key: SessionKey, opts: Retu
     }
     sql.exec(`UPDATE ov_sessions SET updated_at=?,last_commit_at=?,message_count=?,keep_recent_count=?,commit_count=? WHERE ${sessionWhere}`,
       now, archived ? now : session.last_commit_at, retained, opts.keep, count, ...key)
+    if (!auto) noteRetention(sql, key, opts.retention)
+    if (archived || opts.reset) saveCheckpoint(sql,key,n,retainedPlan?.checkpoint)
     const result = { session_id: key[3], status: archived ? 'completed' : 'skipped',
       task_id: null, archive_uri: archived ? archiveUri(key, n) : null, archived, effective_enable_working_memory: archived && options.working,
       ...(opts.reset ? { reset_context: true } : {}),
@@ -165,10 +174,10 @@ export function rotateArchive(ctx: WorkspaceContext, key: SessionKey, opts: Retu
     return { flight, n, result }
 }
 
-export async function commitArchive(ctx: WorkspaceContext, key: SessionKey, opts: ReturnType<typeof commitOptions>, expected?: string, auto = false) {
+export async function commitArchive(ctx: WorkspaceContext, key: SessionKey, opts: ReturnType<typeof commitOptions>, expected?: string, auto: boolean | 'idle' = false) {
   const rotation = ctx.storage.transactionSync(() => rotateArchive(ctx, key, opts, expected, auto))
   if (!rotation.flight) return rotation.result
-  return processArchive(ctx, key, rotation.n, rotation.flight, rotation.result, auto)
+  return processArchive(ctx, key, rotation.n, rotation.flight, rotation.result, !!auto)
 }
 
 export function acceptedArchive(ctx: WorkspaceContext, key: SessionKey, n: number, taskId: string) {
@@ -214,13 +223,14 @@ async function processArchive<T extends object>(ctx: WorkspaceContext, key: Sess
       const data = (previous?: string) => JSON.stringify({ ...(previous && { previous }), transcript: lines })
       const run = async (system: string, content: string, maxTokens: number, maxBytes: number) => {
         guard()
-        const g = await generateText(ctx, [{ role: 'system', content: system }, { role: 'user', content }], maxTokens, maxBytes, flight.deadline)
+        const g = await generateText(ctx, [{ role: 'system', content: system }, { role: 'user', content }], maxTokens, maxBytes, flight.deadline,
+          undefined,system===overviewPrompt?opts.reasoningEffort:undefined)
         await reauthorize()
         storage.transactionSync(() => { guard(); addUsage(sql, key, g) })
         return g.text
       }
       const events = opts.extract ? parseEvents(await run(eventsPrompt, data(), opts.extractMaxTokens ?? edgeSessionDefaults.extractionTokens, 12 * 1024), lines) : []
-      const overview = opts.working ? (await run(overviewPrompt, data(latestOverview(sql, key, n)), 512, 3072)).trim() : ''
+      const overview = opts.working ? (await run(overviewPrompt, data(latestOverview(sql, key, n)), opts.summaryTokens??512, 3072)).trim() : ''
       plan = { events, overview }
       // Validate every document before the first publication, then persist
       // the exact model selection. Retries don't regenerate a partial plan.

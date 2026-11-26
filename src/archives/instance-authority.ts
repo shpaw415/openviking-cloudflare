@@ -23,13 +23,15 @@ export type Pair = { source: Endpoint; destination: Endpoint }
 export type Mount = Pair & { mode: 'source' | 'standby'; local: Endpoint; key: string }
 export type ControlCommand = 'capture' | 'evaluate' | 'begin' | 'step' | 'status' | 'release'
 export const withAttachments = 'edge-v1-attachments'
-export type InstanceProfile = 'edge-v1' | typeof withAttachments
-type MemberScope = { account: string; capture: string; profile?: typeof withAttachments }
+export const withPortableState = 'edge-v1-portable-state'
+type ExtendedProfile = typeof withAttachments | typeof withPortableState
+export type InstanceProfile = 'edge-v1' | ExtendedProfile
+type MemberScope = { account: string; capture: string; profile?: ExtendedProfile }
 export type MemberCall = MemberScope & ({ op: 'capture' } | { op: 'evaluate' | 'apply' | 'receipt'; job: string; sha256: string; plan?: string })
 
 export function captureProfile(value: unknown): InstanceProfile {
   if (value === undefined || value === 'edge-v1') return 'edge-v1'
-  if (value === withAttachments) return value
+  if (value === withAttachments || value === withPortableState) return value
   return invalid('Unknown instance capture profile.')
 }
 
@@ -105,7 +107,8 @@ export async function admitInstancePermit(m: Mount, call: Rpc, raw: unknown): Pr
 }
 
 /** A compatibility-shaped seal with independent key AND context. It is never a F3 archive or permit MAC. */
-export function memberSeal(m: Mount, capture: string, profile?: typeof withAttachments) {
+export function memberSeal(m: Mount, capture: string, profile?: ExtendedProfile) {
   if (!instanceId(capture)) return invalid('Invalid instance capture identifier.')
-  return { key: m.key, label: `instance-member:${profile ? 'v2' : 'v1'}:${pairFields(m).join(':')}:${capture}` }
+  const version = profile === withPortableState ? 'v3:portable-state' : profile === withAttachments ? 'v2' : 'v1'
+  return { key: m.key, label: `instance-member:${version}:${pairFields(m).join(':')}:${capture}` }
 }

@@ -122,6 +122,26 @@ function matches(node: Schema, value: unknown): boolean {
   return accepts(node.type, value) && (typeof value !== 'string' || wellFormed(value)) && (!node.enum || node.enum.includes(value as Scalar))
 }
 
+export function outputSchema(input: unknown) {
+  const parsed = schema(input, { left: 128 }, 0, true)
+  if (parsed.type !== 'object' || bytes(JSON.stringify(parsed)) > 16 * 1024) throw bad()
+  return parsed
+}
+
+function visitStrings(value: unknown, secret: (value: string) => void): void {
+  if (typeof value === 'string') secret(value)
+  else if (Array.isArray(value)) value.forEach(item => visitStrings(item, secret))
+  else if (isRecord(value)) Object.entries(value).forEach(([key, child]) => { secret(key); visitStrings(child, secret) })
+}
+
+export function matchesOutput(node: Schema, text: string, secret: (value: string) => void): boolean {
+  let parsed: unknown
+  try { parsed = JSON.parse(text) } catch { return false }
+  if (!matches(node, parsed)) return false
+  visitStrings(parsed, secret)
+  return true
+}
+
 export function readCall(rules: ToolRules, id: unknown, name: unknown, args: unknown, encoded: boolean,
   failure: () => GatewayError = badHistory): Call {
   const tool = rules.tools.find(tool => tool.function.name === name)
@@ -153,12 +173,7 @@ export function validateCalls(calls: Call[], finish: string, rules: ToolRules, e
     secret(call.arguments)
     // Also check JSON-decoded string leaves; neither JSON escaping nor a split
     // SSE field may conceal a provider credential in a client-visible call.
-    const visit = (value: unknown): void => {
-      if (typeof value === 'string') secret(value)
-      else if (Array.isArray(value)) value.forEach(visit)
-      else if (isRecord(value)) Object.entries(value).forEach(([key, child]) => { secret(key); visit(child) })
-    }
-    visit(call.args)
+    visitStrings(call.args, secret)
   }
   if (calls.length) secret(text + calls.map(call => call.id + call.name + call.arguments).join(''))
 }

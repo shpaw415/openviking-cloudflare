@@ -19,7 +19,7 @@ export function initAutoPolicy(sql: SqlStorage): void {
   ) WITHOUT ROWID`)
 }
 
-export function validateAutoPolicy(value: unknown): Partial<AutoPolicy> | null | undefined {
+export function validateAutoPolicy(value: unknown, idleAvailable = false): Partial<AutoPolicy> | null | undefined {
   if (value === undefined || value === null) return value
   if (!isRecord(value)) invalid('auto_commit_policy must be an object or null.')
   const out: Partial<AutoPolicy> = {}
@@ -30,7 +30,7 @@ export function validateAutoPolicy(value: unknown): Partial<AutoPolicy> | null |
     const field = key as keyof AutoPolicy
     if (field === 'idle_timeout_seconds' && n !== 0) {
       if (n < 300) invalid('idle_timeout_seconds must be 0 or at least 300.')
-      unsupported('Idle auto-commit needs a durable delayed scheduler and is not available.')
+      if (!idleAvailable) unsupported('Idle auto-commit needs a mounted durable delayed scheduler.')
     }
     out[field] = Math.max(0, Math.min(maxima[field], n))
   }

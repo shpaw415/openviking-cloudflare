@@ -4,9 +4,10 @@ import { aclSeal } from './backup-acl.js'
 import type { Scope } from './backup-authority.js'
 import { strictJson } from './backup-codec.js'
 import { decoder, digest, encoder, invalid } from './common.js'
-import { hashId, INSTANCE_ACCOUNTS, instanceId, rosterTag, signInstance, unsupported, verifyInstance, withAttachments } from './instance-authority.js'
+import { hashId, INSTANCE_ACCOUNTS, instanceId, rosterTag, signInstance, unsupported, verifyInstance, withAttachments, withPortableState } from './instance-authority.js'
 import type { Endpoint, InstanceProfile, Mount } from './instance-authority.js'
 import { attachmentArchiveBytes } from './instance-attachments.js'
+import { portableArchiveBytes } from './instance-portable-state.js'
 import type { Env } from '../context.js'
 import { inspectZip, memberBytes, storedZip, ZIP_BYTES } from './zip.js'
 
@@ -17,9 +18,11 @@ const settingsLimit = 16 * 1024
 const manifestPath = 'inventory.json', settingsPath = 'configuration.json', sealPath = 'inventory.hmac'
 const limits = (perAccount: number) => ({ bytes: INSTANCE_ACCOUNTS * perAccount + manifestLimit + settingsLimit + 8192,
   entries: INSTANCE_ACCOUNTS + 3, expanded: INSTANCE_ACCOUNTS * perAccount + manifestLimit + settingsLimit + 64, storedOnly: true })
-const legacyLimits = limits(ZIP_BYTES), attachmentLimits = limits(attachmentArchiveBytes)
-export const memberLimit = (profile: InstanceProfile) => profile === withAttachments ? attachmentArchiveBytes : ZIP_BYTES
-export const instanceBytes = attachmentLimits.bytes
+export const memberLimit = (profile: InstanceProfile) => profile === withPortableState ? portableArchiveBytes :
+  profile === withAttachments ? attachmentArchiveBytes : ZIP_BYTES
+const version = (profile: InstanceProfile) => profile === withPortableState ? 3 : profile === withAttachments ? 2 : 1
+const portableLimits = limits(portableArchiveBytes)
+export const instanceBytes = portableLimits.bytes
 export const zipInput = (value: unknown) => {
   if (!(value instanceof ArrayBuffer) || !value.byteLength || value.byteLength > instanceBytes) return invalid('A bounded instance ZIP is required.')
   return new Uint8Array(value)
@@ -36,13 +39,13 @@ export async function encodeInstance(m: Mount, capture: string, settings: unknow
   const accounts = await Promise.all(members.map(async ({ account_id, workspace, roster, seal, bytes }) => ({
     account_id, workspace, roster, seal, ...await descriptor(memberPath(account_id), bytes),
   })))
-  const data = encoder.encode(JSON.stringify({ kind, format_version: profile === withAttachments ? 2 : 1, profile, capture,
+  const data = encoder.encode(JSON.stringify({ kind, format_version: version(profile), profile, capture,
     source: m.source, destination: m.destination, configuration: await descriptor(settingsPath, config), accounts }))
   if (data.length > manifestLimit) return unsupported()
   const signature = await signInstance(m, 'inventory', await digest(data))
   return storedZip([{ name: manifestPath, bytes: data }, { name: sealPath, bytes: encoder.encode(signature) },
     { name: settingsPath, bytes: config }, ...members.map(({ account_id, bytes }) => ({ name: memberPath(account_id), bytes }))],
-    profile === withAttachments ? attachmentLimits : legacyLimits)
+    limits(memberLimit(profile)))
 }
 
 function json(bytes: Bytes) { return strictJson(decoder.decode(bytes), 10) }
@@ -51,7 +54,7 @@ function sameEndpoint(raw: unknown, expected: Endpoint): boolean {
 }
 
 export async function decodeInstance(env: Env, m: Mount, scopes: Scope[], bytes: Bytes) {
-  const members = inspectZip(bytes, attachmentLimits)
+  const members = inspectZip(bytes, portableLimits)
   if (members.size !== scopes.length + 3) return unsupported()
   async function read(path: string, limit: number) {
     const member = members.get(path)
@@ -66,8 +69,8 @@ export async function decodeInstance(env: Env, m: Mount, scopes: Scope[], bytes:
       !instanceId(meta.capture) || !sameEndpoint(meta.source, m.source) || !sameEndpoint(meta.destination, m.destination) ||
       !Array.isArray(meta.accounts) || meta.accounts.length !== scopes.length) return unsupported()
   const { profile } = meta
-  if (!((profile === 'edge-v1' && meta.format_version === 1 && bytes.byteLength <= legacyLimits.bytes) ||
-        (profile === withAttachments && meta.format_version === 2))) return unsupported()
+  if ((profile !== 'edge-v1' && profile !== withAttachments && profile !== withPortableState) ||
+      meta.format_version !== version(profile) || bytes.byteLength > limits(memberLimit(profile)).bytes) return unsupported()
   const sourceMounts = new Set<string>()
   async function checked(raw: Record<string, unknown>, path: string, max: number) {
     if (raw.path !== path || !hashId(raw.sha256) || !Number.isSafeInteger(raw.size) || raw.size === 0) return unsupported()
@@ -87,5 +90,5 @@ export async function decodeInstance(env: Env, m: Mount, scopes: Scope[], bytes:
     aclSeal(raw.seal, scope.users.length)
     accounts.push({ account: scope.account, seal: raw.seal, ...await checked(raw, memberPath(scope.account), memberLimit(profile)) })
   }
-  return { capture: meta.capture, job, settings, accounts, profile }
+  return { capture: meta.capture, job, settings, accounts, profile: profile as InstanceProfile }
 }

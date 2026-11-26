@@ -18,7 +18,8 @@ export function embeddingVectors(data: unknown, count: number, dimension: number
 }
 
 export async function embed(binding: BoundModel | undefined, config: EmbeddingConfig, texts: string[], reserve: (count: number) => void,
-  report?: (tokens: number) => void, beforeNextBatch?: () => Promise<void>): Promise<number[][]> {
+  report?: (tokens: number) => void, beforeNextBatch?: () => Promise<void>, signal?: AbortSignal): Promise<number[][]> {
+  signal?.throwIfAborted()
   if (!binding) throw unavailable()
   if (!texts.length || texts.length > embeddingBatchLimit || texts.some(text => typeof text !== 'string' || text.length > 4096)) {
     throw new ApiError(400, 'INVALID_ARGUMENT', 'The embedding batch exceeds the Worker limits.')
@@ -30,16 +31,18 @@ export async function embed(binding: BoundModel | undefined, config: EmbeddingCo
   let usage: number | undefined = 0
   for (let offset = 0; offset < texts.length; offset += batchSize) {
     if (offset) await beforeNextBatch?.()
+    signal?.throwIfAborted()
     const left = deadline - Date.now()
     if (left <= 0) throw unavailable()
     const batch = texts.slice(offset, offset + batchSize)
     try {
-      const data = await modelEmbedding(binding, config, batch, left / 1000)
+      const data = await modelEmbedding(binding, config, batch, left / 1000, signal)
+      signal?.throwIfAborted()
       vectors.push(...embeddingVectors(data, batch.length, config.dimension))
       const count = isRecord(data) && isRecord(data.usage) ? data.usage.prompt_tokens ?? data.usage.total_tokens : undefined
       if (usage !== undefined && typeof count === 'number' && Number.isSafeInteger(count) && count >= 0 && usage + count <= 1_000_000) usage += count
       else usage = undefined
-    } catch { throw unavailable() }
+    } catch { signal?.throwIfAborted(); throw unavailable() }
   }
   if (usage !== undefined) report?.(usage)
   return vectors

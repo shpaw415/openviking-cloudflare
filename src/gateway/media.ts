@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { GatewayError, fields, integer, invalid, record, unsupported } from './contract.js'
+import { GatewayError, bytes, fields, integer, invalid, record, unsupported } from './contract.js'
 import type { Protocol } from './contract.js'
 
-export type Capability = 'image' | 'audio' | 'tools'
+export type Capability = 'image' | 'audio' | 'tools' | 'document' | 'sampling' | 'structured' | 'stop_sequences' | 'count_tokens' | 'local_read' | 'audio_output'
+export type AudioRequest = { voice: string; format: 'wav' }
+export type AudioOutput = { data: string; transcript: string; expires_at: number; id: string }
 type Detail = 'auto' | 'low' | 'high'
 export type ChatPart = { type: 'text'; text: string } |
   { type: 'image_url'; image_url: { url: string; detail?: Detail } } |
   { type: 'input_audio'; input_audio: { data: string; format: 'wav' } }
-type AttachmentPart = { type: 'attachment'; id: string; kind: 'image' | 'audio'; detail?: Detail }
-export type MediaPart = ChatPart | AttachmentPart
+export type DocumentPart = { type: 'document'; filename?: string; data: string; text: string }
+export type ResolvedPart = ChatPart | DocumentPart
+type AttachmentPart = { type: 'attachment'; id: string; kind: 'image' | 'audio' | 'document'; detail?: Detail }
+export type MediaPart = ResolvedPart | AttachmentPart
 export type ReadGatewayAttachment = (id: string) => Promise<{
   filename: string; contentType: string; size: number; expiresAt: number; bytes: ArrayBuffer; assertCurrent(): void
 } | null | undefined>
@@ -98,10 +102,29 @@ function wav(raw: string, data: DataView): boolean {
     size === raw.length - 44 && size > 0 && size % align === 0
 }
 
+export function wavOutput(data: unknown, guard: (text: string) => void): data is string {
+  if (typeof data !== 'string' || data.length > 180 * 1024 || !/^[A-Za-z0-9+/]+={0,2}$/.test(data) || data.length % 4) return false
+  const raw = atob(data)
+  if (btoa(raw) !== data) return false
+  guard(data); guard(raw)
+  return wav(raw, new DataView(Uint8Array.from(raw, c => c.charCodeAt(0)).buffer))
+}
+
+function validDocumentText(text: unknown): text is string {
+  return typeof text === 'string' && !!text.trim() && !/[\p{Cs}\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\ufeff]/u.test(text)
+}
+
+export function decodePlainDocument(data: Uint8Array): string | undefined {
+  try {
+    const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(data)
+    if (validDocumentText(text)) return text
+  } catch { /* invalid UTF-8 */ }
+}
+
 export function mediaReader(protocol: Protocol, capabilities: ReadonlySet<Capability>, references: boolean) {
   let size = 0, blocks = 0
   const count = () => { if (++blocks > 4) throw limited() }
-  function decode(value: unknown, format: 'image/png' | 'image/jpeg' | 'wav'): string {
+  function binary(value: unknown): [string, Uint8Array, string] {
     if (typeof value !== 'string' || !value) throw invalidMedia()
     if (value.length > b64Limit) throw limited()
     if (value.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(value)) throw invalidMedia()
@@ -110,9 +133,28 @@ export function mediaReader(protocol: Protocol, capabilities: ReadonlySet<Capabi
     if (btoa(raw) !== value) throw invalidMedia() // Reject ambiguous padding/alphabet.
     size += raw.length
     if (raw.length > blockLimit || size > totalLimit) throw limited()
-    const data = new DataView(Uint8Array.from(raw, c => c.charCodeAt(0)).buffer)
+    return [raw, Uint8Array.from(raw, c => c.charCodeAt(0)), value]
+  }
+  function decode(value: unknown, format: 'image/png' | 'image/jpeg' | 'wav'): string {
+    const [raw, octets, canonical] = binary(value)
+    const data = new DataView(octets.buffer)
     if (!(format === 'image/png' ? png(raw, data) : format === 'image/jpeg' ? jpeg(raw, data) : wav(raw, data))) throw invalidMedia()
+    return canonical
+  }
+  function documentName(value: unknown): string | undefined {
+    if (value === undefined) return
+    if (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_. -]{0,91}\.txt$/i.test(value)) throw invalidMedia()
     return value
+  }
+  function documentText(text: unknown): string {
+    if (!validDocumentText(text)) throw invalidMedia()
+    return text
+  }
+  function document(value: unknown, filename: unknown): DocumentPart {
+    const [, data] = binary(value)
+    const text = decodePlainDocument(data)
+    if (text === undefined) throw invalidMedia()
+    return { type: 'document', filename: documentName(filename), data: value as string, text }
   }
   function checkDetail(detail: unknown): Detail | undefined {
     if (detail !== undefined && detail !== 'auto' && detail !== 'low' && detail !== 'high') throw invalidMedia()
@@ -123,7 +165,7 @@ export function mediaReader(protocol: Protocol, capabilities: ReadonlySet<Capabi
     const detail = checkDetail(hint)
     return { type: 'image_url', image_url: { url: `data:${mime};base64,${decode(data, mime)}`, ...(detail !== undefined && { detail }) } }
   }
-  function attachment(id: unknown, kind: 'image' | 'audio', hint?: unknown): AttachmentPart {
+  function attachment(id: unknown, kind: AttachmentPart['kind'], hint?: unknown): AttachmentPart {
     if (!references || typeof id !== 'string' || !/^att_[0-9a-f]{32}$/.test(id)) throw unsupportedMedia()
     const detail = checkDetail(hint)
     count()
@@ -139,6 +181,37 @@ export function mediaReader(protocol: Protocol, capabilities: ReadonlySet<Capabi
     return image(match[1], url.slice(match[0].length), detail)
   }
   function parse(part: Record<string, unknown>): MediaPart {
+    if (capabilities.has('document') && protocol === 'responses' && part.type === 'input_file') {
+      if (Object.hasOwn(part, 'file_id')) {
+        fields(part, ['type', 'file_id'], invalidMedia)
+        return attachment(part.file_id, 'document')
+      }
+      fields(part, ['type', 'filename', 'file_data'], unsupportedMedia)
+      if (!documentName(part.filename) || typeof part.file_data !== 'string') throw invalidMedia()
+      count()
+      return document(part.file_data.replace(/^data:text\/plain;base64,/, ''), part.filename)
+    }
+    if (capabilities.has('document') && protocol === 'anthropic' && part.type === 'document') {
+      fields(part, ['type', 'title', 'source'], unsupportedMedia)
+      const source = record(part.source, invalidMedia)
+      if (source.type === 'file') {
+        fields(source, ['type', 'file_id'], invalidMedia)
+        if (part.title !== undefined) throw invalidMedia()
+        return attachment(source.file_id, 'document')
+      }
+      if (source.media_type !== 'text/plain') throw unsupportedMedia()
+      count()
+      if (source.type === 'base64') {
+        fields(source, ['type', 'media_type', 'data'], invalidMedia)
+        return document(source.data, part.title)
+      }
+      if (source.type !== 'text') throw unsupportedMedia()
+      fields(source, ['type', 'media_type', 'data'], invalidMedia)
+      const text = documentText(source.data), length = bytes(text)
+      size += length
+      if (length > blockLimit || size > totalLimit) throw limited()
+      return { type: 'document', filename: documentName(part.title), text, data: '' }
+    }
     if (protocol === 'chat' && part.type === 'input_audio' && capabilities.has('audio')) {
       fields(part, ['type', 'input_audio'], invalidMedia)
       const audio = record(part.input_audio, invalidMedia)
@@ -181,7 +254,7 @@ export function mediaReader(protocol: Protocol, capabilities: ReadonlySet<Capabi
     throw unsupportedMedia()
   }
   const receipts: Array<() => void> = []
-  return { parse, async resolve(part: AttachmentPart, read: ReadGatewayAttachment | undefined, guard: () => void): Promise<ChatPart> {
+  return { parse, async resolve(part: AttachmentPart, read: ReadGatewayAttachment | undefined, guard: () => void): Promise<ResolvedPart> {
     if (!read) throw unsupportedMedia()
     guard()
     const unavailable = () => new GatewayError(404, 'attachment_unavailable', 'The private attachment is not available to this request.')
@@ -191,9 +264,11 @@ export function mediaReader(protocol: Protocol, capabilities: ReadonlySet<Capabi
     if (!file || !(file.bytes instanceof ArrayBuffer) || file.size !== file.bytes.byteLength || typeof file.assertCurrent !== 'function') throw unavailable()
     if (file.size > blockLimit || file.size + size > totalLimit) throw limited()
     const type = file.contentType
-    if (part.kind === 'audio' ? type !== 'audio/wav' && type !== 'audio/x-wav' : type !== 'image/png' && type !== 'image/jpeg') throw unsupportedMedia()
+    if (part.kind === 'audio' ? type !== 'audio/wav' && type !== 'audio/x-wav' : part.kind === 'document' ? type !== 'text/plain' :
+        type !== 'image/png' && type !== 'image/jpeg') throw unsupportedMedia()
     const base64 = btoa(Array.from(new Uint8Array(file.bytes), b => String.fromCharCode(b)).join(''))
-    const verified: ChatPart = part.kind === 'audio' ? { type: 'input_audio', input_audio: { data: decode(base64, 'wav'), format: 'wav' } } :
+    const verified: ResolvedPart = part.kind === 'document' ? document(base64, file.filename) :
+      part.kind === 'audio' ? { type: 'input_audio', input_audio: { data: decode(base64, 'wav'), format: 'wav' } } :
       image(type, base64, part.detail)
     receipts.push(() => file.assertCurrent())
     return verified

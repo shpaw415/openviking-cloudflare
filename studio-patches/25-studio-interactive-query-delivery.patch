@@ -1,0 +1,178 @@
+diff --git a/src/shared/hooks/use-query-settlement.ts b/src/shared/hooks/use-query-settlement.ts
+new file mode 100644
+--- /dev/null
++++ b/src/shared/hooks/use-query-settlement.ts
+@@ -0,0 +1,24 @@
++import { useQueryClient } from '@tanstack/react-query'
++import type { QueryKey } from '@tanstack/react-query'
++import { useCallback, useSyncExternalStore } from 'react'
++
++/**
++ * Let an interactive view consume a settled cache entry without waiting for
++ * the query observer's scheduled notification. The observer still owns all
++ * fetching, polling and errors. Do not change the global notification queue.
++ */
++export function useQuerySettlement(queryKey: QueryKey, enabled: boolean) {
++  const client = useQueryClient()
++  const cache = client.getQueryCache()
++  const hash = client.defaultQueryOptions({ queryKey }).queryHash
++  const subscribe = useCallback((update: () => void) => {
++    if (!enabled) return () => {}
++    return cache.subscribe(event => {
++      if (event.type === 'updated' && event.query.queryHash === hash &&
++          (event.action.type === 'success' || event.action.type === 'error')) update()
++    })
++  }, [cache, enabled, hash])
++  const snapshot = useCallback(() => enabled && hash !== undefined ? cache.get(hash)?.state : undefined,
++    [cache, enabled, hash])
++  useSyncExternalStore(subscribe, snapshot, () => undefined)
++}
+diff --git a/src/features/connection/components/account-switcher.tsx b/src/features/connection/components/account-switcher.tsx
+--- a/src/features/connection/components/account-switcher.tsx
++++ b/src/features/connection/components/account-switcher.tsx
+@@ -1,5 +1,6 @@
+ import { showErrorToast } from '#/shared/lib/error-toast'
+ import { newConnectionPath } from '#/features/connection/lib/studio-mode'
++import { useQuerySettlement } from '#/shared/hooks/use-query-settlement'
+ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+ import { Link } from '@tanstack/react-router'
+ import {
+@@ -187,17 +188,15 @@
+     ],
+   )
+ 
++  const accountsEnabled = canManageAccounts && open && selectedIsActive && view === 'accounts'
++  const accountsKey = ['account-switcher', adminConnection.baseUrl, adminConnection.apiKey]
+   const accountsQuery = useQuery({
+-    enabled:
+-      canManageAccounts && open && selectedIsActive && view === 'accounts',
++    enabled: accountsEnabled,
+     queryFn: () => fetchAdminAccounts(adminConnection),
+-    queryKey: [
+-      'account-switcher',
+-      adminConnection.baseUrl,
+-      adminConnection.apiKey,
+-    ],
++    queryKey: accountsKey,
+     retry: false,
+   })
++  useQuerySettlement(accountsKey, accountsEnabled)
+ 
+   const filteredAccounts = React.useMemo(() => {
+     const normalizedSearch = search.trim().toLowerCase()
+diff --git a/src/features/connection/components/studio-scope-switcher.tsx b/src/features/connection/components/studio-scope-switcher.tsx
+--- a/src/features/connection/components/studio-scope-switcher.tsx
++++ b/src/features/connection/components/studio-scope-switcher.tsx
+@@ -13,5 +13,6 @@
+ import { cn } from '#/shared/lib/utils'
++import { useQuerySettlement } from '#/shared/hooks/use-query-settlement'
+ import { Button } from '#/shared/ui/button'
+ import { Input } from '#/shared/ui/input'
+ import { Popover, PopoverContent, PopoverTrigger } from '#/shared/ui/popover'
+ import { useQuery } from '@tanstack/react-query'
+@@ -163,12 +164,15 @@
+     ...connection,
+     apiKey: connection.adminApiKey || (isGatewayHost ? connection.apiKey : ''),
+   }
++  const accountsKey = ['scope-accounts', identityScopeKey]
++  const accountsEnabled = open === 'account' && canListAccounts
+   const accounts = useQuery({
+-    queryKey: ['scope-accounts', identityScopeKey],
++    queryKey: accountsKey,
+     queryFn: () => fetchAdminAccounts(adminConnection),
+-    enabled: open === 'account' && canListAccounts,
++    enabled: accountsEnabled,
+     retry: false,
+   })
++  useQuerySettlement(accountsKey, accountsEnabled)
+   const identities = savedDataIdentities(
+     [
+       ...profiles.filter((profile) => profile.id === activeProfileId),
+@@ -176,13 +180,16 @@
+     ],
+     connection,
+   )
++  const usersKey = ['trusted-scope-users', identityScopeKey]
++  const usersEnabled = trusted && open === 'user' && Boolean(connection.accountId)
+   const trustedUsers = useQuery({
+-    queryKey: ['trusted-scope-users', identityScopeKey],
++    queryKey: usersKey,
+     queryFn: () =>
+       fetchAdminUsers(adminConnection, connection.accountId, false),
+-    enabled: trusted && open === 'user' && Boolean(connection.accountId),
++    enabled: usersEnabled,
+     retry: false,
+   })
++  useQuerySettlement(usersKey, usersEnabled)
+   const savedUsers = trusted
+     ? (trustedUsers.data ?? []).map((user) => ({
+         accountId: connection.accountId,
+@@ -224,9 +231,11 @@
+   )
+   const matches = (text: string) =>
+     text.toLowerCase().includes(search.trim().toLowerCase())
+   const changeOpen = (scope: Scope) => (next: boolean) => {
+-    setOpen(next ? scope : null)
+-    setSearch('')
++    // A focus-out from the previous popup is delivered asynchronously. It
++    // does not own the new popup (or its search) after a selector switch.
++    setOpen(current => next ? scope : current === scope ? null : current)
++    if (next) setSearch('')
+   }
+   const errorMessage = (error: unknown) =>
+     error instanceof Error ? error.message : String(error)
+diff --git a/src/features/admin/gateway/lib/use-gateway.ts b/src/features/admin/gateway/lib/use-gateway.ts
+--- a/src/features/admin/gateway/lib/use-gateway.ts
++++ b/src/features/admin/gateway/lib/use-gateway.ts
+@@ -6,5 +6,6 @@
+ import { useManagementKey } from '#/features/admin/gateway/lib/management-key'
+ import { useAppConnection } from '#/features/connection/hooks/use-app-connection'
+ import { useStudioService } from '#/features/connection/hooks/use-studio-service'
++import { useQuerySettlement } from '#/shared/hooks/use-query-settlement'
+ import { EDGE_STUDIO } from '#/shared/lib/edge-studio'
+ 
+@@ -145,17 +146,21 @@
+ function useGatewayQuery<T>(
+   resource: GatewayResource,
+   params: unknown[],
+   load: (connection: GatewayConnection) => Promise<T>,
+   options: GatewayQueryOptions<T> = {},
+ ) {
+   const { allowed, connection, scope } = useGatewayConnection()
+-  return useQuery<T, GatewayError>({
++  const queryKey = gatewayQueryKey(scope, resource, ...params)
++  const enabled = allowed && options.enabled !== false
++  const query = useQuery<T, GatewayError>({
+     ...options,
+-    queryKey: gatewayQueryKey(scope, resource, ...params),
++    queryKey,
+     queryFn: () => {
+       if (!allowed) throw new Error(i18n.t('studio:errors.gatewayUnavailable'))
+       return load(connection)
+     },
+-    enabled: allowed && options.enabled !== false,
++    enabled,
+   })
++  useQuerySettlement(queryKey, resource === 'logs' && enabled)
++  return query
+ }
+diff --git a/src/i18n/locales/en/studio.ts b/src/i18n/locales/en/studio.ts
+--- a/src/i18n/locales/en/studio.ts
++++ b/src/i18n/locales/en/studio.ts
+@@ -49,5 +49,5 @@
+     webImportGit: 'GitHub documentation',
+     webImportAlias: 'Approved collection alias',
+-    webImportHtmlHint: 'Enter the exact approved HTTPS .html or .htm address. Only text from the approved snapshot is indexed; links are not followed.',
++    webImportHtmlHint: 'Enter the exact approved HTTPS .html or .htm address. Only text from the approved page is indexed; links are not followed.',
+     webImportSiteHint: 'Enter the approved HTTPS entry page. Imports up to six catalogue pages on that origin, no more than two links deep, subject to the site policy.',
+     webImportGitHint: 'Enter the alias provided by your operator. This reads a pinned documentation file. No repository address or credentials are needed.',
+diff --git a/src/i18n/locales/zh-CN/studio.ts b/src/i18n/locales/zh-CN/studio.ts
+--- a/src/i18n/locales/zh-CN/studio.ts
++++ b/src/i18n/locales/zh-CN/studio.ts
+@@ -49,5 +49,5 @@
+     webImportGit: 'GitHub 文档',
+     webImportAlias: '已批准的集合别名',
+-    webImportHtmlHint: '请原样输入已批准的 HTTPS .html 或 .htm 地址。仅索引已批准快照的文本，不访问链接。',
++    webImportHtmlHint: '请原样输入已批准的 HTTPS .html 或 .htm 地址。仅索引已批准网页的文本，不访问链接。',
+     webImportSiteHint: '请输入已批准的 HTTPS 入口页。按站点规则，仅导入同源目录清单内最多六个页面，且最多跟随两层链接。',
+     webImportGitHint: '请输入管理员提供的别名，以读取固定版本的文档。无需填写仓库地址或凭据。',

@@ -17,7 +17,7 @@ export function recipeMarkdown(name: string, description: string): string {
   return `---\nname: ${name}\ndescription: ${JSON.stringify(description)}\n---\n\n# ${name}\n\n${description}\n`
 }
 
-export type Schedule = { frequency: 'daily' | 'weekly'; hour?: number; minute?: number; weekday?: number }
+export type Schedule = { frequency: 'daily' | 'weekly'; hour?: number; minute?: number; weekday?: number; timezone?:string; weekdays?:number[] }
 export type Inputs = {
   from: string[]; to: string; skill: string; instruction: string | null; args: Record<string, unknown>
   auto_update: boolean; update_schedule: Schedule | null
@@ -100,8 +100,10 @@ function checkedArgs(value: unknown): Record<string, unknown> {
   return args
 }
 
-function scheduleOf(value: unknown): Schedule | null {
+function scheduleOf(value: unknown, advanced: boolean): Schedule | null {
   if (value == null) return null
+  if (advanced && (typeof value==='string' || isRecord(value) &&
+      ['cron','rrule','expression','timezone','weekdays'].some(key=>Object.hasOwn(value,key)))) return advancedSchedule(value)
   if (typeof value === 'string' || isRecord(value) &&
       (typeof value.frequency === 'string' && !['daily', 'weekly'].includes(value.frequency) ||
        ['cron', 'expression', 'timezone', 'tz', 'rrule'].some(key => Object.hasOwn(value, key)))) {
@@ -116,6 +118,51 @@ function scheduleOf(value: unknown): Schedule | null {
     ...(value.minute !== undefined && { minute: int(value.minute, 'minute', 0, 0, 59) }),
     ...(value.weekday !== undefined && { weekday: int(value.weekday, 'weekday', 1, 1, 7) }),
   }
+}
+
+function advancedSchedule(input:unknown):Schedule {
+  const value=isRecord(input)?input:typeof input==='string' && input.startsWith('RRULE:')?{rrule:input}:{cron:input}
+  onlyKeys(value,'frequency cron expression rrule timezone weekday weekdays hour minute')
+  const tz=value.timezone??'Asia/Shanghai'
+  if (typeof tz!=='string'||tz.length>64||!(/^[A-Za-z_]+(?:\/[A-Za-z0-9_+-]+)+$/u.test(tz)||tz==='UTC')) invalid('Expected a named IANA timezone.')
+  try { new Intl.DateTimeFormat('en',{timeZone:tz}) } catch { invalid('Unknown IANA timezone.') }
+  const clock=(v:unknown,field:string,max:number)=>int(v,field,0,0,max)
+  if (value.cron!==undefined||value.expression!==undefined||value.rrule!==undefined) {
+    if (['weekday','weekdays','minute','hour'].some(k=>Object.hasOwn(value,k))) invalid('Conflicting recurrence fields.')
+    const raw = value.cron ?? value.expression
+    if (raw!==undefined) {
+      if (value.cron!==undefined&&value.expression!==undefined||value.rrule!==undefined||
+          value.frequency!==undefined&&value.frequency!=='cron'||typeof raw!=='string'||raw.length>100) invalid('Invalid cron definition.')
+      const m=/^([0-9]{1,2}) ([0-9]{1,2}) \* \* (\*|[0-7](?:,[0-7]){0,6})$/u.exec(raw.trim())
+      if (!m) invalid('Cron accepts fixed minute/hour, wildcard day/month, and wildcard or a weekday list.')
+      const weekdays=m[3]==='*'?undefined:[...new Set(m[3].split(',').map(d=>Number(d)||7))].sort()
+      return {frequency:weekdays?'weekly':'daily',minute:clock(Number(m[1]),'minute',59),hour:clock(Number(m[2]),'hour',23),timezone:tz,
+        ...(weekdays&&{weekdays,weekday:weekdays[0]})}
+    }
+    if (typeof value.rrule!=='string'||value.rrule.length>150||value.frequency!==undefined&&value.frequency!=='rrule') invalid('Invalid RRULE definition.')
+    const fields=new Map<string,string>()
+    for (const part of value.rrule.replace(/^RRULE:/u,'').split(';')) {
+      const match=/^(FREQ|BYDAY|BYHOUR|BYMINUTE|INTERVAL)=([A-Z0-9,]+)$/u.exec(part)
+      if (!match||fields.has(match[1])) invalid('Unsupported or duplicate RRULE field.')
+      fields.set(match[1],match[2])
+    }
+    const frequency=fields.get('FREQ'), days=fields.get('BYDAY'), hour=fields.get('BYHOUR'), minute=fields.get('BYMINUTE')
+    if (!['DAILY','WEEKLY'].includes(frequency??'') || (fields.get('INTERVAL')??'1')!=='1'||
+        !/^\d{1,2}$/u.test(hour??'')||!/^\d{1,2}$/u.test(minute??'')||
+        (frequency==='WEEKLY'?!days||! /^(?:MO|TU|WE|TH|FR|SA|SU)(?:,(?:MO|TU|WE|TH|FR|SA|SU)){0,6}$/u.test(days):days!==undefined)) invalid('Invalid bounded RRULE.')
+    const weekdays=days?[...new Set(days.split(',').map(d=>['MO','TU','WE','TH','FR','SA','SU'].indexOf(d)+1))].sort():undefined
+    return {frequency:frequency==='WEEKLY'?'weekly':'daily',hour:clock(Number(hour),'hour',23),minute:clock(Number(minute),'minute',59),
+      timezone:tz,...(weekdays&&{weekdays,weekday:weekdays[0]})}
+  }
+  if (value.frequency!=='daily'&&value.frequency!=='weekly') invalid('Invalid bounded schedule frequency.')
+  const days=value.weekdays
+  if (days!==undefined && (value.frequency!=='weekly'||!Array.isArray(days)||!days.length||days.length>7||
+      days.some(d=>typeof d!=='number'||!Number.isInteger(d)||d<1||d>7))) invalid('Invalid weekly day list.')
+  if (value.frequency==='daily'&&value.weekday!==undefined) invalid('Daily schedules cannot select a weekday.')
+  return {frequency:value.frequency,timezone:tz,...(value.hour!==undefined&&{hour:clock(value.hour,'hour',23)}),
+    ...(value.minute!==undefined&&{minute:clock(value.minute,'minute',59)}),
+    ...(value.weekday!==undefined&&{weekday:int(value.weekday,'weekday',1,1,7)}),
+    ...(Array.isArray(days)&&{weekdays:[...new Set(days as number[])].sort()})}
 }
 
 export function checkOwner(value: unknown, ctx: WorkspaceContext): void {
@@ -166,7 +213,7 @@ export function parseInputs(body: Record<string, unknown>, ctx: WorkspaceContext
     invalid('Use Compile configuration scheduling fields, not execution arguments.')
   }
   if (mode === 'update' && !Object.hasOwn(body, 'auto_update')) invalid('auto_update is required.')
-  const schedule = scheduleOf(mode === 'update' ? body.update_schedule ?? saved?.update_schedule : args.update_schedule)
+  const schedule = scheduleOf(mode === 'update' ? body.update_schedule ?? saved?.update_schedule : args.update_schedule,!!ctx.compileAdvancedSchedule)
   const enabled = bool(mode === 'update' ? body.auto_update : args.auto_update, 'auto_update', !!schedule && mode === 'create')
   if (enabled && !schedule) invalid('update_schedule is required when auto_update is true.')
   delete args.auto_update

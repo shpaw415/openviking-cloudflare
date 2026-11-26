@@ -6,6 +6,7 @@ import { embeddingUnavailable } from '../fs/vectors.js'
 import { asObject, protocolVersions, requireMcp, serverInfo, toolError } from './common.js'
 import type { Data, McpContext } from './common.js'
 import { callTool, toolCatalog } from './tools.js'
+import { routeLive } from './live.js'
 
 const base = '/api/v1/mcps'
 const shared = 'viking://agent/tools'
@@ -85,6 +86,21 @@ async function definitions(): Promise<Definition[]> {
 function row(ctx: McpContext, root: Root, name: string): Registration | undefined {
   return ctx.sql.exec<Registration>('SELECT * FROM ov_edge_mcp_registry WHERE account_id=? AND scope=? AND name=?',
     ctx.caller.accountId, root.scope, name).toArray()[0]
+}
+
+export async function prepareLocalRead() { await definitions() }
+
+export function localReadRegistration(ctx: McpContext, uri: unknown) {
+  const path = pathFor(uri,ctx.caller)
+  if (path.parts.at(-1) !== 'read.json') unsupported('Live Context only mounts exact local file reads.')
+  const at = root(ctx, `viking://${path.parts.slice(0,-2).join('/')}`)
+  if (at.scope === 'account') unsupported('Only a private local registry may back a Live Context node.')
+  const server = serverName(path.parts.at(-2)), current = catalog?.find(item=>item.tool.name==='read')
+  const entry = row(ctx,at,server) ?? missing()
+  if (!current || stored(entry).find(item=>item.tool.name==='read')?.revision !== current.revision) {
+    throw new ApiError(409,'CONFLICT','The local read definition changed.')
+  }
+  return { uri:path.uri, server, registration:entry.created_at, revision:current.revision }
 }
 
 function visible(ctx: McpContext, requested: unknown) {
@@ -172,7 +188,8 @@ export async function routeRegistry(request: Request, url: URL, ctx: McpContext)
   const queryRoot = () => queryString(url.searchParams, 'target_uri')
   const parse = () => readJson(request, 32 * 1024)
   if (suffix === '/mount' || suffix === '/mounts' || suffix === '/batch-mount' || suffix === '/batch-unmount') {
-    unsupported('MCP tool mounts and evaluated Live Context are not supported.')
+    if (!ctx.mcpLive) unsupported('MCP Live Context is not mounted.')
+    return routeLive(request,url,ctx,suffix)
   }
   if (suffix === '' && method === 'GET') {
     const found = visible(ctx, queryRoot())

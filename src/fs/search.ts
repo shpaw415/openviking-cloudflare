@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { ApiError, ok, readJson } from '../http.js'
+import { ApiError, isRecord, ok, readJson } from '../http.js'
 import {
   JSON_LIMIT, MAX_DEPTH, ROOT, bool, choice, compare, conflict, inPath, int, invalid, linesOf, onlyKeys, parseTags, pathFor,
   relative, str, tagMatch, transport, unsupported,
@@ -15,10 +15,15 @@ import type { FileLevel } from './file-levels.js'
 import { portableFilter, timeBound } from './filters.js'
 import type { SearchRecord } from './filters.js'
 import { edgeSearchDefaults } from '../model-config.js'
+import { mountDataAuthority } from '../data-authority.js'
+import { assembleContext, contextOptions, contextResultUri, contextSource, planQueries, rerankContextPool, rewriteContext } from './search-context.js'
+import { pinSource, pinsCurrent, recallSession } from './search-ledger.js'
+import type { ContextPins } from './search-ledger.js'
+import { keywordSearch } from './search-keywords.js'
 
 const contextTypes = ['resource', 'memory', 'skill'] as const
 const maxHits = 50
-type Candidate = { entry: Entry; path: FsPath; record: SearchRecord; score: number; group?: string; fileLevel?: FileLevel }
+export type SearchCandidate = { entry: Entry; path: FsPath; record: SearchRecord; score: number; group?: string; fileLevel?: FileLevel }
 
 function optionalList(value: unknown, label: string, max: number): unknown[] {
   if (value == null || value === '') return []
@@ -40,17 +45,24 @@ export function excerpt(text: string, cap: number): string {
 }
 
 export async function semantic(fs: Filesystem, request: Request, search: boolean): Promise<Response> {
-  const body = await readJson(request, JSON_LIMIT)
+  const signal = fs.ctx.requestSignal ?? request.signal
+  const body = await readJson(request, JSON_LIMIT, signal)
   const common = 'query image_url target_uri context_type limit node_limit score_threshold filter include_provenance tags since until time_field level read_content telemetry events_time_decay_protection'
   onlyKeys(body, search ? common + ' search_type session_id args mode query_expansion max_tokens quotas purpose detail dedup_turns exclude_uris peer_scope other_peer_penalty rewrite rewrite_max_bullets' : common)
   transport(body)
+  if (search && body.search_type === 'keywords' && body.image_url != null) invalid('Image input is not supported for keywords.')
+  if (search && body.mode === 'context') {
+    const options = contextOptions(fs, body)
+    return collectRanked(fs, body, undefined, signal, options)
+  }
   if (body.image_url != null || body.events_time_decay_protection != null ||
       (search && (Object.keys(body).some(key => ['query_expansion', 'max_tokens', 'quotas', 'purpose', 'detail', 'dedup_turns',
         'exclude_uris', 'peer_scope', 'other_peer_penalty', 'rewrite', 'rewrite_max_bullets'].includes(key)) ||
-         (body.search_type != null && body.search_type !== 'semantic') || (body.mode != null && body.mode !== 'list') || body.args != null))) {
-    unsupported('Only text semantic and metadata-only list search is implemented here.')
+         (body.search_type != null && body.search_type !== 'semantic' && body.search_type !== 'keywords') ||
+         (body.mode != null && body.mode !== 'list') || (body.args != null && body.search_type !== 'keywords')))) {
+    unsupported('This search mode or option is not implemented here.')
   }
-  const { query, hits, searched, eligible, sessionUsed } = await rankedHits(fs, body, undefined, request.signal)
+  const { query, hits, searched, eligible, sessionUsed } = await rankedHits(fs, body, undefined, signal)
   return ok({ memories: hits.filter(hit => hit.context_type === 'memory'), resources: hits.filter(hit => hit.context_type === 'resource'),
     skills: hits.filter(hit => hit.context_type === 'skill'), total: hits.length,
     ...(query && bool(body.include_provenance, 'include_provenance') && { provenance: [{ query, searched_directories: searched,
@@ -60,17 +72,50 @@ export async function semantic(fs: Filesystem, request: Request, search: boolean
     }] }) })
 }
 
-export async function rankedHits(fs: Filesystem, body: Record<string, unknown>, groupFor?: (path: FsPath) => string | undefined, signal?: AbortSignal) {
+export async function recall(fs: Filesystem, request: Request): Promise<Response> {
+  const raw = await readJson(request, JSON_LIMIT)
+  onlyKeys(raw, 'query quotas max_chars min_score peer_scope other_peer_penalty render telemetry session_id query_expansion max_tokens purpose detail score_threshold dedup_turns exclude_uris rewrite rewrite_max_bullets')
+  transport(raw)
+  const query = str(raw.query, 'query', undefined, 1024).trim()
+  if (!query) invalid('A nonempty query is required.')
+  const { max_chars, min_score, render = true, ...body } = raw
+  if (render !== true && render !== false && render !== 'full' && render !== 'compact') invalid('Invalid recall render mode.')
+  const chars = int(max_chars, 'max_chars', 6500, 0, 128_000)
+  if (min_score !== undefined && (typeof min_score !== 'number' || !Number.isFinite(min_score) || min_score < -1 || min_score > 1)) invalid('Invalid min_score.')
+  const defaults = { events: 10, entities: 10, preferences: 3, experiences: 0 }
+  const quotas = body.quotas === undefined ? defaults : isRecord(body.quotas) ? { ...defaults, ...body.quotas } : body.quotas
+  const folded = { ...body, query, quotas, purpose: body.purpose ?? 'coding', query_expansion: body.query_expansion ?? 'auto',
+    detail: body.detail ?? (render === 'compact' ? 'abstract' : undefined), dedup_turns: body.dedup_turns ?? (body.session_id ? 5 : 0),
+    max_tokens: body.max_tokens ?? (max_chars === undefined ? 1600 : Math.max(64, Math.floor(chars / 4) +
+      Number(chars % 4 > 2 || chars % 4 === 2 && Math.floor(chars / 4) % 2 === 1))),
+    score_threshold: body.score_threshold ?? min_score ?? 0.1 }
+  const aliases = ['max_chars', 'min_score', 'render'].filter(key => Object.hasOwn(raw, key))
+  return collectRanked(fs, folded, undefined, request.signal, { ...contextOptions(fs, folded), recall: { render: render !== false, aliases } })
+}
+
+export function rankedHits(fs: Filesystem, body: Record<string, unknown>, groupFor?: (path: FsPath) => string | undefined, signal?: AbortSignal) {
+  return collectRanked(fs, body, groupFor, signal)
+}
+
+type ContextOptions = ReturnType<typeof contextOptions> & { recall?: { render: boolean; aliases: string[] } }
+type ListResult = { query: string; hits: Array<{ uri: string; context_type: ContextKind; level: number; score: number; abstract: string;
+  overview: null; category: string; match_reason: string; tags: string[]; content?: string }>; searched: string[]; eligible: number; sessionUsed: number }
+function collectRanked(fs: Filesystem, body: Record<string, unknown>, groupFor?: (path: FsPath) => string | undefined, signal?: AbortSignal): Promise<ListResult>
+function collectRanked(fs: Filesystem, body: Record<string, unknown>, groupFor: undefined, signal: AbortSignal, options: ContextOptions): Promise<Response>
+async function collectRanked(fs: Filesystem, body: Record<string, unknown>, groupFor?: (path: FsPath) => string | undefined,
+  signal?: AbortSignal, options?: ContextOptions) {
   const query = str(body.query, 'query', '', 1024).trim()
   const roots = optionalList(body.target_uri, 'target_uri', 8).map(uri => pathFor(uri, fs.caller))
   if (!roots.length) roots.push(pathFor(ROOT, fs.caller))
   const selected = optionalList(body.context_type, 'context_type', 3)
     .flatMap(item => str(item, 'context_type', undefined, 128).split(',').map(part => part.trim().toLowerCase()).filter(Boolean))
   if (selected.some(type => !contextTypes.includes(type as ContextKind))) invalid('Unknown context_type.')
-  const requested = levels(body.level)
+  const requestedLevels = levels(body.level)
+  const requested = options ? [] : requestedLevels
   const fallback = int(body.limit, 'limit', fs.ctx.defaultSearchLimit ?? edgeSearchDefaults.limit, 1, maxHits)
   const limit = int(body.node_limit ?? undefined, 'node_limit', fallback, 1, maxHits)
-  const threshold = body.score_threshold ?? fs.ctx.defaultSearchScore ?? edgeSearchDefaults.score
+  const lexical = body.search_type === 'keywords' ? keywordSearch(query, body.args, limit) : undefined
+  const threshold = body.score_threshold ?? (lexical ? 0 : fs.ctx.defaultSearchScore ?? edgeSearchDefaults.score)
   if (typeof threshold !== 'number' || !Number.isFinite(threshold) || threshold < -1 || threshold > 1) invalid('score_threshold must be between -1 and 1.')
   const min: number = threshold
   const timeField = choice(body.time_field ?? undefined, 'time_field', ['created_at', 'updated_at'] as const, 'updated_at')
@@ -85,7 +130,9 @@ export async function rankedHits(fs: Filesystem, body: Record<string, unknown>, 
   const readContent = bool(body.read_content, 'read_content')
   const requestedSession = str(body.session_id ?? undefined, 'session_id', '', 128)
   if (requestedSession && !query) invalid('A text query is required when using session context.')
-  const session = fs.ctx.useSearchSessionContext === false ? '' : requestedSession
+  if (options?.dedup && !requestedSession) invalid('dedup_turns requires an existing session_id.')
+  if (options?.rewrite === 'required' && !fs.ctx.searchDigestGeneration) unsupported('Context rewriting is not enabled by the operator.')
+  const session = options || lexical || fs.ctx.useSearchSessionContext !== false ? requestedSession : ''
   const sessionContext = () => {
     if (!fs.ctx.sessionSearchContext) unsupported('Session context is unavailable for this identity.')
     const result = fs.ctx.sessionSearchContext(session)
@@ -94,47 +141,85 @@ export async function rankedHits(fs: Filesystem, body: Record<string, unknown>, 
     }
     return result
   }
-  if (session) await fs.ctx.reauthorize?.()
-  const history = session ? sessionContext() : undefined
-  const context = history?.text.trim() ?? ''
-  const vector = query ? await queryVector(fs.ctx, query, context) : undefined
-  if (vector) await fs.ctx.reauthorize?.()
+  if (options || lexical || fs.ctx.deferSearchPublication) await mountDataAuthority(fs.ctx)
+  else if (session) await fs.ctx.reauthorize?.()
+  signal?.throwIfAborted()
+  const sessionState = (options || lexical) && session ? recallSession(fs.ctx, session) : undefined
+  const history = !options && !lexical && session ? sessionContext() : undefined
   const checkHistory = () => {
+    sessionState?.check()
     if (!history) return
     const fresh = sessionContext()
     if (fresh.text !== history.text || fresh.usedMessages !== history.usedMessages) conflict('The session changed while searching; retry with its current context.')
   }
+  const check = async () => {
+    await fs.ctx.reauthorize?.()
+    fs.ctx.assertActive?.()
+    signal?.throwIfAborted()
+    checkHistory()
+  }
+  const context = !options ? history?.text.trim() ?? '' : ''
+  // Context planning only receives the caller's explicit query, never the session body.
+  const plan = options && !lexical && query && options.expansion && fs.ctx.useSearchSessionContext !== false && options.width !== 0
+    ? await planQueries(fs.ctx, query, check, signal) : undefined
+  const vectors: Awaited<ReturnType<typeof queryVector>>[] = []
+  if (query && !lexical && options?.width !== 0) {
+    for (const term of plan?.queries ?? [query]) {
+      signal?.throwIfAborted()
+      vectors.push(await queryVector(fs.ctx, term, context, signal))
+      if (options) await check()
+      else await fs.ctx.reauthorize?.()
+    }
+  }
+  signal?.throwIfAborted()
   checkHistory()
+  const vector = vectors[0]
+  const scoreFor = (packed: ArrayBuffer, dimensions: number) => vectors.length === 1 ? cosine(vector, packed, dimensions) :
+    vectors.reduce((best, item) => Math.max(best, cosine(item, packed, dimensions)), -1)
 
-  const candidates: Candidate[] = []
+  const candidates: SearchCandidate[] = []
+  const matches: Array<{ item: SearchCandidate; score: () => number }> = []
   const seen = new Set<string>()
+  const contextReranker = options && vector && signal && fs.ctx.retrievalSettings?.apply_rerank_to_context ? fs.ctx.searchReranker : undefined
+  const admittedScore = (value: number) => value >= min
   let eligible = 0
-  for (const root of roots) {
+  for (const root of options?.width === 0 ? [] : roots) {
     for (const entry of fs.entries(root, true)) {
-      if (entry.is_dir || !entry.dimensions || seen.has(entry.uri)) continue
+      if (entry.is_dir || (!lexical && !entry.dimensions) || seen.has(entry.uri)) continue
       seen.add(entry.uri)
       const path = pathFor(entry.uri, fs.caller)
       if (selected.length && !selected.includes(path.kind)) continue
       const level = sidecarLevel(entry.uri)
       if (level === 2 && path.parts.at(-1)!.startsWith('.')) continue
+      if (lexical && (path.managed && path.kind !== 'skill' || path.parts[0] === 'system')) continue
+      if (options && !contextSource(fs, path, level, options)) continue
+      if (options && entry.derived_from && options.excluded.some(exclusion => inPath(entry.derived_from!, exclusion))) continue
       const group = groupFor?.(path)
       if (groupFor && !group) continue
       const category = path.kind === 'memory' && path.parts.length > 4 ? path.parts[3] : ''
-      function add(logical: Entry, hitLevel: number, bytes: number, scoreForVector: () => number, fileLevel?: FileLevel) {
+      function add(logical: Entry, hitLevel: number, bytes: number, scoreForVector: () => number, fileLevel?: FileLevel, text?: string) {
         if ((since !== undefined && logical[timeField] < since) || (until !== undefined && logical[timeField] > until)) return
         const record: SearchRecord = { uri: logical.uri, context_type: path.kind, level: hitLevel, category,
           search_tags: tagsOf(logical), size: bytes, created_at: logical.created_at, updated_at: logical.updated_at }
         if (!tagMatch(record.search_tags, wanted) || filter && !filter(record)) return
         eligible++
+        if (lexical) {
+          const score = lexical.collect(() => {
+            const body = text ?? fs.content(path).body
+            return path.kind === 'memory' ? body.split(/\n[ \t]*<!--[ \t]*MEMORY_FIELDS\b/u, 1)[0] : hitLevel < 2 && !fileLevel ? summaryText(body) : body
+          }, bytes)
+          if (score) matches.push({ item: { entry, path, record, score: 0, group, fileLevel }, score })
+          return
+        }
         const score = vector ? scoreForVector() : 0
-        if (!vector || score >= min) candidates.push({ entry, path, record, score, group, fileLevel })
+        if (!vector || contextReranker || admittedScore(score)) candidates.push({ entry, path, record, score, group, fileLevel })
       }
       // Keep the historical default ranking/hit count. An explicit level
       // selection reads the document's own derived records (no new viking URI).
       if (level === 2 && admitsFileLevels(path) && (requested.includes(0) || requested.includes(1)) &&
           fs.acl.allows(fs.parent(path), 'read')) {
         for (const item of readFileLevels(fs, path)) if (requested.includes(item.level)) {
-          add(entry, item.level, item.bytes, () => cosine(vector!, item.vectors, item.dimensions), item.level)
+          add(entry, item.level, item.bytes, () => scoreFor(item.vectors, item.dimensions), item.level, item.body)
         }
       }
       if (requested.length && !requested.includes(level)) continue
@@ -146,18 +231,97 @@ export async function rankedHits(fs: Filesystem, body: Record<string, unknown>, 
         if (!directory?.is_dir) continue
         logical = directory
       }
-      add(logical, level, entry.bytes, () => cosine(vector!, fs.vector(path), entry.dimensions))
+      add(logical, level, entry.bytes, () => scoreFor(fs.vector(path), entry.dimensions))
     }
   }
+  for (const hit of matches) {
+    hit.item.score = hit.score()
+    if (admittedScore(hit.item.score)) candidates.push(hit.item)
+  }
   const grouped = new Set<string>()
-  let ranked = candidates.sort((a, b) => b.score - a.score || (!vector ? b.record.updated_at - a.record.updated_at : 0) ||
+  let ranked = candidates.sort((a, b) => b.score - a.score || (!vector && !lexical ? b.record.updated_at - a.record.updated_at : 0) ||
     compare(a.entry.uri, b.entry.uri) || a.record.level - b.record.level).filter(item => {
     if (!item.group) return true
     if (grouped.has(item.group)) return false
     grouped.add(item.group)
     return true
   })
-  const textFor = ({ path, fileLevel }: Pick<Candidate, 'path' | 'fileLevel'>) => {
+  if (lexical) ranked = ranked.slice(0, lexical.window)
+  if (options) {
+    const ledger = options.dedup ? sessionState!.ledger(options.dedup) : undefined
+    const cooled = new Set<string>()
+    if (ledger?.recent.size) ranked = ranked.filter(hit => {
+      const uri = contextResultUri(fs, hit.path, hit.record.level)
+      const prior = ledger.recent.get(uri)
+      if (!prior || !pinsCurrent(fs, prior)) return true
+      cooled.add(uri)
+      return false
+    })
+    const pool = contextReranker ? rerankContextPool(fs, ranked, options, limit) : []
+    const verifyPool = () => {
+      ledger?.check()
+      if (pool.some(item => !pinsCurrent(fs, item.pins))) conflict('The ranked context changed while searching; retry.')
+    }
+    let rescored: number[] | undefined
+    if (contextReranker && signal && pool.length) {
+      const modelQuery = (plan?.queries ?? [query]).join('\n')
+      rescored = await contextReranker.score(modelQuery, pool.map(item => item.text), signal).catch(error => {
+        if (error instanceof ApiError && error.code === 'RERANK_UNAVAILABLE') return undefined
+        throw error
+      })
+      await check()
+      verifyPool()
+    }
+    const rerankScores = new Map(rescored?.map((score, i) => [pool[i].uri, score]))
+    if (contextReranker) ranked = ranked.flatMap(item => {
+      const uri = contextResultUri(fs, item.path, item.record.level)
+      const score = rerankScores.get(uri)
+      if (score !== undefined) return score > (body.score_threshold == null ? contextReranker.threshold : min) ? [{ ...item, score }] : []
+      return admittedScore(item.score) ? [item] : []
+    }).sort((a, b) => b.score - a.score || compare(a.entry.uri, b.entry.uri))
+    const canRewrite = options.rewrite !== 'off' && !!fs.ctx.searchDigestGeneration
+    const defer = fs.ctx.deferSearchPublication
+    const { result, sources, projections } = assembleContext(fs, ranked, options, limit, plan?.status ?? 'off', !!ledger || canRewrite || !!pool.length || !!defer)
+    const verifySelection = () => {
+      fs.ctx.assertActive?.()
+      signal?.throwIfAborted()
+      checkHistory()
+      verifyPool()
+      if (projections.some(pins => !pinsCurrent(fs, pins))) conflict('The selected context changed while assembling it; retry.')
+    }
+    const rewrite = canRewrite ? await rewriteContext(fs.ctx, query, result.entries, options, check, verifySelection, signal) : undefined
+    const noRelevant = rewrite?.status === 'no_relevant'
+    const response = () => {
+      verifySelection()
+      const output = ok({ ...result, digest: rewrite?.digest ?? '', rendered: noRelevant || options.recall?.render === false ? '' : result.rendered,
+        stats: { ...result.stats, rewrite: rewrite?.status ?? 'off',
+          ...(rewrite && { rewrite_usage: rewrite.usage }),
+          ...(contextReranker && { rerank: { used: !!rescored, candidates: pool.length } }),
+          ...(lexical && { search_type: 'keywords' }),
+          ...(options.recall && { deprecated: { endpoint: '/api/v1/search/recall', successor: '/api/v1/search/search',
+            successor_body: { mode: 'context' }, aliases_used: options.recall.aliases } }),
+          dedup: ledger ? { turns: options.dedup, status: ledger.status, cooled: cooled.size, turn: ledger.turn } : { status: 'off' } },
+        ...(body.include_provenance === true && { provenance: [{ query, matched_contexts: result.entries.map(({ uri, category, detail, score }) =>
+          ({ uri, category, detail, score })) }] }),
+      })
+      if (options.recall) {
+        output.headers.set('Deprecation', 'true')
+        output.headers.set('Link', '</api/v1/search/search>; rel="successor-version"')
+      }
+      if (!defer && !noRelevant) ledger?.record(sources)
+      return output
+    }
+    if (defer) {
+      const output = response()
+      defer(() => {
+        if (ledger && !noRelevant) fs.atomic(() => { verifySelection(); ledger.record(sources) })
+        else verifySelection()
+      })
+      return output
+    }
+    return ledger ? fs.atomic(response) : response()
+  }
+  const textFor = ({ path, fileLevel }: Pick<SearchCandidate, 'path' | 'fileLevel'>) => {
     if (fileLevel === undefined) return fs.content(path).body
     return readFileLevels(fs, path, fileLevel)[0]?.body ?? conflict('The indexed file level no longer exists.')
   }
@@ -167,6 +331,7 @@ export async function rankedHits(fs: Filesystem, body: Record<string, unknown>, 
     const documents = shortlist.map(textFor)
     const scores = await reranker.score(query, documents, signal)
     await fs.ctx.reauthorize?.()
+    signal.throwIfAborted()
     fs.ctx.assertActive?.()
     checkHistory()
     // Provider ranking is bound to the readable bytes in the shortlist, not to
@@ -184,12 +349,25 @@ export async function rankedHits(fs: Filesystem, body: Record<string, unknown>, 
   ranked = ranked.slice(0, limit)
   const hits = ranked.map(({ entry, path, record, score, fileLevel }) => {
     const text = textFor({ path, fileLevel })
-    return { uri: vector ? entry.uri : record.uri, context_type: path.kind, level: record.level, score,
+    return { uri: vector || lexical ? entry.uri : record.uri, context_type: path.kind, level: record.level, score,
       abstract: excerpt(record.level < 2 ? summaryText(text) : text, 256),
-      overview: null, category: record.category, match_reason: reranker ? 'provider_rerank' : vector ? (context ? 'cosine_similarity_session' : 'cosine_similarity') : 'metadata_filter', tags: record.search_tags,
+      overview: null, category: record.category, match_reason: lexical ? 'keyword_bm25' : reranker ? 'provider_rerank' : vector ? (context ? 'cosine_similarity_session' : 'cosine_similarity') : 'metadata_filter', tags: record.search_tags,
       ...(readContent && { content: text }) }
   })
   const searched = [...new Set(roots.filter(root => fs.previewEntry(root)?.is_dir).map(root => root.uri))]
+  if (fs.ctx.deferSearchPublication) {
+    const pins: ContextPins = []
+    for (const { path } of ranked) pinSource(fs, pins, path.uri)
+    const levels = ranked.filter(item => item.fileLevel !== undefined).map(item => [item, textFor(item)] as const)
+    fs.ctx.deferSearchPublication(() => {
+      fs.ctx.assertActive?.()
+      signal?.throwIfAborted()
+      checkHistory()
+      if (!pinsCurrent(fs, pins) || levels.some(([item, text]) => textFor(item) !== text)) {
+        conflict('The selected search results changed before publication; retry.')
+      }
+    })
+  }
   return { query, hits, searched, eligible, sessionUsed: context ? history!.usedMessages : 0 }
 }
 

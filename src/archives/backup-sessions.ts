@@ -68,7 +68,8 @@ export function captureSessions(d: Domain): BackupSession[] {
   const { sql, scope: { account } } = d
   if (!hasTable(sql, 'ov_sessions')) return []
   for (const [table, filter] of [['ov_session_flights', ''], ['ov_session_semantic_archives', ''], ['ov_session_tool_results', ''],
-    ['ov_session_auto_commit', ' AND policy IS NOT NULL'], ['ov_bot_threads', '']]) {
+    ['ov_session_auto_commit', ' AND policy IS NOT NULL'], ['ov_session_idle', ''], ['ov_session_idle_receipt', ''], ['ov_session_retention', ''],
+    ['ov_session_checkpoints',''], ['ov_bot_threads', '']]) {
     if (hasTable(sql, table) && sql.exec(`SELECT 1 FROM ${table} WHERE account_id=?${filter} LIMIT 1`, account).toArray().length) unsupported()
   }
   const rows = sql.exec<SessionRow & { user_id: string; agent_id: string }>(`SELECT user_id,agent_id,session_id,created_at,updated_at,last_message_at,last_commit_at,

@@ -1,0 +1,12 @@
+diff --git a/src/shared/hooks/use-query-settlement.ts b/src/shared/hooks/use-query-settlement.ts
+--- a/src/shared/hooks/use-query-settlement.ts
++++ b/src/shared/hooks/use-query-settlement.ts
+@@ -18,7 +18,7 @@ export function useQuerySettlement(queryKey: QueryKey, enabled: boolean) {
+           (event.action.type === 'success' || event.action.type === 'error')) update()
+     })
+   }, [cache, enabled, hash])
+-  const snapshot = useCallback(() => enabled && hash !== undefined ? cache.get(hash)?.state : undefined,
++  const snapshot = useCallback(() => enabled ? cache.get(hash)?.state : undefined,
+     [cache, enabled, hash])
+   useSyncExternalStore(subscribe, snapshot, () => undefined)
+ }

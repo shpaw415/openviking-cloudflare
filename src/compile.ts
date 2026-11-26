@@ -5,6 +5,7 @@ import { subtreeRevision } from './filesystem.js'
 import { encoder, conflict, invalid, onlyKeys, queryString, quota, str, unsupported } from './fs/contract.js'
 import { ApiError, isRecord, ok, readJson } from './http.js'
 import { runArtifacts } from './compile/artifacts.js'
+import { runMemory, submitMemory } from './compile/memory.js'
 import { CompileFiles } from './compile/files.js'
 import { unavailable } from './compile/generate.js'
 import { actorScope, checkOwner, compileName, exampleRoot, paging, parseInputs, recipeMarkdown, recipes, rulesRoot, sha256, submissionKey, targetPath } from './compile/input.js'
@@ -93,7 +94,7 @@ async function enqueueCompile(state: CompileState, files: CompileFiles, inputs: 
   return jobs.enqueue('compile', resource.length <= 512 ? resource : (name ?? 'compile'),
     { v: 1, type: 'compile', inputs, name, requestKey: key, intent, ...(scheduling && { scheduling }) },
     { idempotencyKey: scheduled?.key ?? key ?? undefined,
-      meta: { request: refs, ...(scheduled && { trigger: 'scheduled', scheduled_slot: slotIso(scheduled.slot) }) },
+      meta: { request: refs, ...(scheduled && { trigger: 'scheduled', scheduled_slot: slotIso(scheduled.slot,inputs.update_schedule?.timezone) }) },
       onAccepted: accepted => {
         if (scheduled) {
           verifyAdmission(state, files, inputs, scheduled)
@@ -135,6 +136,7 @@ export async function runDueCompileSchedule(storage: DurableObjectStorage,
     const saved = state.config(row.name)
     if (!saved || saved.signature !== row.revision) return suspend('COMPILE_SCHEDULE_INVALID', true)
     const input: Inputs = JSON.parse(saved.inputs)
+    if (input.update_schedule?.timezone && !ctx.compileAdvancedSchedule) return suspend('COMPILE_SCHEDULE_MOUNT_REQUIRED',false)
     if (!input.auto_update || !input.update_schedule) return suspend('COMPILE_SCHEDULE_INVALID', true)
     const slot = dueSlot(input.update_schedule, timestamp), next = futureSlot(input.update_schedule, timestamp)
     if (slot < row.next_slot || row.last_slot !== null && slot <= row.last_slot) return suspend('COMPILE_SCHEDULE_INVALID', true)
@@ -149,6 +151,10 @@ export async function runDueCompileSchedule(storage: DurableObjectStorage,
 
 async function submit(request: Request, state: CompileState, files: CompileFiles) {
   const ctx = state.ctx, body = await readJson(request, 24_576)
+  if (body.skill === 'memory' && ctx.memoryCompile) {
+    const supplied = request.headers.get('Idempotency-Key')
+    return ok(await submitMemory(body,ctx,supplied===null?null:await sha256(submissionKey(supplied))),202)
+  }
   const named = Object.hasOwn(body, 'compile_name')
   let name: string | null = null
   if (named) {
@@ -273,6 +279,7 @@ export async function runCompile(payload: Record<string, unknown>, ctx: Workspac
     const inputs = ruleInputs({ instruction, sources: [...sources.map(resource_uri => ({ resource_uri })), ...uploads] }, new CompileFiles(ctx))
     return runRules(inputs, payload.taskId, ctx)
   }
+  if (payload.type === 'memory') return runMemory(payload,ctx)
   if (payload.type !== 'compile' || !isRecord(payload.inputs)) return unsupported('Unknown Compile task envelope.')
   const { auto_update, update_schedule, ...raw } = payload.inputs
   if (typeof auto_update !== 'boolean') return invalid('Invalid internal Compile schedule.')

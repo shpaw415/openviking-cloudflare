@@ -34,7 +34,9 @@ async function restoreFile(fs: Filesystem, body: Record<string, unknown>, dry: b
   const sourceId = fullOid(body.restore_commit_id, 'restore_commit_id')
   const expected = body.current_commit_id == null ? undefined : fullOid(body.current_commit_id, 'current_commit_id')
   const store = new SnapshotStore(fs.ctx, path.space)
-  const head = store.head('main') ?? notFound('Snapshot ref not found.')
+  const head = store.assertWritableHead('main') ?? notFound('Snapshot ref not found.')
+  const from = store.resolve(sourceId)
+  store.assertWritableHistory(from)
   const previous = store.files(head)
   const current = previous.get(path.uri)
   const live = captureAt(fs, path.uri)
@@ -48,7 +50,6 @@ async function restoreFile(fs: Filesystem, body: Record<string, unknown>, dry: b
   if (expected) {
     if (last?.oid !== expected || file?.content !== (current && store.blob(current).body)) throw VERSION_CONFLICT()
   }
-  const from = store.resolve(sourceId)
   const source = store.files(from).get(path.uri) ?? notFound('Snapshot file not found.')
   historicalRead(fs, path.uri, source, current)
   const blob = store.blob(source)
@@ -66,6 +67,8 @@ async function restoreFile(fs: Filesystem, body: Record<string, unknown>, dry: b
   if (!next.changes.includes(path.uri)) next.changes.push(path.uri)
   try {
     const prepared = await prepareSubtreeMutation(fs, path.uri, plan)
+    store.assertWritableHeadMatches('main', head)
+    store.assertWritableHistory(from)
     historicalRead(fs, path.uri, source, current)
     commitSubtreeMutation(fs, prepared, () => {
       carry(fs, next, [path.uri])
@@ -133,8 +136,9 @@ export async function routeRestore(request: Request, fs: Filesystem): Promise<Re
     : dry ? defaultSnapshotScope(fs, scopeRequired) : forbidden(scopeRequired)
   const branch = branchName(text(body.branch ?? 'main', 'branch', 80))
   const store = new SnapshotStore(fs.ctx, root.space)
-  const head = store.head(branch) ?? notFound('Snapshot ref not found.')
+  const head = store.assertWritableHead(branch) ?? notFound('Snapshot ref not found.')
   const source = store.resolve(text(body.source_commit, 'source_commit', 80))
+  store.assertWritableHistory(source)
   const { plan, writes, deletes, unchanged, previous, files, targets, original } = restorePlan(fs, root.uri, store, head, source)
   const headAndSource = () => ({ head: visibleRevisionId(fs, store, head), source: visibleRevisionId(fs, store, source) })
   if (dry) return ok({ result: 'dry_run', ...headAndSource(), diff: {
@@ -144,6 +148,8 @@ export async function routeRestore(request: Request, fs: Filesystem): Promise<Re
   if (!writes.length && !deletes.length) return ok({ result: 'noop', ...headAndSource() })
   const next = await store.prepare(files, previous, head, text(body.message ?? `Restore ${root.uri}`, 'message'), ...commitAuthor(body))
   const prepared = await prepareSubtreeMutation(fs, root.uri, plan)
+  store.assertWritableHeadMatches(branch, head)
+  store.assertWritableHistory(source)
   if (subtreeRevision(fs, root.uri) !== plan.expectedRevision) conflict('The workspace changed during restore.')
   for (const target of targets) historicalRead(fs, target, previous.get(target), original.get(target))
   commitSubtreeMutation(fs, prepared, () => {

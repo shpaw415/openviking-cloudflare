@@ -79,7 +79,7 @@ export function sseWire(protocol: Protocol, model: string, requestId: string, no
       }).join('')
     },
     snapshot(text: string, usage: Usage) { return response('completed', [item([part(prefix + text)], 'completed')], usage) },
-    finish(text: string, reason: Finish, usage: Usage, calls: Call[] = []) {
+    finish(text: string, reason: Finish, usage: Usage, calls: Call[] = [], stopSequence?: string) {
       if (protocol === 'chat') {
         const actual = includeUsage && usage.inputTokens !== null && usage.outputTokens !== null ? data({ id,
           object: 'chat.completion.chunk', created, model, choices: [], usage: { prompt_tokens: usage.inputTokens,
@@ -87,8 +87,8 @@ export function sseWire(protocol: Protocol, model: string, requestId: string, no
         return chat({}, reason) + actual + 'data: [DONE]\n\n'
       }
       if (protocol === 'anthropic') return closeText(text, 'completed') +
-        event('message_delta', { delta: { stop_reason: reason === 'stop' ? 'end_turn' : reason === 'length' ? 'max_tokens' :
-          reason === 'content_filter' ? 'refusal' : reason === 'tool_calls' ? 'tool_use' : null, stop_sequence: null },
+        event('message_delta', { delta: { stop_reason: stopSequence ? 'stop_sequence' : reason === 'stop' ? 'end_turn' : reason === 'length' ? 'max_tokens' :
+          reason === 'content_filter' ? 'refusal' : reason === 'tool_calls' ? 'tool_use' : null, stop_sequence: stopSequence ?? null },
          ...(!external ? { usage: { input_tokens: usage.inputTokens, output_tokens: usage.outputTokens } } :
            usage.inputTokens === null && usage.outputTokens === null ? {} : { usage: {
              ...(usage.inputTokens !== null && { input_tokens: usage.inputTokens }),

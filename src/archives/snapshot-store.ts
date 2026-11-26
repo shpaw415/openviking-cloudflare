@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { WorkspaceContext } from '../context.js'
 import type { SubtreeCapture } from '../filesystem.js'
-import { conflict, digest, encoder, invalid, notFound, quota } from './common.js'
+import { conflict, digest, encoder, forbidden, invalid, notFound, quota } from './common.js'
 
 export const SNAPSHOT_FILES = 256
 export const SNAPSHOT_BYTES = 2 * 1024 * 1024
@@ -13,6 +13,7 @@ const AUTHOR_BYTES = 6 * 1024 * 1024
 export const SHA40 = /^[a-f0-9]{40}$/
 const prefixOid = /^[a-f0-9]{7,40}$/
 const COLUMNS = 'oid, parent_oid, tree_oid, message, author_name, author_email, time_seconds, changes'
+export const portableHiddenTable = 'ov_edge_snapshot_portable_hidden'
 export type Revision = {
   oid: string; parent_oid: string | null; tree_oid: string; message: string
   author_name: string; author_email: string; time_seconds: number; changes: string
@@ -83,18 +84,61 @@ export class SnapshotStore {
     return found && this.at(found.oid)
   }
 
+  private limitPortableHistory() {
+    return this.mount === 'shared' && this.ctx.caller.role !== 'admin' &&
+      !!this.sql.exec('SELECT 1 FROM sqlite_schema WHERE type=\'table\' AND name=?', portableHiddenTable).toArray().length
+  }
+
+  hiddenPortable(oid: string): boolean {
+    return this.limitPortableHistory() && !!this.sql.exec(`SELECT 1 FROM ${portableHiddenTable} WHERE account=? AND oid=?`, this.keys[0], oid).toArray().length
+  }
+
+  // A mutation must not derive a tree, version comparison or new commit from
+  // imported shared history. A hidden branch is occupied, not an empty base.
+  assertWritableHistory(...revisions: Revision[]): void {
+    if (!revisions.length || !this.limitPortableHistory()) return
+    // UNION deduplicates OIDs. The indexed traversal stays within one mount
+    // (and the account's bounded history), even if inputs share ancestors.
+    const roots = revisions.map(() => '(?)').join(',')
+    if (this.sql.exec(`WITH RECURSIVE lineage(oid) AS (
+      VALUES ${roots}
+      UNION
+      SELECT c.parent_oid FROM lineage l JOIN ov_edge_snapshot_commit c ON c.oid=l.oid
+        WHERE c.account=? AND c.mount=? AND c.parent_oid IS NOT NULL
+    ) SELECT 1 FROM lineage l JOIN ${portableHiddenTable} h ON h.oid=l.oid WHERE h.account=? LIMIT 1`,
+    ...revisions.map(row => row.oid), ...this.keys, this.keys[0]).toArray().length) {
+      notFound('Snapshot ref not found.')
+    }
+  }
+
+  assertWritableHead(branch: string): Revision | undefined {
+    const head = this.head(branch)
+    if (head) this.assertWritableHistory(head)
+    return head
+  }
+
+  // Commit can create a missing branch (including main). Reserve the entire
+  // shared namespace, independently of any head or portable-state lookup.
+  assertCommitAuthority(): void {
+    if (this.mount === 'shared' && this.ctx.caller.role !== 'admin') {
+      forbidden('Committing snapshots to shared branches requires an administrator.')
+    }
+  }
+
   resolve(ref: string): Revision {
+    const visible = (row?: Revision) => row && !this.hiddenPortable(row.oid) ? row : notFound('Snapshot ref not found.')
     const heads = 'refs/heads/'
-    if (ref.startsWith(heads)) return this.head(branchName(ref.slice(heads.length))) ?? notFound('Snapshot ref not found.')
+    if (ref.startsWith(heads)) return visible(this.head(branchName(ref.slice(heads.length))))
     if (ref.startsWith('refs/')) return notFound('Snapshot ref not found.')
-    if (SHA40.test(ref)) return this.at(ref) ?? notFound('Snapshot ref not found.')
+    if (SHA40.test(ref)) return visible(this.at(ref))
     if (prefixOid.test(ref)) {
-      const rows = this.sql.exec<Revision>(`SELECT ${COLUMNS} FROM ov_edge_snapshot_commit
-        WHERE account=? AND mount=? AND oid>=? AND oid<? LIMIT 2`, ...this.keys, ref, `${ref}g`).toArray()
+      const exclude = this.limitPortableHistory() ? `AND NOT EXISTS (SELECT 1 FROM ${portableHiddenTable} h WHERE h.account=c.account AND h.oid=c.oid)` : ''
+      const rows = this.sql.exec<Revision>(`SELECT ${COLUMNS} FROM ov_edge_snapshot_commit c
+        WHERE account=? AND mount=? AND oid>=? AND oid<? ${exclude} LIMIT 2`, ...this.keys, ref, `${ref}g`).toArray()
       if (rows.length === 2) conflict('Ambiguous snapshot ref.')
       return rows[0] ?? notFound('Snapshot ref not found.')
     }
-    return this.head(branchName(ref)) ?? notFound('Snapshot ref not found.')
+    return visible(this.head(branchName(ref)))
   }
 
   *walk(start: Revision): Generator<Revision> {
@@ -146,7 +190,7 @@ export class SnapshotStore {
 
   // Invoked inside the workspace/FS transaction. No awaits and no write before guards.
   publish(branch: string, expectedHead: Revision | undefined, next: Awaited<ReturnType<SnapshotStore['prepare']>>, blobs: Blob[]): void {
-    this.assertHead(branch, expectedHead)
+    this.assertWritableHeadMatches(branch, expectedHead)
     const jsonChanges = JSON.stringify(next.changes)
     const jsonTree = JSON.stringify(next.tree)
     const metadataBytes = encoder.encode(jsonTree + jsonChanges + next.message + next.authorName + next.authorEmail).byteLength
@@ -173,8 +217,8 @@ export class SnapshotStore {
       ON CONFLICT(account,mount,branch) DO UPDATE SET oid=excluded.oid`, ...this.keys, branch, next.oid)
   }
 
-  assertHead(branch: string, expected?: Revision): void {
-    if (this.head(branch)?.oid !== expected?.oid) conflict('Snapshot branch changed; retry from the latest revision.')
+  assertWritableHeadMatches(branch: string, expected?: Revision): void {
+    if (this.assertWritableHead(branch)?.oid !== expected?.oid) conflict('Snapshot branch changed; retry from the latest revision.')
   }
 
   private capacity(extra: number, maxCommits: number, maxBytes: number, owner?: string): void {

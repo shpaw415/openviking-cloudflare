@@ -22,9 +22,11 @@ type Operation =
   | 'POST /api/v1/search/glob' | 'POST /api/v1/search/grep' | 'POST /api/v1/search/find' | 'POST /api/v1/search/search'
 
 export async function filesystem<T>(ctx: WorkspaceContext, operation: Operation, fields: Data = {}): Promise<{ value: T; hasMore: boolean }> {
+  const signal = ctx.requestSignal
+  signal?.throwIfAborted()
   const [method, path] = operation.split(' ')
   const url = new URL(path, 'https://workspace.invalid')
-  const input: RequestInit = { method }
+  const input: RequestInit = { method, signal }
   if (method === 'GET' || method === 'DELETE') {
     for (const [key, value] of Object.entries(fields)) {
       if (value == null) continue
@@ -40,6 +42,7 @@ export async function filesystem<T>(ctx: WorkspaceContext, operation: Operation,
   const response = await routeFilesystem(new Request(url, input), url, ctx)
   if (!response) throw new ApiError(501, 'NOT_IMPLEMENTED', 'The requested data operation is not mounted.')
   const wire: unknown = await response.json()
+  signal?.throwIfAborted()
   if (!isRecord(wire) || !response.ok || wire.status !== 'ok' || !Object.hasOwn(wire, 'result')) {
     throw new ApiError(500, 'INTERNAL_ERROR', 'The local data operation did not return a result.')
   }

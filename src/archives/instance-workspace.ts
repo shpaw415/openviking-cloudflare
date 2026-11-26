@@ -7,9 +7,11 @@ import { hasTable } from './backup-domain.js'
 import { captureBackup, restoreBackup } from './backup-workspace.js'
 import { digest, fail } from './common.js'
 import { admitInstancePermit, coldRequired, controlName, hashId, instanceId, instanceMode, instanceMount, instanceSeats, memberSeal,
-  offline, refused, withAttachments, workspaceName, wrongStage } from './instance-authority.js'
+  offline, refused, withAttachments, withPortableState, workspaceName, wrongStage } from './instance-authority.js'
 import type { MemberCall } from './instance-authority.js'
-import { attachmentArchiveBytes, attachmentsExpired } from './instance-attachments.js'
+import { attachmentsExpired } from './instance-attachments.js'
+import { memberLimit } from './instance-codec.js'
+import { compileConfigTable, snapshotTables } from './instance-portable-state.js'
 
 const table = 'ov_edge_instance_restore_receipt'
 const attachmentReceipt = 'ov_edge_instance_attachment_deadline'
@@ -45,12 +47,13 @@ function cold(sql: SqlStorage) {
   if (sql.exec("SELECT 1 FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' AND name NOT GLOB '_cf_*' LIMIT 1").toArray().length) coldRequired()
 }
 
-function assertInstancePortable(sql: SqlStorage, carriesAttachments: boolean) {
+function assertInstancePortable(sql: SqlStorage, carriesAttachments: boolean, portable: boolean) {
   const hasRows = (name: string, filter = '') => hasTable(sql, name) && sql.exec(`SELECT 1 FROM ${name} ${filter} LIMIT 1`).toArray().length > 0
   // This living domain is intentionally refused ahead of capture; no bytes or ticket fields are read.
   if (!carriesAttachments && hasRows(attachmentTable)) fail(409, 'INSTANCE_BACKUP_ATTACHMENTS_UNSUPPORTED', 'This backup version cannot represent private Gateway attachments.')
-  const outside = ['ov_edge_snapshot_commit', 'ov_edge_snapshot_head', 'ov_edge_snapshot_blob', 'ov_edge_snapshot_ignore', 'ov_watches',
-    'ov_edge_compile_config', 'ov_edge_compiled_rule', 'ov_edge_compile_artifact', 'ov_gateway_objects', 'ov_gateway_state', 'ov_edge_mcp_registry']
+  const outside = ['ov_watches', 'ov_edge_compiled_rule', 'ov_edge_compile_artifact', 'ov_gateway_objects', 'ov_gateway_state', 'ov_edge_mcp_registry',
+    'ov_mcp_live', 'ov_session_idle', 'ov_session_idle_receipt', 'ov_session_retention', 'ov_session_checkpoints',
+    ...(portable ? ['ov_edge_compile_run', 'ov_edge_compile_schedule'] : [...snapshotTables, compileConfigTable])]
   if (outside.some(name => hasRows(name)) || hasRows('ov_edge_compile_schedule', 'WHERE wake_at IS NOT NULL') ||
       hasRows('ov_edge_fs_entry', `WHERE space!='shared' AND substr(space,1,8)!='["user",'`) ||
       hasRows('ov_jobs', "WHERE status IN ('pending','running','cancelling')")) {
@@ -64,9 +67,10 @@ export function workspaceInstanceBackup(storage: DurableObjectStorage, env: Env,
     const mount = instanceMount(env)
     if (!isRecord(raw) || typeof raw.account !== 'string' || !backupAccountId.test(raw.account) || !instanceId(raw.capture) ||
         env.WORKSPACES.idFromName(workspaceName(raw.account)).toString() !== id) return refused()
-    if (Object.hasOwn(raw, 'profile') && raw.profile !== withAttachments) return refused()
-    const carriesAttachments = raw.profile === withAttachments
-    const extra: Pick<MemberCall, 'profile'> = carriesAttachments ? { profile: withAttachments } : {}
+    if (Object.hasOwn(raw, 'profile') && raw.profile !== withAttachments && raw.profile !== withPortableState) return refused()
+    const portable = raw.profile === withPortableState
+    const carriesAttachments = raw.profile === withAttachments || portable
+    const extra: Pick<MemberCall, 'profile'> = carriesAttachments ? { profile: portable ? withPortableState : withAttachments } : {}
     const additional = Number(carriesAttachments)
     let call: MemberCall
     if (raw.op === 'capture') {
@@ -81,11 +85,11 @@ export function workspaceInstanceBackup(storage: DurableObjectStorage, env: Env,
     }
     const live = await admitInstancePermit(mount, call, permit)
     const scope = scopeFor(env, call.account), signing = memberSeal(mount, call.capture, call.profile)
-    const roster = carriesAttachments ? instanceSeats(env, scope.account) : undefined
-    const seats = roster && { account: scope.account, owns: (user: string, agent: string) => roster.some(s => s.userId === user && s.agentId === agent) }
+    const seats = carriesAttachments ? { account: scope.account,
+      owns: (user: string, agent: string) => instanceSeats(env, scope.account).some(s => s.userId === user && s.agentId === agent) } : undefined
     const sql = storage.sql
     if (call.op === 'capture') return captureBackup(storage, env, scope, undefined, { profile: 'edge-v1' }, {
-      seal: signing, live, seats, check: () => assertInstancePortable(sql, carriesAttachments),
+      seal: signing, live, seats, portable, check: () => assertInstancePortable(sql, carriesAttachments, portable),
     })
 
     const { job, sha256, plan } = call
@@ -113,11 +117,11 @@ export function workspaceInstanceBackup(storage: DurableObjectStorage, env: Env,
     }
     if (call.op === 'receipt') return wrongStage()
     const bytes = carriesAttachments ? archive : zipBuffer(archive)
-    if (!(bytes instanceof ArrayBuffer) || !bytes.byteLength || bytes.byteLength > attachmentArchiveBytes) return refused()
+    if (!(bytes instanceof ArrayBuffer) || !bytes.byteLength || bytes.byteLength > memberLimit(call.profile ?? 'edge-v1')) return refused()
     if (await digest(new Uint8Array(bytes)) !== sha256) return refused()
     return restoreBackup(storage, env, id, scope, undefined, call.op === 'evaluate', bytes, seal,
       { profile: 'edge-v1', on_conflict: 'overwrite', vector_mode: 'deferred' }, undefined, {
-        seal: signing, live, plan, seats, cold: () => cold(sql), commit: (deadline, count) => {
+        seal: signing, live, plan, seats, portable, cold: () => cold(sql), commit: (deadline, count) => {
           sql.exec(`CREATE TABLE ${table} (id INTEGER PRIMARY KEY CHECK(id=1), destination TEXT NOT NULL, job TEXT NOT NULL,
             account TEXT NOT NULL, sha256 TEXT NOT NULL, plan TEXT NOT NULL, receipt TEXT NOT NULL)`)
           const receipt = crypto.randomUUID()

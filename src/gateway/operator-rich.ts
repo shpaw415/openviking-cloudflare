@@ -2,17 +2,19 @@
 import type { WorkspaceContext } from '../context.js'
 import { admitGeneration, openGenerationStream, outputLimit } from '../generation.js'
 import { isRecord, readJson } from '../http.js'
+import { openAIBase } from '../model-config.js'
 import type { BoundModel, VlmConfig } from '../model-config.js'
 import { openOperatorChat, requireChatStream } from '../model-runtime.js'
-import { GatewayError, bytes, maxOutputBytes, modelId } from './contract.js'
-import type { Capability } from './media.js'
+import { GatewayError, bytes, integer, maxOutputBytes, modelId } from './contract.js'
+import { wavOutput } from './media.js'
+import type { AudioOutput, Capability } from './media.js'
 import { usageNumber } from './providers.js'
 import { maxCalls, readCall, toolOutputError, validateCalls, wellFormed } from './tool-dto.js'
 import type { Call } from './tool-dto.js'
 import type { RichInput } from './wire-rich.js'
 
 export type RichFinish = 'stop' | 'length' | 'content_filter' | 'tool_calls'
-export type RichReply = { text: string; finish: RichFinish; calls: Call[]; inputTokens: number | null; outputTokens: number | null }
+export type RichReply = { text: string; finish: RichFinish; calls: Call[]; inputTokens: number | null; outputTokens: number | null; stopSequence?: string; audio?: AudioOutput }
 type ModelBinding = Extract<BoundModel, { kind: 'openai' }>
 type Invoke = [model: string, input: RichInput, maxTokens: number, signal: AbortSignal, guard: () => void]
 export type RichOperator = {
@@ -38,8 +40,8 @@ function configuredCapabilities(raw: string | undefined, binding: ModelBinding, 
   for (const entry of parsed) {
     if (!isRecord(entry) || Object.keys(entry).length !== 3 || !modelId(entry.model) ||
         typeof entry.api_base !== 'string' || entry.api_base.length > 256 || !/^https:\/\/[a-z0-9.-]+(?:\/[A-Za-z0-9_-]+)*$/.test(entry.api_base) ||
-        !Array.isArray(entry.capabilities) || !entry.capabilities.length || entry.capabilities.length > 3 ||
-        entry.capabilities.some(value => value !== 'image' && value !== 'audio' && value !== 'tools') ||
+        !Array.isArray(entry.capabilities) || !entry.capabilities.length || entry.capabilities.length > 4 ||
+        entry.capabilities.some(value => !['image', 'audio', 'tools'].includes(value) && !(value === 'audio_output' && entry.api_base === openAIBase)) ||
         new Set(entry.capabilities).size !== entry.capabilities.length) return
     const identity = `${entry.api_base} ${entry.model}`
     if (seen.has(identity)) return
@@ -61,8 +63,8 @@ export function richOperator(ctx: WorkspaceContext, binding: ModelBinding, confi
   const same = (model: string) => {
     if (model !== config.model) throw new GatewayError(409, 'gateway_configuration_changed', 'The admitted operator model changed.')
   }
-  const dto = (input: RichInput) => input.rules.tools.length ? { tools: input.rules.tools, tool_choice: input.rules.choice,
-    parallel_tool_calls: input.rules.parallel } : {}
+  const dto = (input: RichInput) => ({ ...(input.rules.tools.length && { tools: input.rules.tools, tool_choice: input.rules.choice,
+    parallel_tool_calls: input.rules.parallel }), ...(input.audio && { modalities: ['text', 'audio'], audio: input.audio }) })
   const open = (input: RichInput, max: number, stream: boolean, signal: AbortSignal, guard: () => void) =>
     openOperatorChat(binding, config, input.messages, max, stream, signal, () => {
       ctx.assertActive?.()
@@ -94,11 +96,20 @@ export function richOperator(ctx: WorkspaceContext, binding: ModelBinding, confi
         if (value.error != null || value.tool_calls != null || !isRecord(choice) || choice.index !== undefined && choice.index !== 0 ||
             !isRecord(choice.message) || choice.message.role !== 'assistant') throw failed()
         const message = choice.message, finish = richFinish(choice.finish_reason)
-        if (finish === undefined || message.function_call != null || message.refusal != null || message.audio != null ||
+        if (finish === undefined || message.function_call != null || message.refusal != null || !input.audio && message.audio != null ||
             message.reasoning != null || message.reasoning_content != null || message.content != null && !wellFormed(message.content)) throw failed()
         const text = message.content as string | null | undefined ?? ''
         if (bytes(text) > maxOutputBytes) throw failed()
         secretGuard(text)
+        let audio: AudioOutput | undefined
+        if (input.audio) {
+          const source = message.audio
+          if (finish !== 'stop' || !isRecord(source) || !wellFormed(source.transcript) || !source.transcript.trim() ||
+              bytes(source.transcript) > maxOutputBytes || !integer(source.expires_at, 1, Number.MAX_SAFE_INTEGER) ||
+              !wavOutput(source.data, secretGuard)) throw failed()
+          secretGuard(text + source.transcript)
+          audio = { data: source.data, transcript: source.transcript, expires_at: source.expires_at, id: '' }
+        }
         let calls: Call[] = []
         if (message.tool_calls != null) {
           if (!Array.isArray(message.tool_calls) || message.tool_calls.length > maxCalls) throw toolOutputError()
@@ -108,10 +119,10 @@ export function richOperator(ctx: WorkspaceContext, binding: ModelBinding, confi
             return readCall(input.rules, item.id, item.function.name, item.function.arguments, true, toolOutputError)
           })
         }
-        if (!text.trim() && !calls.length) throw failed()
+        if (!text.trim() && !calls.length && !audio) throw failed()
         validateCalls(calls, finish, input.rules, input.ids, secretGuard, text)
         const usage = isRecord(value.usage) ? value.usage : {}
-        return { text, finish, calls, inputTokens: usageNumber(usage.prompt_tokens), outputTokens: usageNumber(usage.completion_tokens) }
+        return { text, finish, calls, audio, inputTokens: usageNumber(usage.prompt_tokens), outputTokens: usageNumber(usage.completion_tokens) }
       } catch (error) {
         if (response && !response.body?.locked) void response.body?.cancel().catch(() => {})
         if (signal.aborted) throw signal.reason

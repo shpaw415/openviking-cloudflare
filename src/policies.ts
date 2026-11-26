@@ -4,6 +4,7 @@ import { ApiError, ok } from './http.js'
 import { activateCommand, byteLength, decoded, name, notFound, PrivacyInputError, query, reference,
   requireNoReveal, scanCommand, segment, select, versionNumber, writeCommand } from './policies/protocol.js'
 import { fieldStates, initStore, PolicyStore, publicSnapshot } from './policies/store.js'
+import { scanPrivacy } from './policies/scan.js'
 
 export function initPolicies(ctx: WorkspaceContext): void {
   initStore(ctx.sql)
@@ -56,7 +57,7 @@ async function dispatch(request: Request, url: URL, ctx: WorkspaceContext, parts
 
   if (parts.length === 1) {
     const [route] = parts
-    if (route === 'scan' && method === 'POST') return scanCommand(request)
+    if (route === 'scan' && method === 'POST') return scanPrivacy(ctx, await scanCommand(request))
     if (route === 'resolve' && method === 'POST') {
       const selected = await select(request, owner, true)
       if (selected.field === undefined) throw new Error('Expected a validated Privacy field selector.')

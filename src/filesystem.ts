@@ -11,7 +11,7 @@ import { Filesystem, ordered, tagsOf, wireEntry } from './fs/store.js'
 import type { Entry } from './fs/store.js'
 import { batchSetTags, batchWrite, download, read, setTags, summary, write } from './fs/content.js'
 import { addResource, tempUpload } from './fs/resources.js'
-import { glob, grep, semantic } from './fs/search.js'
+import { glob, grep, recall, semantic } from './fs/search.js'
 import { ensureDirectoryIndex, reindex } from './fs/indexing.js'
 import { routeSkills } from './skills.js'
 
@@ -198,6 +198,9 @@ export async function routeFilesystem(request: Request, url: URL, ctx: Workspace
     case '/api/v1/resources/temp_upload':
       checkMethod(request, 'POST')
       return tempUpload(fs, request, url)
+    case '/api/v1/search/recall':
+      checkMethod(request, 'POST')
+      return recall(fs, request)
     case '/api/v1/search/find':
     case '/api/v1/search/search':
       checkMethod(request, 'POST')

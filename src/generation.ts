@@ -70,14 +70,26 @@ export function outputLimit(requested: number | undefined, config: VlmConfig): n
 
 export function generation(ctx: WorkspaceContext, binding: BoundModel, config: VlmConfig): Generation {
   return async (messages, options = {}) => {
+    if (options.reasoningEffort !== undefined && (binding.kind !== 'openai' || config.reasoning_effort === undefined || !ctx.sessionReasoning)) {
+      throw new ApiError(503, 'SESSION_REASONING_UNAVAILABLE', 'The configured session model does not admit reasoning overrides.')
+    }
     const max = outputLimit(options.maxTokens, config)
-    const { input, units } = await authorizeInput(ctx, messages, max)
+    const { input, units } = await authorizeInput(ctx, messages, max, options.signal)
     // The async authorizeInput return is itself a yield. This check and the
     // binding call must stay in the same Workspace turn.
     ctx.assertActive?.()
+    options.signal?.throwIfAborted()
     const release = admitGeneration(ctx, config, units)
     let output: unknown
-    try { output = await modelChat(binding, config, input, max) } catch { throw unavailable() }
+    try {
+      const effective = options.reasoningEffort === undefined ? config : { ...config, reasoning_effort: options.reasoningEffort }
+      output = await modelChat(binding, effective, input, max, options.signal)
+    }
+    catch (error) {
+      options.signal?.throwIfAborted()
+      if (error instanceof ApiError && error.code === 'GENERATION_TIMEOUT') throw error
+      throw unavailable()
+    }
     finally { release() }
     if (!isRecord(output) || typeof output.response !== 'string' || !output.response.trim() || encoder.encode(output.response).byteLength > 65_536) throw unavailable()
     const usage = isRecord(output.usage) ? output.usage : {}

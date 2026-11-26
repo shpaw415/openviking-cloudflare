@@ -10,16 +10,18 @@ import type { Protocol } from './contract.js'
 import type { ReadGatewayAttachment } from './media.js'
 import type { RichOperator } from './operator-rich.js'
 import type { TextFilter } from './sse-source.js'
+import type { NativeRoutes } from './native-operator.js'
 
 // Trusted deployment-side interface. Do not construct it from request data.
 export interface GatewayProvider {
   models: readonly string[]
   /** Opaque deployment destination identity; kept only in Responses routing state. */
   responseScope?: string
-  generate(model: string, messages: ModelMessage[], options: { maxTokens: number }): ReturnType<Generation>
+  generate?(model: string, messages: ModelMessage[], options: { maxTokens: number }): ReturnType<Generation>
   generateStream?(model: string, messages: ModelMessage[], options: StreamGenerationOptions): ReturnType<GenerationStream>
   streamTextFilter?(): TextFilter
   rich?: RichOperator
+  native?: NativeRoutes
   countTokens?(model: string, messages: ModelMessage[]): Promise<number>
 }
 
@@ -47,35 +49,44 @@ export type Upstream = {
 }
 export type SavedUpstream = Upstream & { id: string; revision: number }
 
-export function manifest(ctx: GatewayContext, binding: Binding): readonly string[] {
+export function nativeRoute(ctx: GatewayContext, binding: Binding, protocol: Protocol) {
+  return binding === 'operator' && protocol !== 'chat' && !ctx.gatewayKey && ctx.assertGatewayMount
+    ? ctx.gatewayProvider?.native?.[protocol] : undefined
+}
+
+export function manifest(ctx: GatewayContext, binding: Binding, protocol: Protocol): readonly string[] {
   if (binding === 'workers_ai') return ctx.externalGeneration ? [] : [ctx.workersAIModel ?? generationModel]
+  const native = nativeRoute(ctx, binding, protocol)
+  if (native !== undefined) return native ? [native.model] : []
   const models = ctx.gatewayProvider?.models
   return Array.isArray(models) && models.length > 0 && models.length <= 32 && models.every(modelId) ? models : []
 }
 
-export function isBound(ctx: GatewayContext, binding: Binding): boolean {
+export function isBound(ctx: GatewayContext, binding: Binding, protocol: Protocol): boolean {
   return binding === 'workers_ai' ? !ctx.externalGeneration && typeof ctx.generate === 'function' :
-    manifest(ctx, binding).length > 0 && typeof ctx.gatewayProvider?.generate === 'function'
+    manifest(ctx, binding, protocol).length > 0 && (!!nativeRoute(ctx, binding, protocol) || typeof ctx.gatewayProvider?.generate === 'function')
 }
 
 export function generationConfigured(ctx: GatewayContext): boolean {
-  return isBound(ctx, 'workers_ai') || isBound(ctx, 'operator')
+  return isBound(ctx, 'workers_ai', 'chat') || protocols.some(protocol => isBound(ctx, 'operator', protocol))
 }
 
 export function defaults(ctx: GatewayContext): SavedUpstream[] {
   const entries: SavedUpstream[] = []
   for (const binding of ['workers_ai', 'operator'] as const) {
-    const models = manifest(ctx, binding)
-    if (!models.length) continue
-    for (const protocol of protocols) entries.push({ id: `${binding}-${protocol}`, revision: 0,
+    for (const protocol of protocols) {
+      const models = manifest(ctx, binding, protocol)
+      if (!models.length) continue
+      entries.push({ id: `${binding}-${protocol}`, revision: 0,
       name: binding === 'workers_ai' ? 'Workers AI' : 'Operator binding', binding, protocol,
       models: [...new Set(models)], aliases: {}, priority: binding === 'workers_ai' ? 0 : -1, enabled: true })
+    }
   }
   return entries
 }
 
 export function viewUpstream(ctx: GatewayContext, upstream: SavedUpstream) {
-  return { ...upstream, base_url: bindingUris[upstream.binding], binding_configured: isBound(ctx, upstream.binding),
+  return { ...upstream, base_url: bindingUris[upstream.binding], binding_configured: isBound(ctx, upstream.binding, upstream.protocol),
     append_endpoint_path: true, auth_mode: 'managed', key_header: 'authorization', has_api_key: false, vendor: 'generic',
     allow_gateway_tools: false, replay_reasoning: false, coding_plan: false, allow_coding_plan: false,
     cache_min_tokens: 1024, context_windows: {} }
@@ -102,7 +113,7 @@ export function parseUpstream(ctx: GatewayContext, value: Record<string, unknown
   }
   const protocol = value.protocol
   if (!protocols.includes(protocol as Protocol)) throw invalidConfig('Expected chat, responses, or anthropic protocol.')
-  const allowed = manifest(ctx, binding), models = value.models === undefined ? allowed : value.models
+  const allowed = manifest(ctx, binding, protocol as Protocol), models = value.models === undefined ? allowed : value.models
   if (!Array.isArray(models) || models.length < 1 || models.length > 32 ||
       models.some(model => !modelId(model) || !allowed.includes(model))) {
     throw invalidConfig('models must be a nonempty subset of the binding inventory.')
@@ -123,14 +134,25 @@ export function parseUpstream(ctx: GatewayContext, value: Record<string, unknown
 
 export function routedModel(ctx: GatewayContext, rule: Upstream, name: string): string | undefined {
   const target = Object.hasOwn(rule.aliases, name) ? rule.aliases[name] : name
-  return rule.models.includes(target) && manifest(ctx, rule.binding).includes(target) ? target : undefined
+  return rule.models.includes(target) && manifest(ctx, rule.binding, rule.protocol).includes(target) ? target : undefined
 }
 
 export type Target = { rule: SavedUpstream; model: string; responseScope?: string }
 
+export function targetFor(ctx: GatewayContext, rule: SavedUpstream, model: string): Target {
+  return { rule, model, responseScope: rule.binding === 'operator'
+    ? nativeRoute(ctx, rule.binding, rule.protocol)?.scope ?? ctx.gatewayProvider?.responseScope : undefined }
+}
+
+export function canStream(ctx: GatewayContext, target: Target): boolean {
+  return routedModel(ctx, target.rule, target.model) === target.model &&
+    (!!nativeRoute(ctx, target.rule.binding, target.rule.protocol)?.stream || !!streamSource(ctx, target))
+}
+
 export function streamSource(ctx: GatewayContext, target: Target): GenerationStream | undefined {
-  if (!isBound(ctx, target.rule.binding) || !target.rule.models.includes(target.model) ||
-      !manifest(ctx, target.rule.binding).includes(target.model)) return
+  if (!isBound(ctx, target.rule.binding, target.rule.protocol) || !target.rule.models.includes(target.model) ||
+      !manifest(ctx, target.rule.binding, target.rule.protocol).includes(target.model) ||
+      nativeRoute(ctx, target.rule.binding, target.rule.protocol) !== undefined) return
   if (target.rule.binding === 'workers_ai') return ctx.generateStream
   const provider = ctx.gatewayKey ? undefined : ctx.gatewayProvider
   if (provider?.generateStream) return (messages, options = {}) => provider.generateStream!(target.model, messages, options)
@@ -143,14 +165,14 @@ export function resolveTarget(ctx: GatewayContext, upstreams: SavedUpstream[], p
     const model = routedModel(ctx, rule, name)
     if (!model) continue
     // No automatic fallback to a different provider if the winning route is down.
-    if (!isBound(ctx, rule.binding)) throw unconfigured()
-    return { rule, model, responseScope: rule.binding === 'operator' ? ctx.gatewayProvider?.responseScope : undefined }
+    if (!isBound(ctx, rule.binding, protocol)) throw unconfigured()
+    return targetFor(ctx, rule, model)
   }
   throw new GatewayError(404, 'no_matching_upstream', 'No enabled route matches this protocol and model.')
 }
 
 export function listModels(ctx: GatewayContext, upstreams: SavedUpstream[]): string[] {
-  return [...new Set(upstreams.flatMap(rule => !rule.enabled || !isBound(ctx, rule.binding) ? [] :
+  return [...new Set(upstreams.flatMap(rule => !rule.enabled || !isBound(ctx, rule.binding, rule.protocol) ? [] :
     [...rule.models, ...Object.keys(rule.aliases)].filter(name => {
       try { resolveTarget(ctx, upstreams, rule.protocol, name); return true } catch { return false }
     })))].sort()
@@ -177,7 +199,7 @@ export async function generate(ctx: GatewayContext, target: Target, messages: Mo
     try {
       output = await within(25_000, () => {
         fence()
-        return operator ? ctx.gatewayProvider!.generate(target.model, messages, { maxTokens }) : ctx.generate!(messages, { maxTokens })
+        return operator ? ctx.gatewayProvider!.generate!(target.model, messages, { maxTokens }) : ctx.generate!(messages, { maxTokens })
       }, () => { timedOut = true; return timeout() })
     } catch (error) {
       if (error instanceof GatewayError) throw error

@@ -110,7 +110,8 @@ async function commit(request: Request, fs: Filesystem): Promise<Response> {
   const paths = body.paths ?? [defaultSnapshotScope(fs, 'Snapshot commit requires explicit paths.').uri]
   if (!Array.isArray(paths)) return invalid('paths must be an array.')
   const { roots, selected, store } = scopes(fs, paths, true)
-  const head = store.head(branch)
+  store.assertCommitAuthority()
+  const head = store.assertWritableHead(branch)
   const previous = store.files(head)
   const rules = ignoreSource(fs), ignored = compileIgnore(rules)
   const captures = new Map<string, SubtreeCapture | undefined>()
@@ -150,7 +151,8 @@ async function commit(request: Request, fs: Filesystem): Promise<Response> {
   const next = await store.prepare(files, previous, head, message, ...author)
   await fs.ctx.reauthorize?.()
   return fs.atomic(() => {
-    store.assertHead(branch, head)
+    store.assertCommitAuthority()
+    store.assertWritableHeadMatches(branch, head)
     if (rules !== ignoreSource(fs)) conflict('Snapshot ignore rules changed while capturing.')
     for (const [root, saved] of captures) {
       if (subtreeRevision(fs, root) !== (saved?.revision ?? null)) conflict('Filesystem changed while capturing the snapshot.')
@@ -183,7 +185,8 @@ function show(fs: Filesystem, query: URLSearchParams, headOnly: boolean): Respon
   const selected = store.resolve(text(param(query, 'target_ref'), 'target_ref', 80))
   const ref = store.files(selected).get(path.uri)
   if (!ref) {
-    const parent = selected.parent_oid ? store.files(store.at(selected.parent_oid)).get(path.uri) : undefined
+    const parent = selected.parent_oid && !store.hiddenPortable(selected.parent_oid)
+      ? store.files(store.at(selected.parent_oid)).get(path.uri) : undefined
     historicalRead(fs, path.uri, parent)
     throw new ArchiveError(404, 'NOT_FOUND', 'Snapshot file not found.',
       { type: 'git_blob', resource: path.uri, reason: 'path_not_found', deleted_file: !!parent })
@@ -249,6 +252,7 @@ export function fileChanges(row: Revision): string[] { return JSON.parse(row.cha
 
 function canReadRevisionMetadata(fs: Filesystem, store: SnapshotStore, revision: Revision, changes = fileChanges(revision)): boolean {
   if (store.mount !== 'shared' || fs.caller.role === 'admin') return true
+  if (store.hiddenPortable(revision.oid)) return false
   const current = store.files(revision)
   const prior = store.files(revision.parent_oid ? store.at(revision.parent_oid) : undefined)
   try {
@@ -285,6 +289,7 @@ function history(fs: Filesystem, query: URLSearchParams): Response {
   const start = store.resolve(text(param(query, 'branch') ?? 'main', 'branch', 80))
   const output: ReturnType<typeof wireRevision>[] = []
   for (const row of store.walk(start)) {
+    if (store.hiddenPortable(row.oid)) break
     const changes = fileChanges(row)
     if ((!implicit && !changes.some(selected)) || !canReadRevisionMetadata(fs, store, row, changes)) continue
     if (offset > 0) { offset--; continue }
@@ -304,6 +309,7 @@ function versions(fs: Filesystem, query: URLSearchParams): Response {
   const root = store.head('main'), result: ReturnType<typeof wireRevision>[] = []
   let found = !cursor
   if (root) for (const row of store.walk(root)) {
+    if (store.hiddenPortable(row.oid)) break
     const changes = fileChanges(row)
     if (!changes.includes(path.uri) || !store.files(row).has(path.uri) || !canReadRevisionMetadata(fs, store, row, changes)) continue
     if (!found) { found = row.oid === cursor; continue }

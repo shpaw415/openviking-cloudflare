@@ -1,0 +1,555 @@
+diff --git a/src/features/connection/hooks/use-edge-features.tsx b/src/features/connection/hooks/use-edge-features.tsx
+--- a/src/features/connection/hooks/use-edge-features.tsx
++++ b/src/features/connection/hooks/use-edge-features.tsx
+@@ -1,10 +1,10 @@
+ import type { ConnectionDraft } from '#/features/connection/lib/types'
+ import type { EdgeFeatures } from '#/shared/lib/edge-capabilities'
+-import { fetchEdgeFeatures } from '#/shared/lib/edge-capabilities'
++import { edgeImportFlags, fetchEdgeFeatures } from '#/shared/lib/edge-capabilities'
+ import { createContext, useContext, useEffect, useMemo, useState } from 'react'
+ import type { ReactNode } from 'react'
+ 
+-const closed = { flags: {} as EdgeFeatures, pending: false }
++const closed = { flags: {} as EdgeFeatures, pending: false, workspace: false }
+ const EdgeFeatureContext = createContext(closed)
+ 
+ export function EdgeFeatureProvider({ connection, management, enabled, children }: {
+@@ -25,10 +25,7 @@
+     const commit = (flags: EdgeFeatures) => {
+       if (controller.signal.aborted) return
+       if (identity.management) {
+-        delete flags.urlImport
+-        delete flags.htmlImport
+-        delete flags.siteImport
+-        delete flags.gitDocsImport
++        for (const flag of edgeImportFlags) delete flags[flag]
+       }
+       setResult({ identity, flags })
+     }
+@@ -36,7 +33,8 @@
+     return () => controller.abort()
+   }, [identity, ready])
+   const current = result?.identity === identity ? result : undefined
+-  return <EdgeFeatureContext.Provider value={ready ? { flags: current?.flags ?? closed.flags, pending: !current } : closed}>{children}</EdgeFeatureContext.Provider>
++  return <EdgeFeatureContext.Provider value={{ flags: ready ? current?.flags ?? closed.flags : closed.flags,
++    pending: ready && !current, workspace: !management && !!key && !!baseUrl }}>{children}</EdgeFeatureContext.Provider>
+ }
+ 
+ export function useEdgeFeatures() {
+diff --git a/src/features/workbench/resources/components/add-resource-page.tsx b/src/features/workbench/resources/components/add-resource-page.tsx
+--- a/src/features/workbench/resources/components/add-resource-page.tsx
++++ b/src/features/workbench/resources/components/add-resource-page.tsx
+@@ -27,8 +27,8 @@
+ import { WebResourceOptions } from '#/features/workbench/resources/components/web-resource-options'
+ import type { RemoteStartResult } from '#/features/workbench/resources/hooks/use-resource-upload'
+ import { useResourceUpload } from '#/features/workbench/resources/hooks/use-resource-upload'
+-import type { ApprovedSource, ApprovedUrlDraft } from '#/features/workbench/resources/hooks/use-approved-url-import'
+-import { isApprovedDestinationShape, isApprovedUrlShape } from '#/features/workbench/resources/hooks/use-approved-url-import'
++import type { ApprovedUrlDraft } from '#/features/workbench/resources/hooks/use-approved-url-import'
++import { approvedSourceModes, approvedSources, isApprovedDestinationShape, isApprovedUrlShape, isCollection, isConnectorDocument, isPrivateImport, usesAlias } from '#/features/workbench/resources/hooks/use-approved-url-import'
+ import { buildResourceImportCommonBody } from '#/features/workbench/resources/lib/resource-import-request'
+ import type { RemoteResourceTypeSelection } from '#/features/workbench/resources/lib/resource-source'
+ import { detectRemoteResourceKind } from '#/features/workbench/resources/lib/resource-source'
+@@ -50,8 +50,6 @@
+ import { useEdgeFeatures } from '#/features/connection/hooks/use-edge-features'
+ 
+ type Mode = 'upload' | 'remote'
+-const SOURCE_FLAGS = { text: 'urlImport', html: 'htmlImport', site: 'siteImport', git: 'gitDocsImport' } as const
+-const SOURCE_MODES: ApprovedSource[] = ['text', 'html', 'site', 'git']
+ 
+ const DEFAULT_WEB_OPTIONS: WebResourceOptionsValue = {
+   allowExternalLinks: false,
+@@ -113,8 +111,8 @@
+   const { i18n, t } = useTranslation('addResource')
+   const { enqueueUploads, startRemote, resetRemote, remoteState, approvedUrl } =
+     useResourceUpload()
+-  const { flags, pending } = useEdgeFeatures()
+-  const availableSources = SOURCE_MODES.filter(source => flags[SOURCE_FLAGS[source]] === true)
++  const { flags, pending, workspace } = useEdgeFeatures()
++  const availableSources = approvedSourceModes.filter(source => flags[approvedSources[source].flag] === true)
+   const canImportUrl = EDGE_STUDIO && !watchRequired && !pending && availableSources.length > 0
+   const urlState = EDGE_STUDIO ? approvedUrl.state : { phase: 'idle' } as const
+   const [mode, setMode] = useState<Mode>(EDGE_STUDIO ? urlState.phase === 'idle' ? 'upload' : 'remote' : watchRequired ? 'remote' : initialMode)
+@@ -130,6 +128,8 @@
+   const urlInput = useRef<HTMLInputElement>(null)
+   const destinationInput = useRef<HTMLInputElement>(null)
+   const consentInput = useRef<HTMLInputElement>(null)
++  const importStatus = useRef<HTMLDivElement>(null)
++  const importAction = useRef<HTMLButtonElement>(null)
+   const [destinationMode, setDestinationMode] =
+     useState<ResourceDestinationMode>('parent')
+   const [strict, setStrict] = useState(false)
+@@ -157,7 +157,8 @@
+   const remotePhase = remoteState.phase
+   const activeMode = EDGE_STUDIO && !canImportUrl ? 'upload' : mode
+   const edgeUrl = EDGE_STUDIO && activeMode === 'remote'
+-  const attach = edgeUrl ? approvedUrl.attach : undefined
++  const showReceipt = EDGE_STUDIO && workspace && !watchRequired && urlState.phase !== 'idle'
++  const attach = edgeUrl || showReceipt ? approvedUrl.attach : undefined
+   const completion = useRef(onCompleted)
+   useLayoutEffect(() => { completion.current = onCompleted }, [onCompleted])
+   useLayoutEffect(() => {
+@@ -168,19 +169,31 @@
+   const requestedSource = urlDraft.source ?? 'text'
+   const sourceMode = availableSources.includes(requestedSource) ? requestedSource : undefined
+   const isSite = sourceMode === 'site'
+-  const isWebDocument = sourceMode === 'html' || sourceMode === 'git'
++  const collection = isCollection(sourceMode)
++  const privateImport = isPrivateImport(sourceMode)
++  const alias = usesAlias(sourceMode)
++  const connector = isConnectorDocument(sourceMode)
++  const liveHtml = flags.liveOriginImport === true
++  const receiptSource = 'draft' in urlState ? urlState.draft.source : undefined
++  const receiptAlias = usesAlias(receiptSource) || isConnectorDocument(receiptSource)
+   const modeHint = sourceMode ? undefined : t('studio:edge.webImportModeHint')
+-  const webInput = sourceMode === 'git' ? { label: t('studio:edge.webImportAlias'), hint: t('studio:edge.webImportGitHint'), alias: true }
++  const webInput = alias ? { label: t('studio:edge.webImportAlias'), hint: t(sourceMode === 'git' ? 'studio:edge.webImportGitHint' : 'studio:edge.webImportGroupHint'), alias: true }
++    : connector ? { label: t('studio:edge.webImportDocument'), hint: t(sourceMode === 'feishu-native' ? 'studio:edge.webImportFeishuHint' : 'studio:edge.webImportTosHint'), alias: true }
+     : isSite ? { hint: t('studio:edge.webImportSiteHint') }
+-    : sourceMode === 'html' ? { hint: t('studio:edge.webImportHtmlHint') }
++    : sourceMode === 'html' ? { hint: t(liveHtml ? 'studio:edge.webImportLiveHtmlHint' : 'studio:edge.webImportHtmlHint') }
++    : sourceMode === 'feed' ? { hint: t('studio:edge.webImportFeedHint') }
++    : sourceMode === 'sitemap' ? { hint: t('studio:edge.webImportSitemapHint') }
+     : modeHint ? { hint: modeHint } : undefined
+-  const urlError = urlIssue === 'empty' ? t(sourceMode === 'git' ? 'studio:edge.webImportAliasRequired' : 'studio:edge.urlImportRequired')
+-    : urlIssue === 'url' ? t(sourceMode === 'git' ? 'studio:edge.webImportAliasInvalid' : isSite || isWebDocument ? 'studio:edge.webImportUrlInvalid' : 'studio:edge.urlImportInvalid')
+-    : refusal === 'source' ? t(isSite || isWebDocument ? 'studio:edge.webImportSourceRefused' : 'studio:edge.urlImportSource')
+-    : refusal === 'sourceTimeout' ? t('studio:edge.urlImportSourceTimeout') : undefined
+-  const exactHint = modeHint ?? (isSite || isWebDocument
+-    ? t(isSite ? 'studio:edge.webImportFolderHint' : 'studio:edge.webImportFileHint') : undefined)
+-  const exactInvalid = isSite ? 'studio:edge.webImportFolderInvalid' : isWebDocument ? 'studio:edge.webImportFileInvalid' : 'studio:edge.urlImportExactInvalid'
++  const urlError = urlIssue === 'empty' ? t(alias ? 'studio:edge.webImportAliasRequired' : connector ? 'studio:edge.webImportDocumentRequired' : 'studio:edge.urlImportRequired')
++    : urlIssue === 'url' ? t(alias ? 'studio:edge.webImportAliasInvalid' : connector ? 'studio:edge.webImportDocumentInvalid'
++      : sourceMode === 'html' && !liveHtml ? 'studio:edge.webImportUrlInvalid' : sourceMode === 'sitemap' ? 'studio:edge.webImportSitemapInvalid'
++      : isSite ? 'studio:edge.webImportSiteInvalid' : sourceMode && sourceMode !== 'text' ? 'studio:edge.webImportCanonicalInvalid' : 'studio:edge.urlImportInvalid')
++    : refusal === 'source' ? t(receiptSource && receiptSource !== 'text' ? 'studio:edge.webImportSourceRefused' : 'studio:edge.urlImportSource')
++    : refusal === 'sourceTimeout' ? t(receiptAlias ? 'studio:edge.webImportAliasTimeout' : 'studio:edge.urlImportSourceTimeout') : undefined
++  const exactHint = modeHint ?? (privateImport ? t(collection ? 'studio:edge.webImportPrivateFolder' : 'studio:edge.webImportPrivateFile')
++    : isSite ? t('studio:edge.webImportFolderHint') : sourceMode === 'html' || sourceMode === 'git' ? t('studio:edge.webImportFileHint') : undefined)
++  const exactInvalid = privateImport ? collection ? 'studio:edge.webImportPrivateFolder' : 'studio:edge.webImportPrivateFile'
++    : collection ? 'studio:edge.webImportFolderInvalid' : sourceMode === 'html' || sourceMode === 'git' ? 'studio:edge.webImportFileInvalid' : 'studio:edge.urlImportExactInvalid'
+   const destinationError = urlIssue === 'destination'
+     ? t(urlDraft.mode === 'to' ? exactInvalid : 'studio:edge.urlImportParentInvalid')
+     : refusal === 'siteFolderExists' ? t('studio:edge.webImportFolderExists')
+@@ -307,7 +320,7 @@
+         sourceSelect.current?.focus()
+         return
+       }
+-      if (!isApprovedUrlShape(urlDraft.url, sourceMode)) {
++      if (!isApprovedUrlShape(urlDraft.url, sourceMode, liveHtml)) {
+         setUrlIssue(urlDraft.url ? 'url' : 'empty')
+         urlInput.current?.focus()
+         return
+@@ -324,6 +337,8 @@
+       }
+       setUrlIssue(undefined)
+       setAllowReplacement(false)
++      const active = importStatus.current?.ownerDocument.activeElement
++      if (active === importAction.current || active === urlInput.current) importStatus.current?.focus()
+       approvedUrl.start({ ...urlDraft, source: sourceMode })
+       return
+     }
+@@ -419,14 +434,11 @@
+               aria-describedby={urlIssue === 'sourceMode' ? 'add-resource-approved-kind-error' : undefined}
+               onChange={event => {
+                 const source = availableSources.find(option => option === event.target.value)
+-                if (source) updateUrlDraft({ source, url: '' })
++                if (source) updateUrlDraft({ source, url: '', ...(isPrivateImport(source) || privateImport ? { mode: isPrivateImport(source) ? 'to' : 'parent', destination: '' } : {}) })
+               }}
+             >
+               {!sourceMode && <option value="" disabled>{t('studio:edge.webImportChooseMode')}</option>}
+-              {availableSources.includes('text') && <option value="text">{t('studio:edge.webImportText')}</option>}
+-              {availableSources.includes('html') && <option value="html">{t('studio:edge.webImportHtml')}</option>}
+-              {availableSources.includes('site') && <option value="site">{t('studio:edge.webImportSite')}</option>}
+-              {availableSources.includes('git') && <option value="git">{t('studio:edge.webImportGit')}</option>}
++              {availableSources.map(source => <option key={source} value={source}>{t(approvedSources[source].label)}</option>)}
+             </select>
+             {urlIssue === 'sourceMode' && <p id="add-resource-approved-kind-error" className="text-sm text-destructive" role="alert">{t('studio:edge.webImportChooseMode')}</p>}
+           </div>
+@@ -534,7 +546,7 @@
+ 
+         <ResourceDestinationFields
+           disabled={edgeUrl ? urlLocked || !sourceMode : remotePhase === 'processing'}
+-          exactOnly={sourceCapabilities.exactDestination}
++          exactOnly={edgeUrl ? privateImport : sourceCapabilities.exactDestination}
+           approvedTextOnly={edgeUrl}
+           approvedExactHint={edgeUrl ? exactHint : undefined}
+           inputRef={edgeUrl ? destinationInput : undefined}
+@@ -559,21 +571,21 @@
+               onChange={event => { setAllowReplacement(event.target.checked); setUrlIssue(undefined) }}
+             />
+             <span className="min-w-0 break-words">
+-              {t(isSite ? 'studio:edge.webImportFolderConsent' : 'studio:edge.urlImportExactConsent')} <code>{urlDraft.destination}</code>
++              {t(collection ? 'studio:edge.webImportFolderConsent' : 'studio:edge.urlImportExactConsent')} <code>{urlDraft.destination}</code>
+             </span>
+           </label>
+         )}
+         {edgeUrl && sourceMode && urlIssue === 'consent' && (
+-          <p id="add-resource-consent-error" className="text-sm text-destructive" role="alert">{t(isSite ? 'studio:edge.webImportFolderConsentRequired' : 'studio:edge.urlImportConsentRequired')}</p>
++          <p id="add-resource-consent-error" className="text-sm text-destructive" role="alert">{t(privateImport ? 'studio:edge.webImportPrivateConsentRequired' : isSite ? 'studio:edge.webImportFolderConsentRequired' : 'studio:edge.urlImportConsentRequired')}</p>
+         )}
+-        {edgeUrl && (
++        {(edgeUrl || showReceipt) && (
+           <div className="space-y-2">
+-            <div role="status" className="break-words text-sm">
++            <div role="status" ref={importStatus} tabIndex={-1} className="break-words rounded-sm text-sm focus-visible:outline-2 focus-visible:outline-ring">
+               {urlState.phase === 'submitting' ? t('studio:edge.urlImportSubmitting') : null}
+               {urlState.phase === 'tracking' ? t('studio:edge.urlImportProcessing') : null}
+-              {urlState.phase === 'done' ? <>{t(isSite ? 'studio:edge.webImportSiteDone' : 'studio:edge.urlImportDone')} <code>{urlState.task.uri}</code></> : null}
+-              {urlState.phase === 'done' && urlState.siteLimitReached && (
+-                <p className="mt-1">{t('studio:edge.webImportSiteLimitReached')}</p>
++              {urlState.phase === 'done' ? <>{t(receiptSource === 'site' ? 'studio:edge.webImportSiteDone' : isCollection(receiptSource) ? 'studio:edge.webImportCollectionDone' : 'studio:edge.urlImportDone')} <code>{urlState.task.uri}</code></> : null}
++              {urlState.phase === 'done' && urlState.limited && (
++                <p className="mt-1">{t(receiptSource === 'site' ? 'studio:edge.webImportSiteLimitReached' : 'studio:edge.webImportCollectionLimitReached')}</p>
+               )}
+             </div>
+             {urlState.phase === 'interrupted' && (
+@@ -584,14 +596,18 @@
+               </p>
+             )}
+             {urlState.phase === 'unknown' && <p className="text-sm" role="alert">{t('studio:edge.urlImportUnknown')}</p>}
+-            {urlState.phase === 'failed' && <p className="text-sm" role="alert">{t('studio:edge.urlImportFailed')}</p>}
++            {urlState.phase === 'failed' && <p className="break-words text-sm" role="alert">{t(urlState.failure === 'authority' ? 'studio:edge.webImportTaskRevoked' : 'studio:edge.urlImportFailed')} <code>{urlState.task.uri}</code></p>}
+             {urlState.phase === 'cancelled' && <p className="text-sm" role="alert">{t('studio:edge.urlImportCancelled')}</p>}
+             {refusal === 'authority' && <p className="text-sm" role="alert">{t('studio:edge.urlImportAuthorityRefused')}</p>}
+-            {refusal === 'request' && <p className="text-sm" role="alert">{t(sourceMode === 'git' ? 'studio:edge.webImportGitRefused' : 'studio:edge.urlImportRefused')}</p>}
+-            {(urlState.phase === 'interrupted' || urlState.phase === 'unknown') && (
++            {refusal === 'request' && <p className="text-sm" role="alert">{t(receiptSource === 'git' || receiptSource === 'git-collection' ? 'studio:edge.webImportGitRefused' : 'studio:edge.urlImportRefused')}</p>}
++            {!edgeUrl && refusal && (urlError || destinationError) && <p role="alert" className="text-sm">{urlError ?? destinationError}</p>}
++            {(urlState.phase === 'interrupted' || urlState.phase === 'unknown' || urlState.phase === 'failed') && (
+               <div className="flex flex-wrap gap-2">
+                 {urlState.phase === 'interrupted' && (
+-                  <Button type="button" onClick={approvedUrl.resume}>{t('studio:edge.urlImportVerify')}</Button>
++                  <Button type="button" onClick={event => {
++                    if (event.currentTarget.ownerDocument.activeElement === event.currentTarget) importStatus.current?.focus()
++                    approvedUrl.resume()
++                  }}>{t('studio:edge.urlImportVerify')}</Button>
+                 )}
+                 {onShowTasks && <Button type="button" variant="outline" onClick={onShowTasks}>{t('studio:edge.urlImportShowTasks')}</Button>}
+               </div>
+@@ -742,8 +758,8 @@
+           </CollapsibleContent>
+         </Collapsible>}
+ 
+-        {edgeUrl ? !urlLocked && <Button type="button" onClick={handleSubmit}>
+-          {t(isSite ? 'studio:edge.webImportSiteAction' : urlDraft.mode === 'to' ? 'studio:edge.urlImportExactAction' : 'studio:edge.urlImportAction')}
++        {edgeUrl ? !urlLocked && <Button ref={importAction} type="button" onClick={handleSubmit}>
++          {t(isSite ? 'studio:edge.webImportSiteAction' : collection ? 'studio:edge.webImportCollectionAction' : urlDraft.mode === 'to' ? 'studio:edge.urlImportExactAction' : 'studio:edge.urlImportAction')}
+         </Button> : <Button
+           onClick={handleSubmit}
+           disabled={
+diff --git a/src/features/workbench/resources/hooks/use-approved-url-import.ts b/src/features/workbench/resources/hooks/use-approved-url-import.ts
+--- a/src/features/workbench/resources/hooks/use-approved-url-import.ts
++++ b/src/features/workbench/resources/hooks/use-approved-url-import.ts
+@@ -1,9 +1,38 @@
+ import { useCallback, useLayoutEffect, useRef, useState } from 'react'
+ import { postResourceImport } from '#/features/workbench/resources/lib/resource-import-api'
+ import type { OvClientAdapter } from '#/shared/api/ov-client/index'
++import type { EdgeFeatures } from '#/shared/lib/edge-capabilities'
++import type { ResourceImportRequest } from '#/features/workbench/resources/lib/resource-import-types'
+ import { getOvResult, getTaskByTaskId, normalizeOvClientError } from '#/shared/api/ov-client/index'
+ 
+-export type ApprovedSource = 'text' | 'html' | 'site' | 'git'
++export const approvedSources = {
++  text: { flag: 'urlImport', label: 'studio:edge.webImportText' },
++  html: { flag: 'htmlImport', label: 'studio:edge.webImportHtml' },
++  site: { flag: 'siteImport', label: 'studio:edge.webImportSite' },
++  git: { flag: 'gitDocsImport', label: 'studio:edge.webImportGit' },
++  'git-collection': { flag: 'gitDocsCollectionImport', label: 'studio:edge.webImportGitCollection' },
++  feed: { flag: 'feedImport', label: 'studio:edge.webImportFeed' },
++  sitemap: { flag: 'sitemapImport', label: 'studio:edge.webImportSitemap' },
++  'feishu-native': { flag: 'feishuNativeImport', label: 'studio:edge.webImportFeishuNative' },
++  'tos-native': { flag: 'tosNativeImport', label: 'studio:edge.webImportTosNative' },
++  'feishu-tree': { flag: 'feishuTreeImport', label: 'studio:edge.webImportFeishuTree' },
++  'tos-collection': { flag: 'tosCollectionImport', label: 'studio:edge.webImportTosCollection' },
++} as const satisfies Record<string, { flag: keyof EdgeFeatures; label: string }>
++export type ApprovedSource = keyof typeof approvedSources
++export const approvedSourceModes = Object.keys(approvedSources) as ApprovedSource[]
++export const isCollection = (source?: ApprovedSource) => source === 'site' || source === 'feed' || source === 'sitemap' ||
++  source === 'git-collection' || source === 'feishu-tree' || source === 'tos-collection'
++export const isPrivateImport = (source?: ApprovedSource) => source !== undefined && !['text', 'html', 'site', 'git'].includes(source)
++export const usesAlias = (source?: ApprovedSource) => source === 'git' || source === 'git-collection' || source === 'feishu-tree' || source === 'tos-collection'
++export const isConnectorDocument = (source?: ApprovedSource) => source === 'feishu-native' || source === 'tos-native'
++
++const requestMode: Partial<Record<ApprovedSource, Pick<ResourceImportRequest, 'args' | 'add_type'>>> = {
++  html: { args: { web_mode: 'html' } }, site: { args: { site: true } }, git: { add_type: 'git' },
++  'git-collection': { add_type: 'git', args: { web_mode: 'collection' } }, feed: { args: { web_mode: 'feed' } },
++  sitemap: { args: { sitemap: true } }, 'feishu-native': { add_type: 'feishu', args: { web_mode: 'native' } },
++  'tos-native': { add_type: 'tos', args: { web_mode: 'native' } }, 'feishu-tree': { add_type: 'feishu', args: { web_mode: 'tree' } },
++  'tos-collection': { add_type: 'tos', args: { web_mode: 'collection' } },
++}
+ export type ApprovedUrlDraft = { url: string; mode: 'parent' | 'to'; destination: string; source?: ApprovedSource }
+ type Task = { id: string; uri: string }
+ type Refusal = 'source' | 'sourceTimeout' | 'destination' | 'siteFolderExists' | 'authority' | 'request'
+@@ -13,33 +42,61 @@
+   | { phase: 'submitting' | 'unknown'; draft: ApprovedUrlDraft }
+   | { phase: 'rejected'; draft: ApprovedUrlDraft; refusal: Refusal }
+   | { phase: 'interrupted'; draft: ApprovedUrlDraft; task: Task; reason: Interruption }
+-  | { phase: 'tracking' | 'failed' | 'cancelled'; draft: ApprovedUrlDraft; task: Task }
+-  | { phase: 'done'; draft: ApprovedUrlDraft; task: Task; siteLimitReached: boolean }
++  | { phase: 'tracking' | 'cancelled'; draft: ApprovedUrlDraft; task: Task }
++  | { phase: 'failed'; draft: ApprovedUrlDraft; task: Task; failure: 'authority' | 'unknown' }
++  | { phase: 'done'; draft: ApprovedUrlDraft; task: Task; limited: boolean }
+ 
+ const SOURCE_SUFFIX = /\.(md|txt|csv|json)$/i
+ const RESOURCE_ROOT = /^viking:\/\/(?:resources|~\/resources|user\/[\w-]+\/resources)(?:\/|$)/
+ const FOLDER_NAME = /^[A-Za-z0-9_-][A-Za-z0-9_-]{0,159}$/
+ const TEXT_NAME = /^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,155}\.txt$/
++const SEGMENT = /^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,159}$/
++const ALIAS = /^[a-z0-9][a-z0-9_-]{0,63}$/
+ const TRACK_FOR = 30_000
+ const SUBMIT_FOR = 15_000
+ const POLL_EVERY = 2_000
+ 
+-export function isApprovedUrlShape(value: string, source: ApprovedSource = 'text') {
++export function isApprovedUrlShape(value: string, source: ApprovedSource = 'text', liveHtml = false) {
+   // This is a field check, not authorization. Never submit a normalized href in place of the draft.
+-  if (source === 'git') return /^[a-z0-9][a-z0-9_-]{0,63}$/.test(value)
++  if (value.trim() !== value) return false
++  if (usesAlias(source)) return ALIAS.test(value)
++  if (isConnectorDocument(source) && ALIAS.test(value)) return true
++  if (source === 'tos-native') {
++    const key = /^tos:\/\/([a-z0-9][a-z0-9-]{1,61}[a-z0-9])\/(.+)$/.exec(value)?.[2]
++    return key !== undefined && key.length <= 256 && key.split('/').every(part => SEGMENT.test(part)) &&
++      /\.(?:md|txt|pdf|docx|xlsx|pptx|png|jpe?g)$/i.test(key)
++  }
+   try {
+     const url = new URL(value)
++    // Site has no separate native flag. The mounted Site capability allows a
++    // canonical address here; the Worker selects and authorizes its exact row.
++    const canonicalWeb = source === 'site' || source === 'feed' || source === 'sitemap' || source === 'feishu-native' || (source === 'html' && liveHtml)
++    const segments = url.pathname.slice(1)
++    const path = canonicalWeb ? segments.replace(/\/$/, '') : segments
+     return value.length <= 1000 && url.href === value && url.protocol === 'https:' &&
+       !url.username && !url.password && !url.port && !/[?#]/.test(value) &&
+       url.hostname.length <= 253 &&
+       /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}$/.test(url.hostname) &&
+       !/(?:^|\.)(?:localhost|internal|local|lan|home|arpa)(?:\.|$)/.test(url.hostname) &&
+-      url.pathname.slice(1).split('/').every(part => /^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,159}$/.test(part)) &&
+-      (source === 'text' ? SOURCE_SUFFIX.test(url.pathname) : /\.html?$/i.test(url.pathname))
++      (!canonicalWeb || !/(?:^|\.)onion(?:\.|$)/.test(url.hostname)) &&
++      (canonicalWeb && url.pathname === '/' || path.split('/').every(part => SEGMENT.test(part))) &&
++      // A .xml Site request selects the Worker Sitemap route instead.
++      (source !== 'site' || !/\.xml$/i.test(url.pathname)) &&
++      (source !== 'sitemap' || /\.xml$/i.test(url.pathname)) &&
++      (source !== 'feishu-native' || /\.(?:feishu\.cn|larksuite\.com)$/.test(url.hostname) && /^\/(?:doc|docx|wiki|sheets|base)\/[A-Za-z0-9_-]{1,128}$/.test(url.pathname)) &&
++      (canonicalWeb || (source === 'text' ? SOURCE_SUFFIX.test(url.pathname) : /\.html?$/i.test(url.pathname)))
+   } catch { return false }
+ }
+ 
+-export function isApprovedDestinationShape({ mode, destination, source }: ApprovedUrlDraft) {
++export function isApprovedDestinationShape({ mode, destination, source }: ApprovedUrlDraft, receipt = false) {
++  if (isPrivateImport(source)) {
++    const ownRoot = receipt ? /^viking:\/\/(?:~|user\/[\w-]+)\/resources\// : /^viking:\/\/~\/resources\//
++    const prefix = ownRoot.exec(destination)?.[0]
++    if (mode !== 'to' || !prefix) return false
++    const parts = destination.slice(prefix.length).split('/')
++    const leaf = parts.pop() ?? ''
++    return parts.every(part => SEGMENT.test(part)) && (isCollection(source) ? FOLDER_NAME.test(leaf) : TEXT_NAME.test(leaf))
++  }
+   if (mode === 'parent' && destination === '') return true
+   const root = RESOURCE_ROOT.exec(destination)
+   if (!root || destination !== destination.trim()) return false
+@@ -56,10 +113,11 @@
+     ? value as Record<string, unknown> : undefined
+ }
+ 
+-function acceptedTask(result: Record<string, unknown> | undefined, source: ApprovedSource | undefined): Task | undefined {
++function acceptedTask(result: Record<string, unknown> | undefined, draft: ApprovedUrlDraft): Task | undefined {
+   if ((result?.status === 'accepted' || result?.status === 'success') &&
+       typeof result.task_id === 'string' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(result.task_id) &&
+-      typeof result.root_uri === 'string' && isApprovedDestinationShape({ destination: result.root_uri, mode: 'to', url: '', source })) {
++      typeof result.root_uri === 'string' && isApprovedDestinationShape({ ...draft, destination: result.root_uri, mode: 'to' }, true) &&
++      (!isPrivateImport(draft.source) || result.root_uri.replace(/^viking:\/\/user\/[\w-]+\//, 'viking://~/') === draft.destination)) {
+     return { id: result.task_id, uri: result.root_uri }
+   }
+ }
+@@ -70,7 +128,7 @@
+   if (statusCode === 503 && code === 'AUTH_UNAVAILABLE') return 'authority'
+   if (code === 'DEADLINE_EXCEEDED') return 'sourceTimeout'
+   if (['SOURCE_UNAVAILABLE', 'UNSUPPORTED_MEDIA_TYPE', 'ROBOTS_DENIED'].includes(code)) return 'source'
+-  if (statusCode === 409 && code === 'ALREADY_EXISTS' && draft.source === 'site' && draft.mode === 'to') return 'siteFolderExists'
++  if (statusCode === 409 && code === 'ALREADY_EXISTS' && isCollection(draft.source) && draft.mode === 'to') return 'siteFolderExists'
+   if (['INVALID_URI', 'RESOURCE_BUSY', 'ALREADY_EXISTS', 'NOT_FOUND', 'CONFLICT'].includes(code)) return 'destination'
+   if (statusCode && statusCode >= 400 && statusCode < 500 || code === 'NOT_IMPLEMENTED' || code === 'EMBEDDING_UNAVAILABLE') return 'request'
+   // No authoritative rejection: even a dropped POST response may hide a committed admission.
+@@ -129,16 +187,26 @@
+           active.next = window.setTimeout(() => void read(), POLL_EVERY)
+           return
+         }
+-        if (status.status === 'failed' || status.status === 'cancelled') {
++        if (status.status === 'failed') {
+           stop()
+-          publish({ phase: status.status, draft, task })
++          // F6 exposes a fixed revocation sentinel, not provider error codes.
++          // Classify only that exact value; never pass task.error to the view.
++          const failure = status.error === 'Task credential is no longer authorized.' ? 'authority' : 'unknown'
++          publish({ phase: 'failed', draft, task, failure })
++          return
++        }
++        if (status.status === 'cancelled') {
++          stop()
++          publish({ phase: 'cancelled', draft, task })
+           return
+         }
+         const result = record(status.result)
+         if (status.status === 'completed' && result?.status === 'success' && result.root_uri === task.uri) {
+           stop()
+-          publish({ phase: 'done', draft, task,
+-            siteLimitReached: draft.source === 'site' && result.site_limit_reached === true })
++          publish({ phase: 'done', draft, task, limited:
++            draft.source === 'site' && result.site_limit_reached === true ||
++            draft.source === 'feed' && result.feed_limit_reached === true ||
++            draft.source === 'sitemap' && result.sitemap_limit_reached === true })
+           viewer.current?.onCompleted()
+           return
+         }
+@@ -166,6 +234,7 @@
+   const start = useCallback((draft: ApprovedUrlDraft) => {
+     if (!isCurrent() || !viewer.current || operation.current ||
+         !['idle', 'rejected', 'done', 'failed', 'cancelled'].includes(latest.current.phase)) return
++    if (!isApprovedDestinationShape(draft)) return
+     const active: Operation = { abort: new AbortController() }
+     const current = () => operation.current === active && isCurrent()
+     operation.current = active
+@@ -179,14 +248,12 @@
+       try {
+         const result = await getOvResult(postResourceImport({
+           path: draft.url, [draft.mode]: draft.destination || 'viking://~/resources',
+-          ...(draft.source === 'html' && { args: { web_mode: 'html' } }),
+-          ...(draft.source === 'site' && { args: { site: true } }),
+-          ...(draft.source === 'git' && { add_type: 'git' }),
++          ...(draft.source && requestMode[draft.source]),
+           wait: false, processing_mode: 'vectors_only',
+         }, { client, signal: active.abort.signal }))
+         if (!current()) return
+         stop()
+-        const task = acceptedTask(record(result), draft.source)
++        const task = acceptedTask(record(result), draft)
+         if (!task) publish({ phase: 'unknown', draft })
+         else if (viewer.current) follow(draft, task)
+         else publish({ phase: 'interrupted', draft, task, reason: 'paused' })
+diff --git a/src/i18n/locales/en/studio.ts b/src/i18n/locales/en/studio.ts
+--- a/src/i18n/locales/en/studio.ts
++++ b/src/i18n/locales/en/studio.ts
+@@ -47,8 +47,35 @@
+     webImportHtml: 'HTML page',
+     webImportSite: 'Linked site documents',
+     webImportGit: 'GitHub documentation',
++    webImportGitCollection: 'GitHub documentation collection',
++    webImportFeed: 'RSS or Atom feed',
++    webImportSitemap: 'XML sitemap',
++    webImportFeishuNative: 'Feishu or Lark document',
++    webImportTosNative: 'TOS object',
++    webImportFeishuTree: 'Feishu or Lark Wiki tree',
++    webImportTosCollection: 'TOS object collection',
+     webImportAlias: 'Approved collection alias',
+     webImportHtmlHint: 'Enter the exact approved HTTPS .html or .htm address. Only text from the approved page is indexed; links are not followed.',
++    webImportLiveHtmlHint: 'Enter the exact approved HTTPS page address. Only text from that page is indexed; links are not followed.',
++    webImportFeedHint: 'Enter the exact approved HTTPS feed address. Only a limited set of entries is imported.',
++    webImportSitemapHint: 'Enter the exact approved HTTPS .xml sitemap address. Only registered maps and pages can be imported.',
++    webImportGroupHint: 'Enter the approved group alias from your operator. Only the documents in that group are imported.',
++    webImportDocument: 'Approved alias or document address',
++    webImportFeishuHint: 'Enter the approved alias or exact Feishu or Lark document link from your operator. No credentials are needed.',
++    webImportTosHint: 'Enter the approved alias or exact tos:// object address from your operator. No credentials are needed.',
++    webImportDocumentRequired: 'Enter the approved alias or exact document address.',
++    webImportDocumentInvalid: 'Use the approved alias or copy the exact document address from your operator without changing it.',
++    webImportCanonicalInvalid: 'Copy the exact approved HTTPS address without a query, fragment, port, or credentials.',
++    webImportSiteInvalid: 'Copy the exact approved HTTPS page address without a query, fragment, port, or credentials. For an XML sitemap, select XML sitemap.',
++    webImportSitemapInvalid: 'Copy the exact approved HTTPS .xml address without a query, fragment, port, or credentials.',
++    webImportPrivateFolder: 'Enter the exact URI of a new folder under viking://~/resources/. An existing folder will not be replaced.',
++    webImportPrivateFile: 'Enter the exact URI of a .txt file under viking://~/resources/. This can replace a file at that path.',
++    webImportPrivateConsentRequired: 'Confirm this exact destination before importing.',
++    webImportCollectionAction: 'Import into new folder',
++    webImportCollectionDone: 'Collection imported:',
++    webImportCollectionLimitReached: 'The import reached its limit. Some approved entries or pages may not have been imported.',
++    webImportAliasTimeout: 'The source did not reply in time. Check the approved alias or document address and try again later.',
++    webImportTaskRevoked: 'This task lost access to the workspace. Check your connection or contact your operator before starting another import.',
+     webImportSiteHint: 'Enter the approved HTTPS entry page. Imports up to six catalogue pages on that origin, no more than two links deep, subject to the site policy.',
+     webImportGitHint: 'Enter the alias provided by your operator. This reads a pinned documentation file. No repository address or credentials are needed.',
+     webImportGitRefused: 'The GitHub import request was rejected. Check your connection, the approved alias, and write access to the destination before trying again.',
+diff --git a/src/i18n/locales/zh-CN/studio.ts b/src/i18n/locales/zh-CN/studio.ts
+--- a/src/i18n/locales/zh-CN/studio.ts
++++ b/src/i18n/locales/zh-CN/studio.ts
+@@ -47,8 +47,35 @@
+     webImportHtml: 'HTML 网页',
+     webImportSite: '站点链接文档',
+     webImportGit: 'GitHub 文档',
++    webImportGitCollection: 'GitHub 文档集合',
++    webImportFeed: 'RSS 或 Atom 订阅源',
++    webImportSitemap: 'XML 站点地图',
++    webImportFeishuNative: '飞书或 Lark 文档',
++    webImportTosNative: 'TOS 对象',
++    webImportFeishuTree: '飞书或 Lark 知识库目录树',
++    webImportTosCollection: 'TOS 对象集合',
+     webImportAlias: '已批准的集合别名',
+     webImportHtmlHint: '请原样输入已批准的 HTTPS .html 或 .htm 地址。仅索引已批准网页的文本，不访问链接。',
++    webImportLiveHtmlHint: '请原样输入已批准的 HTTPS 网页地址。仅索引该网页的文本，不访问链接。',
++    webImportFeedHint: '请原样输入已批准的 HTTPS 订阅源地址。只导入有限数量的条目。',
++    webImportSitemapHint: '请原样输入已批准的 HTTPS .xml 站点地图地址。只导入已登记的站点地图和网页。',
++    webImportGroupHint: '请输入管理员提供的已批准分组别名。只导入该分组内的文档。',
++    webImportDocument: '已批准的别名或文档地址',
++    webImportFeishuHint: '请输入管理员提供的已批准别名或原样复制飞书或 Lark 文档链接。无需填写凭据。',
++    webImportTosHint: '请输入管理员提供的已批准别名或原样复制 tos:// 对象地址。无需填写凭据。',
++    webImportDocumentRequired: '请输入已批准的别名或完整文档地址。',
++    webImportDocumentInvalid: '请使用已批准的别名，或原样复制管理员提供的文档地址。',
++    webImportCanonicalInvalid: '请原样复制已批准的 HTTPS 地址，不要添加查询参数、片段、端口或凭据。',
++    webImportSiteInvalid: '请原样复制已批准的 HTTPS 网页地址，不要添加查询参数、片段、端口或凭据。如果要导入 XML 站点地图，请选择对应类型。',
++    webImportSitemapInvalid: '请原样复制已批准的 HTTPS .xml 地址，不要添加查询参数、片段、端口或凭据。',
++    webImportPrivateFolder: '请输入 viking://~/resources/ 下新文件夹的完整 URI。不会替换已有文件夹。',
++    webImportPrivateFile: '请输入 viking://~/resources/ 下 .txt 文件的完整 URI。可能替换该路径下的文件。',
++    webImportPrivateConsentRequired: '导入前请确认此目标位置。',
++    webImportCollectionAction: '导入到新文件夹',
++    webImportCollectionDone: '已导入集合：',
++    webImportCollectionLimitReached: '已达到导入上限。部分已批准的条目或网页可能未导入。',
++    webImportAliasTimeout: '来源未及时响应。请核对已批准的别名或文档地址，稍后重试。',
++    webImportTaskRevoked: '此任务已失去工作区访问权限。请检查连接或联系管理员，再启动新的导入。',
+     webImportSiteHint: '请输入已批准的 HTTPS 入口页。按站点规则，仅导入同源目录清单内最多六个页面，且最多跟随两层链接。',
+     webImportGitHint: '请输入管理员提供的别名，以读取固定版本的文档。无需填写仓库地址或凭据。',
+     webImportGitRefused: 'GitHub 文档导入请求被拒绝。请检查连接、已批准的别名和目标位置的写入权限后再试。',
+diff --git a/src/shared/lib/edge-capabilities.ts b/src/shared/lib/edge-capabilities.ts
+--- a/src/shared/lib/edge-capabilities.ts
++++ b/src/shared/lib/edge-capabilities.ts
+@@ -1,6 +1,8 @@
+ import { allowsStudioApiBase, EDGE_STUDIO } from './edge-studio'
+ 
+-const keys = ['control', 'packImport', 'packExport', 'searchProvenance', 'bot', 'compile', 'skills', 'snapshots', 'webdav', 'oauth', 'watches', 'monitoring', 'gatewayKeys', 'urlImport', 'htmlImport', 'siteImport', 'gitDocsImport'] as const
++export const edgeImportFlags = ['urlImport', 'htmlImport', 'siteImport', 'gitDocsImport', 'liveOriginImport',
++  'gitDocsCollectionImport', 'feedImport', 'sitemapImport', 'feishuNativeImport', 'tosNativeImport', 'feishuTreeImport', 'tosCollectionImport'] as const
++const keys = ['control', 'packImport', 'packExport', 'searchProvenance', 'bot', 'compile', 'skills', 'snapshots', 'webdav', 'oauth', 'watches', 'monitoring', 'gatewayKeys', ...edgeImportFlags] as const
+ export type EdgeFeatures = Partial<Record<(typeof keys)[number], true>>
+ export const gatewayKeysPath = '/admin/gateway/keys'
+ export function isEdgeGatewayKeysPath(path: string): boolean {
+diff --git a/src/shared/ui/dialog.tsx b/src/shared/ui/dialog.tsx
+--- a/src/shared/ui/dialog.tsx
++++ b/src/shared/ui/dialog.tsx
+@@ -32,7 +32,7 @@
+     <DialogPrimitive.Backdrop
+       data-slot="dialog-overlay"
+       className={cn(
+-        'fixed inset-0 isolate z-50 bg-black/10 duration-100 supports-backdrop-filter:backdrop-blur-xs data-open:animate-in data-open:fade-in-0 data-closed:animate-out data-closed:fade-out-0',
++        'fixed inset-0 isolate z-50 bg-black/10 supports-backdrop-filter:backdrop-blur-xs motion-safe:duration-100 motion-safe:data-open:animate-in motion-safe:data-open:fade-in-0 motion-safe:data-closed:animate-out motion-safe:data-closed:fade-out-0',
+         className,
+       )}
+       {...props}
+@@ -55,7 +55,7 @@
+       <DialogPrimitive.Popup
+         data-slot="dialog-content"
+         className={cn(
+-          'fixed top-1/2 left-1/2 z-50 grid w-full max-w-[calc(100%-2rem)] max-h-[calc(100dvh-2rem)] -translate-x-1/2 -translate-y-1/2 gap-6 overflow-y-auto overscroll-contain rounded-xl bg-popover p-6 text-sm text-popover-foreground ring-1 ring-foreground/10 duration-100 outline-none sm:max-w-md data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95',
++          'fixed top-1/2 left-1/2 z-50 grid w-full max-w-[calc(100%-2rem)] max-h-[calc(100dvh-2rem)] -translate-x-1/2 -translate-y-1/2 gap-6 overflow-y-auto overscroll-contain rounded-xl bg-popover p-6 text-sm text-popover-foreground ring-1 ring-foreground/10 outline-none sm:max-w-md motion-safe:duration-100 motion-safe:data-open:animate-in motion-safe:data-open:fade-in-0 motion-safe:data-open:zoom-in-95 motion-safe:data-closed:animate-out motion-safe:data-closed:fade-out-0 motion-safe:data-closed:zoom-out-95',
+           className,
+         )}
+         {...props}
+diff --git a/src/shared/ui/popover.tsx b/src/shared/ui/popover.tsx
+--- a/src/shared/ui/popover.tsx
++++ b/src/shared/ui/popover.tsx
+@@ -35,7 +35,7 @@
+         <PopoverPrimitive.Popup
+           data-slot="popover-content"
+           className={cn(
+-            'z-50 flex w-72 origin-(--transform-origin) flex-col gap-4 rounded-md bg-popover p-4 text-sm text-popover-foreground shadow-md ring-1 ring-foreground/10 outline-hidden duration-100 data-[side=bottom]:slide-in-from-top-2 data-[side=inline-end]:slide-in-from-left-2 data-[side=inline-start]:slide-in-from-right-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95',
++            'z-50 flex w-72 origin-(--transform-origin) flex-col gap-4 rounded-md bg-popover p-4 text-sm text-popover-foreground shadow-md ring-1 ring-foreground/10 outline-hidden motion-safe:duration-100 motion-safe:data-[side=bottom]:slide-in-from-top-2 motion-safe:data-[side=inline-end]:slide-in-from-left-2 motion-safe:data-[side=inline-start]:slide-in-from-right-2 motion-safe:data-[side=left]:slide-in-from-right-2 motion-safe:data-[side=right]:slide-in-from-left-2 motion-safe:data-[side=top]:slide-in-from-bottom-2 motion-safe:data-open:animate-in motion-safe:data-open:fade-in-0 motion-safe:data-open:zoom-in-95 motion-safe:data-closed:animate-out motion-safe:data-closed:fade-out-0 motion-safe:data-closed:zoom-out-95',
+             className,
+           )}
+           {...props}

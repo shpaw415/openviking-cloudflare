@@ -1,0 +1,52 @@
+diff --git a/src/features/workbench/resources/hooks/use-approved-url-import.ts b/src/features/workbench/resources/hooks/use-approved-url-import.ts
+--- a/src/features/workbench/resources/hooks/use-approved-url-import.ts
++++ b/src/features/workbench/resources/hooks/use-approved-url-import.ts
+@@ -13,4 +13,5 @@
+   | { phase: 'rejected'; draft: ApprovedUrlDraft; refusal: Refusal }
+   | { phase: 'interrupted'; draft: ApprovedUrlDraft; task: Task; reason: Interruption }
+-  | { phase: 'tracking' | 'done' | 'failed' | 'cancelled'; draft: ApprovedUrlDraft; task: Task }
++  | { phase: 'tracking' | 'failed' | 'cancelled'; draft: ApprovedUrlDraft; task: Task }
++  | { phase: 'done'; draft: ApprovedUrlDraft; task: Task; siteLimitReached: boolean }
+ 
+@@ -130,6 +131,7 @@
+         const result = record(status.result)
+         if (status.status === 'completed' && result?.status === 'success' && result.root_uri === task.uri) {
+           stop()
+-          publish({ phase: 'done', draft, task })
++          publish({ phase: 'done', draft, task,
++            siteLimitReached: draft.source === 'site' && result.site_limit_reached === true })
+           viewer.current?.onCompleted()
+           return
+diff --git a/src/features/workbench/resources/components/add-resource-page.tsx b/src/features/workbench/resources/components/add-resource-page.tsx
+--- a/src/features/workbench/resources/components/add-resource-page.tsx
++++ b/src/features/workbench/resources/components/add-resource-page.tsx
+@@ -576,6 +576,9 @@
+               {urlState.phase === 'submitting' ? t('studio:edge.urlImportSubmitting') : null}
+               {urlState.phase === 'tracking' ? t('studio:edge.urlImportProcessing') : null}
+               {urlState.phase === 'done' ? <>{t(isSite ? 'studio:edge.webImportSiteDone' : 'studio:edge.urlImportDone')} <code>{urlState.task.uri}</code></> : null}
++              {urlState.phase === 'done' && urlState.siteLimitReached && (
++                <p className="mt-1">{t('studio:edge.webImportSiteLimitReached')}</p>
++              )}
+             </div>
+             {urlState.phase === 'interrupted' && (
+               <p className="text-sm" role="alert">
+diff --git a/src/i18n/locales/en/studio.ts b/src/i18n/locales/en/studio.ts
+--- a/src/i18n/locales/en/studio.ts
++++ b/src/i18n/locales/en/studio.ts
+@@ -64,5 +64,6 @@
+     webImportSiteAction: 'Import linked documents',
+     webImportSiteDone: 'Site documents imported:',
++    webImportSiteLimitReached: 'Import reached the site limit. Some approved linked pages were not imported (up to six pages, two links deep).',
+     dataProfile: 'Workspace',
+     controlProfile: 'Administration',
+     controlKey: 'Root or account Admin API key',
+diff --git a/src/i18n/locales/zh-CN/studio.ts b/src/i18n/locales/zh-CN/studio.ts
+--- a/src/i18n/locales/zh-CN/studio.ts
++++ b/src/i18n/locales/zh-CN/studio.ts
+@@ -64,5 +64,6 @@
+     webImportSiteAction: '导入链接文档',
+     webImportSiteDone: '站点文档已导入：',
++    webImportSiteLimitReached: '已达到站点导入上限。部分已批准的链接页面未导入（最多六页，最多跟随两层链接）。',
+     dataProfile: '工作区',
+     controlProfile: '管理',
+     controlKey: 'Root 或账号管理员 API 密钥',
